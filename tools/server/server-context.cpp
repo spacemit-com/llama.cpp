@@ -2199,9 +2199,6 @@ struct server_context_impl {
                 break;
             case SERVER_TASK_TYPE_SLOT_ERASE:
                 {
-                    if (!check_no_mtmd(task.id)) {
-                        break;
-                    }
                     const int     id_slot = task.slot_action.id_slot;
                     server_slot * slot    = get_slot_by_id(id_slot);
                     if (slot == nullptr) {
