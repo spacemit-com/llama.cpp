@@ -120,6 +120,29 @@ struct mtmd_audio_preprocessor_qwen3a : mtmd_audio_preprocessor {
     mtmd_audio_cache cache;
 };
 
+// Kaldi-compatible fbank features (used by FunASR/SenseVoice models).
+// Output layout: [n_frames, n_mel] flattened in row-major order per time frame.
+bool mtmd_audio_compute_kaldi_fbank(const float * samples,
+                                    size_t        n_samples,
+                                    int           sample_rate,
+                                    int           n_mel,
+                                    int           frame_len,
+                                    int           frame_shift,
+                                    float         preemph_coeff,
+                                    std::vector<float> & features,
+                                    int &         n_frames_out);
+
+// Low Frame Rate (LFR) frame stacking for FunASR models.
+// Stacks lfr_m consecutive frames with stride lfr_n, using centered window
+// and boundary clamping.  Output layout: [n_lfr_frames, n_mel * lfr_m].
+bool mtmd_audio_compute_lfr(const std::vector<float> & features,
+                            int n_frames,
+                            int n_mel,
+                            int lfr_m,
+                            int lfr_n,
+                            std::vector<float> & lfr_features,
+                            int & n_lfr_frames_out);
+
 //
 // streaming ISTFT - converts spectrogram frames back to audio one frame at a time
 //

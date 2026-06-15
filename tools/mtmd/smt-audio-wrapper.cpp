@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -50,6 +51,8 @@ struct smt_audio_config {
     int32_t                                      hop_len          = 160;
     int32_t                                      intra_thread_num = 4;
     int32_t                                      inter_thread_num = 1;
+    int32_t                                      lfr_m            = 0;
+    int32_t                                      lfr_n            = 0;
 };
 
 static std::string read_file_to_string(const std::string & path) {
@@ -343,6 +346,8 @@ static bool parse_audio_config_block(const std::string & config_dir,
     config.n_fft        = (int32_t) extract_int64_value(audio_block, "n_fft", config.n_fft);
     config.window_len   = (int32_t) extract_int64_value(audio_block, "window_len", config.window_len);
     config.hop_len      = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
+    config.lfr_m        = (int32_t) extract_int64_value(audio_block, "lfr_m", config.lfr_m);
+    config.lfr_n        = (int32_t) extract_int64_value(audio_block, "lfr_n", config.lfr_n);
     config.ep_config    = extract_string_map(audio_block, "ep_config");
     apply_legacy_spacemit_ep_config(audio_block, config);
     config.architectures = extract_string_array(content, "architectures");
@@ -654,7 +659,8 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
     d.backend_output_names_raw = make_name_ptrs(d.backend_output_names);
 
     if (d.frontend_input_names_raw.size() != 1 || d.frontend_output_names_raw.size() != 1 ||
-        d.backend_input_names_raw.size() != 2 || d.backend_output_names_raw.size() != 1) {
+        (d.backend_input_names_raw.size() != 1 && d.backend_input_names_raw.size() != 2) ||
+        d.backend_output_names_raw.size() != 1) {
         throw std::runtime_error("Unexpected SMT audio ONNX IO signature");
     }
 
@@ -665,45 +671,77 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
         }
         std::cerr << "\n";
 
-        const int chunk_frames = 100;
-        const int chunk_tokens = 13;
-        const int t_out        = chunk_tokens;
+        int                warmup_t_out;
+        std::vector<float> warmup_hidden;
 
-        std::vector<float>         frontend_input_data((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
-        const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
-        auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
+        if (d.config.lfr_m > 0) {
+            const int warmup_frames = 10;
+            const int feat_dim      = d.config.num_mel_bins * d.config.lfr_m;
 
-        std::cerr << "[SMT][audio] warmup frontend ONNX session: " << d.config.frontend_model_path << "\n";
-        auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
-                                                       &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+            std::vector<float>         frontend_input_data((size_t) warmup_frames * feat_dim, 0.0f);
+            const std::vector<int64_t> frontend_input_shape = { 1, warmup_frames, (int64_t) feat_dim };
+            auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
 
-        std::vector<float> hidden_states((size_t) t_out * (size_t) d.config.d_model, 0.0f);
-        if (frontend_outputs.empty()) {
-            throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+            std::cerr << "[SMT][audio] warmup frontend ONNX session (FunASR): " << d.config.frontend_model_path << "\n";
+            auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                           &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+            if (frontend_outputs.empty()) {
+                throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+            }
+            const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
+            if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                throw std::runtime_error("SMT audio warmup frontend output must be float32");
+            }
+            auto shape    = frontend_output_info.GetShape();
+            warmup_t_out  = (int) shape[1];
+            warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
+            const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
+            std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
+        } else {
+            const int chunk_frames = 100;
+            const int chunk_tokens = 13;
+            warmup_t_out           = chunk_tokens;
+
+            std::vector<float>         frontend_input_data((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+            const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
+            auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
+
+            std::cerr << "[SMT][audio] warmup frontend ONNX session: " << d.config.frontend_model_path << "\n";
+            auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                           &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+
+            warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
+            if (frontend_outputs.empty()) {
+                throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+            }
+            const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
+            if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                throw std::runtime_error("SMT audio warmup frontend output must be float32");
+            }
+            const int64_t frontend_output_elems = frontend_output_info.GetElementCount();
+            if (frontend_output_elems < 0 || (size_t) frontend_output_elems < warmup_hidden.size()) {
+                throw std::runtime_error("SMT audio warmup frontend output is smaller than expected");
+            }
+            const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
+            std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
         }
-        const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
-        if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-            throw std::runtime_error("SMT audio warmup frontend output must be float32");
-        }
-        const int64_t frontend_output_elems = frontend_output_info.GetElementCount();
-        if (frontend_output_elems < 0 || (size_t) frontend_output_elems < hidden_states.size()) {
-            throw std::runtime_error("SMT audio warmup frontend output is smaller than expected");
-        }
-        const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
-        std::memcpy(hidden_states.data(), frontend_output, hidden_states.size() * sizeof(float));
 
-        std::vector<float>         attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
-        const std::vector<int64_t> backend_hidden_shape = { 1, t_out, d.config.d_model };
-        const std::vector<int64_t> backend_mask_shape   = { 1, 1, t_out, t_out };
-
-        auto                      hidden_tensor  = make_tensor_f32(backend_hidden_shape, hidden_states);
-        auto                      mask_tensor    = make_tensor_f32(backend_mask_shape, attention_mask);
-        std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
+        const std::vector<int64_t> backend_hidden_shape = { 1, warmup_t_out, d.config.d_model };
+        auto                      hidden_tensor        = make_tensor_f32(backend_hidden_shape, warmup_hidden);
 
         std::cerr << "[SMT][audio] warmup backend ONNX session: " << d.config.backend_model_path << "\n";
-        (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
-                                     backend_inputs.data(), backend_inputs.size(), d.backend_output_names_raw.data(),
-                                     1);
+        if (d.backend_input_names_raw.size() == 2) {
+            std::vector<float>         attention_mask((size_t) warmup_t_out * (size_t) warmup_t_out, 0.0f);
+            const std::vector<int64_t> backend_mask_shape = { 1, 1, warmup_t_out, warmup_t_out };
+            auto                       mask_tensor        = make_tensor_f32(backend_mask_shape, attention_mask);
+            std::array<Ort::Value, 2>  backend_inputs     = { std::move(hidden_tensor), std::move(mask_tensor) };
+            (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                         backend_inputs.data(), backend_inputs.size(),
+                                         d.backend_output_names_raw.data(), 1);
+        } else {
+            (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                         &hidden_tensor, 1, d.backend_output_names_raw.data(), 1);
+        }
     }
 
     return ctx;
@@ -724,77 +762,150 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
     }
     ggml_trace_log_end("decode_audio_file", "Audio", NULL);
 
-    mtmd_audio_mel mel;
-    ggml_trace_log_begin("compute_log_mel_spectrogram", "Audio", NULL);
-    if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(), samples.size(), 4, d.config.num_mel_bins,
-                                                d.config.n_fft, d.config.window_len, d.config.hop_len,
-                                                d.config.sample_rate, true, 0.0f, false, false, mel)) {
-        ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
-        ggml_trace_log_end("encode_audio", "Audio", NULL);
-        ggml_profile_flush_tls();
-        throw std::runtime_error("failed to compute Qwen3-ASR mel spectrogram");
-    }
-    ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
+    int                t_out;
+    std::vector<float> hidden_states;
 
-    if (mel.n_len <= 0 || mel.n_mel != d.config.num_mel_bins) {
-        ggml_trace_log_end("encode_audio", "Audio", NULL);
-        ggml_profile_flush_tls();
-        throw std::runtime_error("invalid mel spectrogram shape");
-    }
+    if (d.config.lfr_m > 0) {
+        // FunASR path: kaldi fbank -> LFR -> frontend -> backend
+        std::vector<float> fbank_features;
+        int                n_fbank_frames = 0;
+        ggml_trace_log_begin("compute_kaldi_fbank", "Audio", NULL);
+        if (!mtmd_audio_compute_kaldi_fbank(samples.data(), samples.size(), d.config.sample_rate, d.config.num_mel_bins,
+                                 d.config.window_len, d.config.hop_len, 0.97f, fbank_features, n_fbank_frames)) {
+            ggml_trace_log_end("compute_kaldi_fbank", "Audio", NULL);
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("failed to compute kaldi fbank features");
+        }
+        ggml_trace_log_end("compute_kaldi_fbank", "Audio", NULL);
 
-    const int frames        = mel.n_len;
-    const int chunk_frames  = 100;
-    const int chunk_tokens  = 13;
-    const int padded_frames = ((frames + chunk_frames - 1) / chunk_frames) * chunk_frames;
-    const int n_chunks      = padded_frames / chunk_frames;
-
-    std::vector<float>         hidden_states((size_t) n_chunks * chunk_tokens * (size_t) d.config.d_model);
-    std::vector<float>         chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
-    const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
-
-    ggml_trace_log_begin("frontend_session_run", "Audio", NULL);
-    for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
-        std::fill(chunk_input.begin(), chunk_input.end(), 0.0f);
-        const int frame_offset = chunk_idx * chunk_frames;
-        const int copy_frames  = std::min(chunk_frames, frames - frame_offset);
-        if (copy_frames > 0) {
-            for (int mel_idx = 0; mel_idx < mel.n_mel; ++mel_idx) {
-                const float * src = mel.data.data() + (size_t) mel_idx * mel.n_len + frame_offset;
-                float *       dst = chunk_input.data() + (size_t) mel_idx * chunk_frames;
-                std::memcpy(dst, src, (size_t) copy_frames * sizeof(float));
-            }
+        std::vector<float> lfr_features;
+        int                n_lfr_frames = 0;
+        if (!mtmd_audio_compute_lfr(fbank_features, n_fbank_frames, d.config.num_mel_bins, d.config.lfr_m, d.config.lfr_n,
+                         lfr_features, n_lfr_frames)) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("failed to compute LFR features");
         }
 
-        auto    frontend_input   = make_tensor_f32(frontend_input_shape, chunk_input);
-        auto    frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
-                                                          &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
-        float * chunk_out        = frontend_outputs[0].GetTensorMutableData<float>();
-        std::memcpy(hidden_states.data() + (size_t) chunk_idx * chunk_tokens * (size_t) d.config.d_model, chunk_out,
-                    (size_t) chunk_tokens * (size_t) d.config.d_model * sizeof(float));
+        // Per-frame mean subtraction for ONNX numerical stability.
+        // LayerNorm is shift-invariant: LN(x + c) = LN(x), so subtracting the
+        // per-frame mean does not change the model output, but prevents catastrophic
+        // cancellation in the ONNX decomposed variance computation (E[x²] - E[x]²)
+        // when input values have large magnitude but small variance.
+        const int feat_dim = d.config.num_mel_bins * d.config.lfr_m;
+        for (int i = 0; i < n_lfr_frames; i++) {
+            float * frame = lfr_features.data() + (size_t) i * feat_dim;
+            float   sum   = 0.0f;
+            for (int j = 0; j < feat_dim; j++) {
+                sum += frame[j];
+            }
+            float mean = sum / (float) feat_dim;
+            for (int j = 0; j < feat_dim; j++) {
+                frame[j] -= mean;
+            }
+        }
+        const std::vector<int64_t> frontend_input_shape = { 1, (int64_t) n_lfr_frames, (int64_t) feat_dim };
+        auto                       frontend_input       = make_tensor_f32(frontend_input_shape, lfr_features);
+
+        ggml_trace_log_begin("frontend_session_run", "Audio", NULL);
+        auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                       &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+        ggml_trace_log_end("frontend_session_run", "Audio", NULL);
+
+        if (frontend_outputs.empty()) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("FunASR frontend returned no outputs");
+        }
+
+        const auto frontend_shape = frontend_outputs[0].GetTensorTypeAndShapeInfo().GetShape();
+        t_out                     = (int) frontend_shape[1];
+        hidden_states.resize((size_t) t_out * (size_t) d.config.d_model);
+        std::memcpy(hidden_states.data(), frontend_outputs[0].GetTensorData<float>(),
+                    hidden_states.size() * sizeof(float));
+
+    } else {
+        // Qwen3ASR path: mel spectrogram -> chunk -> frontend -> backend
+        mtmd_audio_mel mel;
+        ggml_trace_log_begin("compute_log_mel_spectrogram", "Audio", NULL);
+        if (!mtmd_audio_compute_log_mel_spectrogram(samples.data(), samples.size(), 4, d.config.num_mel_bins,
+                                                    d.config.n_fft, d.config.window_len, d.config.hop_len,
+                                                    d.config.sample_rate, true, 0.0f, false, false, mel)) {
+            ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("failed to compute Qwen3-ASR mel spectrogram");
+        }
+        ggml_trace_log_end("compute_log_mel_spectrogram", "Audio", NULL);
+
+        if (mel.n_len <= 0 || mel.n_mel != d.config.num_mel_bins) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("invalid mel spectrogram shape");
+        }
+
+        const int frames        = mel.n_len;
+        const int chunk_frames  = 100;
+        const int chunk_tokens  = 13;
+        const int padded_frames = ((frames + chunk_frames - 1) / chunk_frames) * chunk_frames;
+        const int n_chunks      = padded_frames / chunk_frames;
+
+        hidden_states.resize((size_t) n_chunks * chunk_tokens * (size_t) d.config.d_model);
+        std::vector<float>         chunk_input((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+        const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
+
+        ggml_trace_log_begin("frontend_session_run", "Audio", NULL);
+        for (int chunk_idx = 0; chunk_idx < n_chunks; ++chunk_idx) {
+            std::fill(chunk_input.begin(), chunk_input.end(), 0.0f);
+            const int frame_offset = chunk_idx * chunk_frames;
+            const int copy_frames  = std::min(chunk_frames, frames - frame_offset);
+            if (copy_frames > 0) {
+                for (int mel_idx = 0; mel_idx < mel.n_mel; ++mel_idx) {
+                    const float * src = mel.data.data() + (size_t) mel_idx * mel.n_len + frame_offset;
+                    float *       dst = chunk_input.data() + (size_t) mel_idx * chunk_frames;
+                    std::memcpy(dst, src, (size_t) copy_frames * sizeof(float));
+                }
+            }
+
+            auto    frontend_input   = make_tensor_f32(frontend_input_shape, chunk_input);
+            auto    frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                              &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+            float * chunk_out        = frontend_outputs[0].GetTensorMutableData<float>();
+            std::memcpy(hidden_states.data() + (size_t) chunk_idx * chunk_tokens * (size_t) d.config.d_model, chunk_out,
+                        (size_t) chunk_tokens * (size_t) d.config.d_model * sizeof(float));
+        }
+        ggml_trace_log_end("frontend_session_run", "Audio", NULL);
+
+        t_out = get_feat_extract_output_lengths(frames);
+        if (t_out <= 0 || t_out > n_chunks * chunk_tokens) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("invalid split-encoder output length");
+        }
+
+        hidden_states.resize((size_t) t_out * (size_t) d.config.d_model);
     }
-    ggml_trace_log_end("frontend_session_run", "Audio", NULL);
 
-    const int t_out = get_feat_extract_output_lengths(frames);
-    if (t_out <= 0 || t_out > n_chunks * chunk_tokens) {
-        ggml_trace_log_end("encode_audio", "Audio", NULL);
-        ggml_profile_flush_tls();
-        throw std::runtime_error("invalid split-encoder output length");
-    }
-
-    hidden_states.resize((size_t) t_out * (size_t) d.config.d_model);
-    std::vector<float> attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
-
+    // Common backend path
     const std::vector<int64_t> backend_hidden_shape = { 1, t_out, d.config.d_model };
-    const std::vector<int64_t> backend_mask_shape   = { 1, 1, t_out, t_out };
-
-    auto                      hidden_tensor  = make_tensor_f32(backend_hidden_shape, hidden_states);
-    auto                      mask_tensor    = make_tensor_f32(backend_mask_shape, attention_mask);
-    std::array<Ort::Value, 2> backend_inputs = { std::move(hidden_tensor), std::move(mask_tensor) };
+    auto                       hidden_tensor        = make_tensor_f32(backend_hidden_shape, hidden_states);
 
     ggml_trace_log_begin("backend_session_run", "Audio", NULL);
-    auto backend_outputs =
-        d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(), backend_inputs.data(),
-                              backend_inputs.size(), d.backend_output_names_raw.data(), 1);
+    std::vector<Ort::Value> backend_outputs;
+    if (d.backend_input_names_raw.size() == 2) {
+        // Backend expects hidden_states + attention_mask
+        std::vector<float>         attention_mask((size_t) t_out * (size_t) t_out, 0.0f);
+        const std::vector<int64_t> backend_mask_shape = { 1, 1, t_out, t_out };
+        auto                       mask_tensor        = make_tensor_f32(backend_mask_shape, attention_mask);
+        std::array<Ort::Value, 2>  inputs             = { std::move(hidden_tensor), std::move(mask_tensor) };
+        backend_outputs = d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                                inputs.data(), inputs.size(), d.backend_output_names_raw.data(), 1);
+    } else {
+        // Backend only expects hidden_states (attention_mask pruned by ONNX exporter)
+        backend_outputs = d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                                &hidden_tensor, 1, d.backend_output_names_raw.data(), 1);
+    }
     ggml_trace_log_end("backend_session_run", "Audio", NULL);
 
     float *            output = backend_outputs[0].GetTensorMutableData<float>();

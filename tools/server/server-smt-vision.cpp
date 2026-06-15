@@ -614,6 +614,10 @@ static bool arch_is_qwen3asr(const std::string & arch_name) {
     return contains_icase(arch_name, "qwen3asr");
 }
 
+static bool arch_is_funasr(const std::string & arch_name) {
+    return contains_icase(arch_name, "funasr");
+}
+
 static std::pair<int32_t, int32_t> infer_image_grid_xy(int32_t n_tokens) {
     if (n_tokens <= 0) {
         return { 0, 0 };

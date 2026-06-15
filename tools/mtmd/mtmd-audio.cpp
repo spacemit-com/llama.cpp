@@ -1088,3 +1088,178 @@ std::vector<float> mtmd_audio_streaming_istft::flush() {
 
     return output;
 }
+
+//
+// FunASR Kaldi-compatible fbank + LFR
+//
+
+static void funasr_fft_inplace(float * data, int n) {
+    for (int i = 1, j = 0; i < n; i++) {
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) {
+            j ^= bit;
+        }
+        j ^= bit;
+        if (i < j) {
+            std::swap(data[2 * i], data[2 * j]);
+            std::swap(data[2 * i + 1], data[2 * j + 1]);
+        }
+    }
+    for (int len = 2; len <= n; len <<= 1) {
+        float angle = -2.0f * (float) M_PI / len;
+        float wre   = cosf(angle);
+        float wim   = sinf(angle);
+        for (int i = 0; i < n; i += len) {
+            float ure = 1.0f, uim = 0.0f;
+            for (int j = 0; j < len / 2; j++) {
+                int   a   = i + j;
+                int   b   = i + j + len / 2;
+                float tre = data[2 * b] * ure - data[2 * b + 1] * uim;
+                float tim = data[2 * b] * uim + data[2 * b + 1] * ure;
+                data[2 * b]     = data[2 * a] - tre;
+                data[2 * b + 1] = data[2 * a + 1] - tim;
+                data[2 * a] += tre;
+                data[2 * a + 1] += tim;
+                float new_ure = ure * wre - uim * wim;
+                uim           = ure * wim + uim * wre;
+                ure           = new_ure;
+            }
+        }
+    }
+}
+
+static std::vector<float> funasr_build_mel_filterbank_htk(int n_mel, int n_fft, int sample_rate) {
+    const int   n_fft_bins  = n_fft / 2 + 1;
+    const float fmax        = (float) sample_rate / 2.0f;
+    const float bin_hz_step = (float) sample_rate / (float) n_fft;
+
+    auto hz_to_mel = [](float f) -> float { return 1127.0f * logf(1.0f + f / 700.0f); };
+    auto mel_to_hz = [](float m) -> float { return 700.0f * (expf(m / 1127.0f) - 1.0f); };
+
+    float              mel_lo = hz_to_mel(0.0f);
+    float              mel_hi = hz_to_mel(fmax);
+    std::vector<float> mel_pts(n_mel + 2);
+    for (int i = 0; i < n_mel + 2; i++) {
+        mel_pts[i] = mel_lo + (mel_hi - mel_lo) * (float) i / (float) (n_mel + 1);
+    }
+
+    std::vector<float> hz_pts(n_mel + 2);
+    for (int i = 0; i < n_mel + 2; i++) {
+        hz_pts[i] = mel_to_hz(mel_pts[i]);
+    }
+
+    std::vector<float> filters((size_t) n_mel * n_fft_bins, 0.0f);
+    for (int m = 0; m < n_mel; m++) {
+        float f_left   = hz_pts[m];
+        float f_center = hz_pts[m + 1];
+        float f_right  = hz_pts[m + 2];
+        for (int k = 0; k < n_fft_bins; k++) {
+            float f = k * bin_hz_step;
+            if (f >= f_left && f <= f_center && f_center > f_left) {
+                filters[(size_t) m * n_fft_bins + k] = (f - f_left) / (f_center - f_left);
+            } else if (f > f_center && f <= f_right && f_right > f_center) {
+                filters[(size_t) m * n_fft_bins + k] = (f_right - f) / (f_right - f_center);
+            }
+        }
+    }
+    return filters;
+}
+
+bool mtmd_audio_compute_kaldi_fbank(const float * samples,
+                                    size_t        n_samples,
+                                    int           sample_rate,
+                                    int           n_mel,
+                                    int           frame_len,
+                                    int           frame_shift,
+                                    float         preemph_coeff,
+                                    std::vector<float> & features,
+                                    int &         n_frames_out) {
+    if (n_samples == 0 || n_mel <= 0) {
+        return false;
+    }
+
+    std::vector<float> emphasized(n_samples);
+    emphasized[0] = samples[0];
+    for (size_t i = 1; i < n_samples; i++) {
+        emphasized[i] = samples[i] - preemph_coeff * samples[i - 1];
+    }
+
+    int n_frames = ((int) n_samples - frame_len) / frame_shift + 1;
+    if (n_frames <= 0) {
+        return false;
+    }
+
+    int n_fft = 1;
+    while (n_fft < frame_len) {
+        n_fft <<= 1;
+    }
+    int n_fft_bins = n_fft / 2 + 1;
+
+    std::vector<float> window(frame_len);
+    for (int i = 0; i < frame_len; i++) {
+        window[i] = 0.54f - 0.46f * cosf(2.0f * (float) M_PI * i / frame_len);
+    }
+
+    auto mel_filters = funasr_build_mel_filterbank_htk(n_mel, n_fft, sample_rate);
+
+    features.resize((size_t) n_frames * n_mel);
+    std::vector<float> fft_buf((size_t) n_fft * 2, 0.0f);
+
+    const float inv_n_fft = 1.0f / (float) n_fft;
+
+    for (int frame = 0; frame < n_frames; frame++) {
+        int offset = frame * frame_shift;
+        std::fill(fft_buf.begin(), fft_buf.end(), 0.0f);
+        for (int j = 0; j < frame_len; j++) {
+            fft_buf[2 * j] = emphasized[offset + j] * window[j];
+        }
+
+        funasr_fft_inplace(fft_buf.data(), n_fft);
+
+        for (int m = 0; m < n_mel; m++) {
+            float sum = 0.0f;
+            for (int k = 0; k < n_fft_bins; k++) {
+                float re    = fft_buf[2 * k];
+                float im    = fft_buf[2 * k + 1];
+                float power = (re * re + im * im) * inv_n_fft;
+                sum += power * mel_filters[(size_t) m * n_fft_bins + k];
+            }
+            features[(size_t) frame * n_mel + m] = logf(std::max(sum, 1e-10f));
+        }
+    }
+
+    n_frames_out = n_frames;
+    return true;
+}
+
+bool mtmd_audio_compute_lfr(const std::vector<float> & features,
+                            int n_frames,
+                            int n_mel,
+                            int lfr_m,
+                            int lfr_n,
+                            std::vector<float> & lfr_features,
+                            int & n_lfr_frames_out) {
+    if (n_frames <= 0 || lfr_n <= 0) {
+        return false;
+    }
+    int n_lfr    = (n_frames + lfr_n - 1) / lfr_n;
+    int feat_dim = n_mel * lfr_m;
+    int half_m   = lfr_m / 2;
+    lfr_features.resize((size_t) n_lfr * feat_dim);
+    for (int i = 0; i < n_lfr; i++) {
+        int center = i * lfr_n;
+        int start  = center - half_m;
+        for (int j = 0; j < lfr_m; j++) {
+            int src = start + j;
+            if (src < 0) {
+                src = 0;
+            } else if (src >= n_frames) {
+                src = n_frames - 1;
+            }
+            std::memcpy(lfr_features.data() + (size_t) i * feat_dim + (size_t) j * n_mel,
+                        features.data() + (size_t) src * n_mel, n_mel * sizeof(float));
+        }
+    }
+    n_lfr_frames_out = n_lfr;
+    return true;
+}
