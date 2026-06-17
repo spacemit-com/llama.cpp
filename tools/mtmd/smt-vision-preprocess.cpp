@@ -28,9 +28,17 @@ struct ep_preproc_spec {
     bool    normalize_to_01             = false;
     bool    quantize_to_u8_after_resize = false;
     bool    apply_rescale_and_normalize = false;
+    bool    qwen2vl_patch_flatten       = false;
 };
 
 static ep_preproc_spec resolve_preproc_spec(const std::string & architecture) {
+    // Qwen2VL ONNX exported from model.visual expects the processor's flattened
+    // patch tensor: [grid_h * grid_w, 3 * temporal_patch_size * 14 * 14].
+    if (contains_icase(architecture, "qwen2vl") || contains_icase(architecture, "qwen2_vl")) {
+        return { /* target_w */ 0, /* target_h */ 0, /* normalize_to_01 */ false, /* quantize */ true,
+                 /* apply */ true, /* qwen2vl_patch_flatten */ true };
+    }
+
     // Qwen3VL SMT ONNX keeps internal (x - 127.5) / 127.5 preprocessing.
     if (contains_icase(architecture, "qwen3vl")) {
         return { /* target_w */ 768, /* target_h */ 768, /* normalize_to_01 */ false, /* quantize */ true,
@@ -404,6 +412,78 @@ static std::vector<float> rgb_u8_to_chw_f32_with_config(const std::vector<uint8_
     return out;
 }
 
+static std::vector<float> rgb_u8_to_qwen2vl_patch_f32_with_config(
+    const std::vector<uint8_t> &         src,
+    int32_t                              w,
+    int32_t                              h,
+    const smt_vision_preprocess_config & config) {
+    constexpr int32_t patch_size          = 14;
+    constexpr int32_t temporal_patch_size = 2;
+    constexpr int32_t merge_size          = 2;
+    constexpr int32_t channels            = 3;
+
+    if (w <= 0 || h <= 0 || w % patch_size != 0 || h % patch_size != 0) {
+        throw std::runtime_error("Qwen2VL image dimensions must be positive multiples of patch_size");
+    }
+    if ((w / patch_size) % merge_size != 0 || (h / patch_size) % merge_size != 0) {
+        throw std::runtime_error("Qwen2VL image grid must be divisible by merge_size");
+    }
+
+    const size_t plane = (size_t) w * (size_t) h;
+    if (src.size() != plane * channels) {
+        throw std::runtime_error("Invalid RGB tensor size");
+    }
+
+    std::vector<float> chw(plane * channels, 0.0f);
+    for (int32_t y = 0; y < h; ++y) {
+        for (int32_t x = 0; x < w; ++x) {
+            const size_t src_idx = ((size_t) y * (size_t) w + (size_t) x) * channels;
+            const size_t dst_idx = (size_t) y * (size_t) w + (size_t) x;
+            for (int32_t c = 0; c < channels; ++c) {
+                const float denom = config.image_std[c] == 0.0f ? 1.0f : config.image_std[c];
+                float       v     = (float) src[src_idx + (size_t) c];
+                v                 = v * config.rescale_factor;
+                v                 = (v - config.image_mean[c]) / denom;
+                chw[(size_t) c * plane + dst_idx] = v;
+            }
+        }
+    }
+
+    const int32_t grid_h       = h / patch_size;
+    const int32_t grid_w       = w / patch_size;
+    const int32_t grid_h_group = grid_h / merge_size;
+    const int32_t grid_w_group = grid_w / merge_size;
+    const size_t  row_size     = (size_t) channels * temporal_patch_size * patch_size * patch_size;
+
+    std::vector<float> out((size_t) grid_h * (size_t) grid_w * row_size, 0.0f);
+    size_t             row = 0;
+    for (int32_t ghg = 0; ghg < grid_h_group; ++ghg) {
+        for (int32_t gwg = 0; gwg < grid_w_group; ++gwg) {
+            for (int32_t mh = 0; mh < merge_size; ++mh) {
+                for (int32_t mw = 0; mw < merge_size; ++mw) {
+                    size_t col = 0;
+                    for (int32_t c = 0; c < channels; ++c) {
+                        for (int32_t t = 0; t < temporal_patch_size; ++t) {
+                            (void) t;
+                            for (int32_t py = 0; py < patch_size; ++py) {
+                                const int32_t y = (ghg * merge_size + mh) * patch_size + py;
+                                for (int32_t px = 0; px < patch_size; ++px) {
+                                    const int32_t x = (gwg * merge_size + mw) * patch_size + px;
+                                    out[row * row_size + col] =
+                                        chw[(size_t) c * plane + (size_t) y * (size_t) w + (size_t) x];
+                                    ++col;
+                                }
+                            }
+                        }
+                    }
+                    ++row;
+                }
+            }
+        }
+    }
+    return out;
+}
+
 static std::vector<uint8_t> pack_f32_bytes(const std::vector<float> & values) {
     if (values.empty()) {
         return {};
@@ -451,10 +531,12 @@ smt_vision_preprocess_result smt_vision_preprocess_if_image(const std::vector<ui
 
         const auto resized_u8 = resize_rgb_u8_antialias(pixels, src_w, src_h, spec.target_w, spec.target_h,
                                                         spec.quantize_to_u8_after_resize);
+        const auto preprocess_config = config != nullptr ? *config : smt_vision_preprocess_config();
         const auto f32 =
+            spec.qwen2vl_patch_flatten ?
+                rgb_u8_to_qwen2vl_patch_f32_with_config(resized_u8, spec.target_w, spec.target_h, preprocess_config) :
             spec.apply_rescale_and_normalize ?
-                rgb_u8_to_chw_f32_with_config(resized_u8, spec.target_w, spec.target_h,
-                                              config != nullptr ? *config : smt_vision_preprocess_config()) :
+                rgb_u8_to_chw_f32_with_config(resized_u8, spec.target_w, spec.target_h, preprocess_config) :
                 rgb_u8_to_chw_f32(resized_u8, spec.target_w, spec.target_h, spec.normalize_to_01);
         stbi_image_free(pixels);
 
