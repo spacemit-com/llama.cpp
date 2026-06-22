@@ -650,7 +650,7 @@ static std::pair<std::vector<llama_token>, std::vector<llama_token>> detect_imag
         contains_icase(arch_name, "qwen3vl") || contains_icase(arch_name, "youtuvl")) {
         return { tokenize_exact_special(lctx, "<|vision_start|>"), tokenize_exact_special(lctx, "<|vision_end|>") };
     }
-    if (contains_icase(arch_name, "llama4")) {
+    if (contains_icase(arch_name, "llama4") || contains_icase(arch_name, "lfm2")) {
         return { tokenize_exact_special(lctx, "<|image_start|>"), tokenize_exact_special(lctx, "<|image_end|>") };
     }
     if (contains_icase(arch_name, "gemma3")) {

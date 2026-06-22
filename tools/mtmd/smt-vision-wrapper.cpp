@@ -3,16 +3,17 @@
 #include "smt-vision-wrapper.h"
 
 #include "ggml-profile.h"
-#include "spine_vision_engine.h"
+#include "onnxruntime_cxx_api.h"
 
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
-#include <type_traits>
+#include <unordered_map>
 
 #if defined(_WIN32)
 #    include <io.h>
@@ -28,58 +29,252 @@ const OrtApi * g_ort = NULL;
 
 namespace {
 
-template <typename...> using void_t = void;
-
-template <typename T, typename = void> struct has_ep_config_vision_ctor : std::false_type {};
-
-template <typename T>
-struct has_ep_config_vision_ctor<
-    T,
-    void_t<decltype(T(std::declval<std::string &>(),
-                      std::declval<const std::string &>(),
-                      std::declval<const std::unordered_map<std::string, std::string> &>()))>> : std::true_type {};
-
-template <typename T, typename = void> struct has_legacy_affinity_vision_ctor : std::false_type {};
-
-template <typename T>
-struct has_legacy_affinity_vision_ctor<T,
-                                       void_t<decltype(T(std::declval<std::string &>(),
-                                                         std::declval<int>(),
-                                                         std::declval<int>(),
-                                                         std::declval<const std::string &>()))>> : std::true_type {};
-
-static std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> create_spine_vision_model_engine(
-    std::string &                                        model_path,
-    const std::string &                                  architecture,
-    const std::unordered_map<std::string, std::string> & ep_config) {
-    int         intra_thread_num = 4;
-    int         inter_thread_num = 1;
-    std::string intra_thread_affinity;
-
-    if (ep_config.count("SPACEMIT_EP_INTRA_THREAD_NUM")) {
-        intra_thread_num = std::stoi(ep_config.at("SPACEMIT_EP_INTRA_THREAD_NUM"));
+static int get_ep_thread_num(const std::unordered_map<std::string, std::string> & ep_config,
+                             const std::string &                                  key,
+                             int                                                  default_value) {
+    auto it = ep_config.find(key);
+    if (it == ep_config.end() || it->second.empty()) {
+        return default_value;
     }
-    if (ep_config.count("SPACEMIT_EP_INTER_THREAD_NUM")) {
-        inter_thread_num = std::stoi(ep_config.at("SPACEMIT_EP_INTER_THREAD_NUM"));
-    }
-    if (ep_config.count("SPACEMIT_EP_INTRA_THREAD_AFFINITY")) {
-        intra_thread_affinity = ep_config.at("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
-    }
-
-    if constexpr (has_ep_config_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
-        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, architecture, ep_config);
-    } else if constexpr (has_legacy_affinity_vision_ctor<onnxruntime::spacemit::SpineVisionModelEngine>::value) {
-        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
-                                                                               inter_thread_num, intra_thread_affinity);
-    } else {
-        if (!intra_thread_affinity.empty()) {
-            std::cerr << "[SMT][vision] warning: SPACEMIT_EP_INTRA_THREAD_AFFINITY is ignored by this "
-                         "SpineVisionModelEngine version\n";
-        }
-        return std::make_unique<onnxruntime::spacemit::SpineVisionModelEngine>(model_path, intra_thread_num,
-                                                                               inter_thread_num);
-    }
+    return std::stoi(it->second);
 }
+
+static bool has_spacemit_ep_affinity(const std::unordered_map<std::string, std::string> & ep_config) {
+    auto it = ep_config.find("SPACEMIT_EP_INTRA_THREAD_AFFINITY");
+    return it != ep_config.end() && !it->second.empty();
+}
+
+static std::unordered_map<std::string, std::string> make_provider_options(
+    const std::unordered_map<std::string, std::string> & ep_config) {
+    std::unordered_map<std::string, std::string> provider_options = ep_config;
+    if (provider_options.find("SPACEMIT_EP_INTRA_THREAD_NUM") == provider_options.end()) {
+        provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = "1";
+    }
+    if (provider_options.find("SPACEMIT_EP_INTER_THREAD_NUM") == provider_options.end()) {
+        provider_options["SPACEMIT_EP_INTER_THREAD_NUM"] = "1";
+    }
+    return provider_options;
+}
+
+static bool init_spacemit_execution_provider(Ort::SessionOptions &                                options,
+                                             const std::unordered_map<std::string, std::string> & provider_options,
+                                             std::string &                                        error_message) {
+    std::vector<const char *> keys;
+    std::vector<const char *> values;
+    keys.reserve(provider_options.size());
+    values.reserve(provider_options.size());
+    for (const auto & entry : provider_options) {
+        keys.push_back(entry.first.c_str());
+        values.push_back(entry.second.c_str());
+    }
+
+    void * handle = dlopen("libspacemit_ep.so", RTLD_NOW);
+    if (!handle) {
+        error_message = std::string("failed to load libspacemit_ep.so: ") + dlerror();
+        return false;
+    }
+
+    auto * ep_init =
+        reinterpret_cast<OrtStatus * (*) (OrtSessionOptions *, const char * const *, const char * const *, size_t)>(
+            dlsym(handle, "OrtSessionOptionsSpaceMITEnvInit"));
+    if (!ep_init) {
+        error_message = std::string("failed to find OrtSessionOptionsSpaceMITEnvInit: ") + dlerror();
+        return false;
+    }
+
+    if (OrtStatus * status = ep_init(options, keys.data(), values.data(), keys.size())) {
+        error_message = Ort::GetApi().GetErrorMessage(status);
+        Ort::GetApi().ReleaseStatus(status);
+        return false;
+    }
+
+    return true;
+}
+
+static std::vector<const char *> make_name_ptrs(const std::vector<std::string> & names) {
+    std::vector<const char *> ptrs;
+    ptrs.reserve(names.size());
+    for (const auto & name : names) {
+        ptrs.push_back(name.c_str());
+    }
+    return ptrs;
+}
+
+static std::vector<std::string> get_io_names(Ort::Session & session, bool inputs) {
+    std::vector<std::string>         names;
+    Ort::AllocatorWithDefaultOptions allocator;
+    const size_t                     count = inputs ? session.GetInputCount() : session.GetOutputCount();
+    names.reserve(count);
+    for (size_t i = 0; i < count; ++i) {
+        auto allocated =
+            inputs ? session.GetInputNameAllocated(i, allocator) : session.GetOutputNameAllocated(i, allocator);
+        names.emplace_back(allocated.get());
+    }
+    return names;
+}
+
+static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vector<float> & data) {
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
+}
+
+class smt_ort_vision_engine {
+public:
+    smt_ort_vision_engine(std::string model_path, std::unordered_map<std::string, std::string> ep_config) :
+        model_path_(std::move(model_path)),
+        ep_config_(std::move(ep_config)),
+        env_(ORT_LOGGING_LEVEL_WARNING, "smt-vision") {}
+
+    Ort::Session & create_session() {
+        session_options_.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+
+        const int intra_thread_num = get_ep_thread_num(ep_config_, "SPACEMIT_EP_INTRA_THREAD_NUM", 1);
+        const int inter_thread_num = get_ep_thread_num(ep_config_, "SPACEMIT_EP_INTER_THREAD_NUM", 1);
+        if (!has_spacemit_ep_affinity(ep_config_)) {
+            session_options_.SetIntraOpNumThreads(intra_thread_num);
+            session_options_.SetInterOpNumThreads(inter_thread_num);
+        } else {
+            std::cerr << "[SMT][vision] detected SPACEMIT_EP_INTRA_THREAD_AFFINITY, skip ORT session thread pinning"
+                      << " to avoid conflicting with EP-managed affinity\n";
+        }
+
+        provider_options_ = make_provider_options(ep_config_);
+        std::string error_message;
+        if (!init_spacemit_execution_provider(session_options_, provider_options_, error_message)) {
+            throw std::runtime_error("[SMT][vision] failed to initialize Spacemit EP: " + error_message);
+        }
+
+        std::cerr << "[SMT][vision] Spacemit EP enabled (";
+        for (const auto & pair : provider_options_) {
+            std::cerr << ", " << pair.first << "=" << pair.second;
+        }
+        std::cerr << ")\n";
+
+        session_          = Ort::Session(env_, model_path_.c_str(), session_options_);
+        input_names_      = get_io_names(session_, true);
+        output_names_     = get_io_names(session_, false);
+        input_names_raw_  = make_name_ptrs(input_names_);
+        output_names_raw_ = make_name_ptrs(output_names_);
+
+        if (input_names_raw_.size() != 1 || output_names_raw_.size() != 1) {
+            throw std::runtime_error("Unexpected SMT vision ONNX IO signature");
+        }
+
+        return session_;
+    }
+
+    Ort::Value & set_input_tensor(const std::string & input_binary_path) {
+        auto                      type_info   = session_.GetInputTypeInfo(0);
+        auto                      tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        const std::vector<int64_t> input_shape = tensor_info.GetShape();
+
+        if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("SMT vision expects float32 input tensor");
+        }
+
+        size_t input_size = 1;
+        for (const int64_t dim : input_shape) {
+            if (dim <= 0) {
+                throw std::runtime_error("SMT vision input tensor must have static positive shape");
+            }
+            if (input_size > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+                throw std::runtime_error("SMT vision input tensor is too large");
+            }
+            input_size *= static_cast<size_t>(dim);
+        }
+
+        input_data_.resize(input_size);
+        std::ifstream file(input_binary_path, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            throw std::runtime_error("failed to open SMT vision input binary: " + input_binary_path);
+        }
+
+        const std::streamoff actual_bytes   = file.tellg();
+        const size_t         expected_bytes = input_data_.size() * sizeof(float);
+        if (actual_bytes < 0 || static_cast<size_t>(actual_bytes) != expected_bytes) {
+            throw std::runtime_error("SMT vision input binary size mismatch: expected " +
+                                     std::to_string(expected_bytes) + ", actual " +
+                                     std::to_string(actual_bytes < 0 ? 0 : static_cast<size_t>(actual_bytes)));
+        }
+
+        file.seekg(0, std::ios::beg);
+        file.read(reinterpret_cast<char *>(input_data_.data()), static_cast<std::streamsize>(expected_bytes));
+        if (!file) {
+            throw std::runtime_error("failed to read SMT vision input binary: " + input_binary_path);
+        }
+
+        input_tensor_ = make_tensor_f32(input_shape, input_data_);
+        return input_tensor_;
+    }
+
+    Ort::Value make_zero_input_tensor() {
+        auto                      type_info   = session_.GetInputTypeInfo(0);
+        auto                      tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        const std::vector<int64_t> input_shape = tensor_info.GetShape();
+
+        if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("SMT vision warmup expects float32 input tensor");
+        }
+
+        size_t input_size = 1;
+        for (const int64_t dim : input_shape) {
+            if (dim <= 0) {
+                throw std::runtime_error("SMT vision warmup requires a static positive input shape");
+            }
+            if (input_size > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
+                throw std::runtime_error("SMT vision warmup input tensor is too large");
+            }
+            input_size *= static_cast<size_t>(dim);
+        }
+
+        warmup_data_.assign(input_size, 0.0f);
+        return make_tensor_f32(input_shape, warmup_data_);
+    }
+
+    std::vector<float> run_session(Ort::Value & input_tensor) {
+        std::vector<Ort::Value> output_tensors =
+            session_.Run(Ort::RunOptions{ nullptr }, input_names_raw_.data(), &input_tensor, input_names_raw_.size(),
+                         output_names_raw_.data(), output_names_raw_.size());
+
+        if (output_tensors.empty()) {
+            throw std::runtime_error("SMT vision ONNX returned no outputs");
+        }
+
+        Ort::Value & output      = output_tensors[0];
+        auto         tensor_info = output.GetTensorTypeAndShapeInfo();
+        auto         shape       = tensor_info.GetShape();
+        if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("Expected float32 output from SMT vision model");
+        }
+
+        if (shape.size() == 3 && shape[0] == 1) {
+            shape = { shape[1], shape[2] };
+        }
+        if (shape.size() != 2) {
+            throw std::runtime_error("Unexpected output shape from SMT vision encoder");
+        }
+
+        const size_t total_elements = static_cast<size_t>(shape[0]) * static_cast<size_t>(shape[1]);
+        const float * data          = output.GetTensorData<float>();
+        return std::vector<float>(data, data + total_elements);
+    }
+
+private:
+    std::string                                  model_path_;
+    std::unordered_map<std::string, std::string> ep_config_;
+    std::unordered_map<std::string, std::string> provider_options_;
+    Ort::Env                                     env_;
+    Ort::SessionOptions                          session_options_;
+    Ort::Session                                 session_{ nullptr };
+    std::vector<std::string>                     input_names_;
+    std::vector<std::string>                     output_names_;
+    std::vector<const char *>                    input_names_raw_;
+    std::vector<const char *>                    output_names_raw_;
+    std::vector<float>                           input_data_;
+    std::vector<float>                           warmup_data_;
+    Ort::Value                                   input_tensor_{ nullptr };
+};
 
 struct smt_vision_config {
     std::vector<std::string>                     architectures;
@@ -567,111 +762,22 @@ static bool load_smt_vision_config(const std::string & config_dir, smt_vision_co
 }  // namespace
 
 struct smt_vision_context::impl {
-    smt_vision_config                                              config;
-    std::unique_ptr<onnxruntime::spacemit::SpineVisionModelEngine> vision_engine;
-    std::string                                                    arch_name;
+    smt_vision_config                      config;
+    std::unique_ptr<smt_ort_vision_engine> vision_engine;
+    std::string                            arch_name;
 };
 
 namespace {
 
-static size_t get_static_input_tensor_elements(Ort::Session & session) {
-    auto type_info   = session.GetInputTypeInfo(0);
-    auto tensor_info = type_info.GetTensorTypeAndShapeInfo();
-
-    if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-        throw std::runtime_error("SMT vision warmup expects float32 input tensor");
+static void warmup_vision_engine(smt_ort_vision_engine & vision_engine, const std::string & arch_name) {
+    std::cerr << "[SMT][vision] warmup ONNX session";
+    if (!arch_name.empty()) {
+        std::cerr << " for " << arch_name;
     }
+    std::cerr << "\n";
 
-    const std::vector<int64_t> input_shape = tensor_info.GetShape();
-    size_t                     input_size  = 1;
-    for (const int64_t dim : input_shape) {
-        if (dim <= 0) {
-            throw std::runtime_error("SMT vision warmup requires a static positive input shape");
-        }
-        if (input_size > std::numeric_limits<size_t>::max() / static_cast<size_t>(dim)) {
-            throw std::runtime_error("SMT vision warmup input tensor is too large");
-        }
-        input_size *= static_cast<size_t>(dim);
-    }
-
-    return input_size;
-}
-
-static std::string write_zero_tensor_file(size_t n_floats) {
-    const std::vector<float> zeros(n_floats, 0.0f);
-
-#if defined(_WIN32)
-    char temp_path[MAX_PATH] = { 0 };
-    char temp_file[MAX_PATH] = { 0 };
-
-    if (GetTempPathA(MAX_PATH, temp_path) == 0) {
-        throw std::runtime_error("failed to get temp path for SMT vision warmup");
-    }
-    if (GetTempFileNameA(temp_path, "lsw", 0, temp_file) == 0) {
-        throw std::runtime_error("failed to create temp file for SMT vision warmup");
-    }
-
-    std::ofstream file(temp_file, std::ios::binary);
-    if (!file.is_open()) {
-        std::remove(temp_file);
-        throw std::runtime_error("failed to open temp file for SMT vision warmup");
-    }
-    file.write(reinterpret_cast<const char *>(zeros.data()),
-               static_cast<std::streamsize>(zeros.size() * sizeof(float)));
-    if (!file) {
-        file.close();
-        std::remove(temp_file);
-        throw std::runtime_error("failed to write temp file for SMT vision warmup");
-    }
-    file.close();
-    return std::string(temp_file);
-#else
-    char      tmpl[] = "/tmp/llama-smt-vision-warmup-XXXXXX";
-    const int fd     = mkstemp(tmpl);
-    if (fd < 0) {
-        throw std::runtime_error("failed to create temp file for SMT vision warmup");
-    }
-
-    const char * ptr        = reinterpret_cast<const char *>(zeros.data());
-    size_t       bytes_left = zeros.size() * sizeof(float);
-    while (bytes_left > 0) {
-        const ssize_t written = write(fd, ptr, bytes_left);
-        if (written <= 0) {
-            close(fd);
-            std::remove(tmpl);
-            throw std::runtime_error("failed to write temp file for SMT vision warmup");
-        }
-        ptr += written;
-        bytes_left -= static_cast<size_t>(written);
-    }
-
-    close(fd);
-    return std::string(tmpl);
-#endif
-}
-
-static void warmup_vision_engine(onnxruntime::spacemit::SpineVisionModelEngine & vision_engine,
-                                 Ort::Session &                                  session,
-                                 const std::string &                             arch_name) {
-    const size_t      input_elements = get_static_input_tensor_elements(session);
-    const std::string temp_path      = write_zero_tensor_file(input_elements);
-
-    try {
-        std::cerr << "[SMT][vision] warmup ONNX session";
-        if (!arch_name.empty()) {
-            std::cerr << " for " << arch_name;
-        }
-        std::cerr << "\n";
-
-        std::string  path_copy    = temp_path;
-        Ort::Value & input_tensor = vision_engine.SetInputTensor(path_copy);
-        (void) vision_engine.RunSession(input_tensor);
-    } catch (...) {
-        std::remove(temp_path.c_str());
-        throw;
-    }
-
-    std::remove(temp_path.c_str());
+    Ort::Value input_tensor = vision_engine.make_zero_input_tensor();
+    (void) vision_engine.run_session(input_tensor);
 }
 
 }  // namespace
@@ -696,17 +802,11 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
     // 3. Create vision engine and session
-    d.vision_engine = create_spine_vision_model_engine(d.config.vision_model_path, d.arch_name, d.config.ep_config);
-    Ort::Session & vision_session = d.vision_engine->CreateVisionModelSession();
+    d.vision_engine = std::make_unique<smt_ort_vision_engine>(d.config.vision_model_path, d.config.ep_config);
+    (void) d.vision_engine->create_session();
     if (warmup) {
-        warmup_vision_engine(*d.vision_engine, vision_session, d.arch_name);
+        warmup_vision_engine(*d.vision_engine, d.arch_name);
     }
-
-    std::cerr << "[SMT][vision] Spacemit EP enabled (";
-    for (const auto & pair : d.config.ep_config) {
-        std::cerr << ", " << pair.first << "=" << pair.second;
-    }
-    std::cerr << ")\n";
 
     return ctx;
 }
@@ -716,14 +816,12 @@ std::vector<float> smt_vision_context::encode_image(const std::string & binary_p
 
     ggml_trace_log_begin("encode_image", "Vision", NULL);
 
-    std::string path_copy = binary_path;
-
     ggml_trace_log_begin("set_input_tensor", "Vision", NULL);
-    Ort::Value & input_tensor = d.vision_engine->SetInputTensor(path_copy);
+    Ort::Value & input_tensor = d.vision_engine->set_input_tensor(binary_path);
     ggml_trace_log_end("set_input_tensor", "Vision", NULL);
 
     ggml_trace_log_begin("vision_session_run", "Vision", NULL);
-    std::vector<float> result = d.vision_engine->RunSession(input_tensor);
+    std::vector<float> result = d.vision_engine->run_session(input_tensor);
     ggml_trace_log_end("vision_session_run", "Vision", NULL);
 
     ggml_trace_log_end("encode_image", "Vision", NULL);
