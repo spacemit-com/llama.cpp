@@ -1718,7 +1718,7 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size =
             ggml::cpu::riscv64_spacemit::global_spine_env_info.tcm_blk_size;
     }
-
+#ifdef GGML_ENABLE_TCM_MEM_BARRIER
     if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
         void * rt =
             ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
@@ -1726,9 +1726,11 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
             GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
         }
     }
+#endif
 }
 
 void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n) {
+#ifdef GGML_ENABLE_TCM_MEM_BARRIER
     if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
         auto rt = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(
             ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
@@ -1736,5 +1738,6 @@ void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int t
             GGML_ABORT("release tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
         }
     }
+#endif
 }
 }
