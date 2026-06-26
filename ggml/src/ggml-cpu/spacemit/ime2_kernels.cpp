@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <cstdlib>
 #include <stdexcept>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
@@ -31,6 +33,24 @@
 
 namespace spacemit_kernels {
 namespace ime2 {
+
+namespace {
+
+bool env_flag_enabled(const char *name) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') {
+        return false;
+    }
+    return !(std::strcmp(value, "0") == 0 || std::strcmp(value, "false") == 0 || std::strcmp(value, "FALSE") == 0 ||
+             std::strcmp(value, "off") == 0 || std::strcmp(value, "OFF") == 0);
+}
+
+bool q4_hp_m1_n64_enabled() {
+    static const bool enabled = env_flag_enabled("SPACEMIT_Q4_HP_M1_N64");
+    return enabled;
+}
+
+}  // namespace
 
 template <size_t MB_ROWS, size_t NB_COLS>
 void gemm_kernel_i8i2k_mrow_ref(size_t          blk_len,
@@ -2904,7 +2924,132 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
     const size_t b_tile_stride = k_blks * b_superblk_stride;
 
     if (quant_b_zp == NULL) {
-        for (size_t ni = 0; ni < count_n; ni += 32) {
+        size_t ni = 0;
+        if (q4_hp_m1_n64_enabled()) {
+            for (; ni + 2 * NB_COLS <= count_n; ni += 2 * NB_COLS) {
+                uint8_t * b_data0 = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
+                uint8_t * b_data1 = b_data0 + b_tile_stride;
+                int8_t *  a_data  = (int8_t *) quant_a_ptr;
+                float *   dst_c0  = c_ptr + ni;
+                float *   dst_c1  = c_ptr + ni + NB_COLS;
+
+                asm volatile(
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vxor.vv        v30, v30, v30           \n\t"
+                    "vxor.vv        v31, v31, v31           \n\t"
+                    "mv             t4, %[BK]               \n\t"
+                    "li             t0, 0x4c00              \n\t"
+                    "fmv.h.x        fa0, t0                 \n\t"
+
+                    ".align 4                               \n\t"
+                    "BLK_LOOP64%=:                          \n\t"
+                    "li             t5, 8                   \n\t"
+                    "addi           t6, %[A], 288           \n\t"
+                    "flh            ft1, (t6)               \n\t"
+                    "addi           t6, %[A], 272           \n\t"
+
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vxor.vv        v16, v16, v16           \n\t"
+                    "vxor.vv        v17, v17, v17           \n\t"
+                    "vxor.vv        v18, v18, v18           \n\t"
+                    "vxor.vv        v19, v19, v19           \n\t"
+                    "vxor.vv        v20, v20, v20           \n\t"
+                    "vxor.vv        v21, v21, v21           \n\t"
+                    "vxor.vv        v22, v22, v22           \n\t"
+                    "vxor.vv        v23, v23, v23           \n\t"
+
+                    "INNER_BLK_LOOP64%=:                    \n\t"
+                    ".rept 4                                 \n\t"
+                    "flh            fa1, (t6)               \n\t"
+                    "addi           t6, t6, 2               \n\t"
+                    "flh            ft0, (%[A])             \n\t"
+                    "addi           %[A], %[A], 2           \n\t"
+
+                    "vsetvli        t0, x0, e8, mf4         \n\t"
+                    "vle8.v         v3, (%[A])              \n\t"
+                    "addi           %[A], %[A], 32          \n\t"
+                    "vsetvli        t0, x0, e8, m1          \n\t"
+                    "vsrl.vi        v28, v3, 4              \n\t"
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vnpack4.vv     v2, v3, v3, 3           \n\t"
+                    "vnpack4.vv     v3, v28, v28, 3         \n\t"
+
+                    "vsetvli        t0, x0, e16, mf2        \n\t"
+                    "vle16.v        v8, (%[B0])             \n\t"
+                    "addi           %[B0], %[B0], 64        \n\t"
+                    "vl4r.v         v4, (%[B0])             \n\t"
+                    "addi           %[B0], %[B0], 512       \n\t"
+                    "vfmul.vf       v8, v8, ft0             \n\t"
+                    "vfmul.vf       v9, v8, fa0             \n\t"
+                    "vfmul.vf       v10, v8, fa1            \n\t"
+                    "vfwmacc.vf     v30, ft1, v10           \n\t"
+                    "vsetvli        t0, x0, e8, m1          \n\t"
+                    "vpack.vv       v0, v8, v9, 3           \n\t"
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"
+                    "vmadotsu.hp    v17, v3, v5, v0, 5, i4  \n\t"
+                    "vmadotsu.hp    v18, v3, v6, v0, 6, i4  \n\t"
+                    "vmadotsu.hp    v19, v3, v7, v0, 7, i4  \n\t"
+                    "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"
+                    "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
+                    "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
+                    "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
+
+                    "vsetvli        t0, x0, e16, mf2        \n\t"
+                    "vle16.v        v8, (%[B1])             \n\t"
+                    "addi           %[B1], %[B1], 64        \n\t"
+                    "vl4r.v         v4, (%[B1])             \n\t"
+                    "addi           %[B1], %[B1], 512       \n\t"
+                    "vfmul.vf       v8, v8, ft0             \n\t"
+                    "vfmul.vf       v9, v8, fa0             \n\t"
+                    "vfmul.vf       v10, v8, fa1            \n\t"
+                    "vfwmacc.vf     v31, ft1, v10           \n\t"
+                    "vsetvli        t0, x0, e8, m1          \n\t"
+                    "vpack.vv       v0, v8, v9, 3           \n\t"
+                    "addi           t5, t5, -1              \n\t"
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vmadotsu.hp    v20, v3, v4, v0, 4, i4  \n\t"
+                    "vmadotsu.hp    v21, v3, v5, v0, 5, i4  \n\t"
+                    "vmadotsu.hp    v22, v3, v6, v0, 6, i4  \n\t"
+                    "vmadotsu.hp    v23, v3, v7, v0, 7, i4  \n\t"
+                    "vmadotu.hp     v20, v2, v4, v0, 0, i4  \n\t"
+                    "vmadotu.hp     v21, v2, v5, v0, 1, i4  \n\t"
+                    "vmadotu.hp     v22, v2, v6, v0, 2, i4  \n\t"
+                    "vmadotu.hp     v23, v2, v7, v0, 3, i4  \n\t"
+                    ".endr                                   \n\t"
+
+                    "bgtz           t5, INNER_BLK_LOOP64%=  \n\t"
+
+                    "vpack.vv       v8, v16, v17, 1         \n\t"
+                    "vpack.vv       v12, v18, v19, 1        \n\t"
+                    "vpack.vv       v24, v8, v12, 2         \n\t"
+                    "vsetvli        t0, x0, e16, mf2        \n\t"
+                    "vfwmacc.vf     v30, ft1, v24           \n\t"
+
+                    "vsetvli        t0, x0, e16, m1         \n\t"
+                    "vpack.vv       v8, v20, v21, 1         \n\t"
+                    "vpack.vv       v12, v22, v23, 1        \n\t"
+                    "vpack.vv       v24, v8, v12, 2         \n\t"
+                    "vsetvli        t0, x0, e16, mf2        \n\t"
+                    "vfwmacc.vf     v31, ft1, v24           \n\t"
+
+                    "addi           t4, t4, -1              \n\t"
+                    "addi           %[A], t6, 2             \n\t"
+                    "bgtz           t4, BLK_LOOP64%=        \n\t"
+
+                    "vsetvli        t0, x0, e32, m1         \n\t"
+                    "vse32.v        v30, (%[DST0])          \n\t"
+                    "vse32.v        v31, (%[DST1])          \n\t"
+                    : [A] "+r"(a_data), [B0] "+r"(b_data0), [B1] "+r"(b_data1)
+                    : [DST0] "r"(dst_c0), [DST1] "r"(dst_c1), [BK] "r"(k_blks)
+                    : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                      "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
+                      "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1",
+                      "ft0", "ft1");
+            }
+        }
+
+        for (; ni < count_n; ni += 32) {
             uint8_t * b_data = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
             int8_t *  a_data = (int8_t *) quant_a_ptr;
             float *   dst_c  = c_ptr + ni;
@@ -2925,12 +3070,13 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
 
                 // init the acc fp16
                 "vsetvli        t0, x0, e16, m1         \n\t"
+                "vxor.vv        v18, v18, v18           \n\t"
                 "vxor.vv        v16, v18, v18           \n\t"
                 "vxor.vv        v17, v18, v18           \n\t"
-                "vxor.vv        v18, v18, v18           \n\t"
                 "vxor.vv        v19, v18, v18           \n\t"
 
                 "INNER_BLK_LOOP%=:                      \n\t"
+                ".rept 4                                 \n\t"
                 // load a sum and scale
                 "flh            fa1, (t6)               \n\t"
                 "addi           t6, t6, 2               \n\t"
@@ -2940,6 +3086,12 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                 "vsetvli        t0, x0, e8, mf4         \n\t"
                 "vle8.v         v3, (%[A])              \n\t"  // 1x32@i8
                 "addi           %[A], %[A], 32          \n\t"
+
+                "vsetvli        t0, x0, e8, m1          \n\t"
+                "vsrl.vi        v28, v3, 4              \n\t"
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vnpack4.vv     v2, v3, v3, 3           \n\t"  // lo4 of A
+                "vnpack4.vv     v3, v28, v28, 3         \n\t"  // hi4 of A
 
                 // load scale B and B
                 "vsetvli        t0, x0, e16, mf2        \n\t"
@@ -2954,11 +3106,8 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
 
                 "vsetvli        t0, x0, e8, m1          \n\t"
                 "vpack.vv       v0, v8, v9, 3           \n\t"
-                "vsrl.vi        v28, v3, 4              \n\t"
 
-                "vsetvli        t0, x0, e16, m1         \n\t"
-                "vnpack4.vv     v2, v3, v3, 3           \n\t"  // lo4 of A
-                "vnpack4.vv     v3, v28, v28, 3         \n\t"  // hi4 of A
+                "addi           t5, t5, -1              \n\t"
 
                 // i4 * i4 vmadot
                 "vsetvli        t0, x0, e16, m1         \n\t"
@@ -2970,8 +3119,8 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                 "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
                 "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
                 "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
+                ".endr                                   \n\t"
 
-                "addi           t5, t5, -1              \n\t"
                 "bgtz           t5, INNER_BLK_LOOP%=    \n\t"
 
                 "vpack.vv       v8, v16, v17, 1         \n\t"
@@ -3001,6 +3150,176 @@ void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
     } else {
         // TODO: support quant_b_zp for i8i4 hp kernel
         GGML_ABORT("gemm_kernel_i8i4_hp_m1 with quant_b_zp is not supported yet");
+    }
+}
+
+void gemm_kernel_i8i4_hp_m2(size_t          blk_len,
+                            const uint8_t * quant_a_ptr,
+                            const uint8_t * quant_b_data,
+                            const uint8_t * quant_b_zp,
+                            float *         c_ptr,
+                            size_t          count_m,
+                            size_t          count_n,
+                            size_t          k_blks,
+                            size_t          ldc) {
+    constexpr size_t NB_COLS                = 32;
+    constexpr size_t k_subblks_per_superblk = 8;
+
+    struct block_q4_0x32_layout {
+        _Float16 d[NB_COLS];
+        uint8_t  qs[16 * NB_COLS];
+    };
+
+    GGML_ASSERT(blk_len == 256);
+    GGML_ASSERT(count_m >= 2);
+
+    const size_t a_row_stride = q8_hp_blk_size(blk_len, true, true) * k_blks;
+    const size_t b_superblk_stride = sizeof(block_q4_0x32_layout) * k_subblks_per_superblk +
+                                     (quant_b_zp ? NB_COLS * k_subblks_per_superblk * sizeof(uint8_t) : 0);
+    const size_t b_tile_stride = k_blks * b_superblk_stride;
+
+    if (quant_b_zp == NULL) {
+        for (size_t ni = 0; ni < count_n; ni += 32) {
+            uint8_t * b_data  = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
+            int8_t *  a_data0 = (int8_t *) quant_a_ptr;
+            int8_t *  a_data1 = (int8_t *) quant_a_ptr + a_row_stride;
+            float *   dst_c0  = c_ptr + ni;
+            float *   dst_c1  = c_ptr + ldc + ni;
+
+            asm volatile(
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vxor.vv        v30, v30, v30           \n\t"
+                "vxor.vv        v31, v31, v31           \n\t"
+                "li             t0, 0x4c00              \n\t"  // 16 in fp16
+                "fmv.h.x        fa0, t0                 \n\t"
+                "mv             t4, %[BK]               \n\t"
+
+                ".align 4                               \n\t"
+                "BLK_LOOP%=:                            \n\t"
+                "li             t5, 4                   \n\t"
+
+                // row0 block scale and a_sum pointer
+                "addi           t6, %[A0], 288          \n\t"
+                "flh            ft1, (t6)               \n\t"
+                "addi           t6, %[A0], 272          \n\t"
+
+                // row1 block scale and a_sum pointer
+                "addi           s2, %[A1], 288          \n\t"
+                "flh            ft2, (s2)               \n\t"
+                "addi           s2, %[A1], 272          \n\t"
+
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vxor.vv        v16, v16, v16           \n\t"
+                "vxor.vv        v17, v17, v17           \n\t"
+                "vxor.vv        v18, v18, v18           \n\t"
+                "vxor.vv        v19, v19, v19           \n\t"
+                "vxor.vv        v20, v20, v20           \n\t"
+                "vxor.vv        v21, v21, v21           \n\t"
+                "vxor.vv        v22, v22, v22           \n\t"
+                "vxor.vv        v23, v23, v23           \n\t"
+
+                "INNER_BLK_LOOP%=:                      \n\t"
+                ".rept 2                                 \n\t"
+                // load shared B scale and payload once for two rows
+                "vsetvli        t0, x0, e16, mf2        \n\t"
+                "vle16.v        v11, (%[B])             \n\t"
+                "addi           %[B], %[B], 64          \n\t"
+                "vsetvli        t0, x0, e8, m1          \n\t"
+                "vl4r.v         v4, (%[B])              \n\t"
+                "addi           %[B], %[B], 512         \n\t"
+
+                // row0: same arithmetic order as m1
+                "flh            fa1, (t6)               \n\t"
+                "addi           t6, t6, 2               \n\t"
+                "flh            ft0, (%[A0])            \n\t"
+                "addi           %[A0], %[A0], 2         \n\t"
+                "vsetvli        t0, x0, e8, mf4         \n\t"
+                "vle8.v         v3, (%[A0])             \n\t"
+                "addi           %[A0], %[A0], 32        \n\t"
+                "vsetvli        t0, x0, e16, mf2        \n\t"
+                "vfmul.vf       v8, v11, ft0            \n\t"
+                "vfmul.vf       v9, v8, fa0             \n\t"
+                "vfmul.vf       v10, v8, fa1            \n\t"
+                "vfwmacc.vf     v30, ft1, v10           \n\t"
+                "vsetvli        t0, x0, e8, m1          \n\t"
+                "vpack.vv       v0, v8, v9, 3           \n\t"
+                "vsrl.vi        v28, v3, 4              \n\t"
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vnpack4.vv     v2, v3, v3, 3           \n\t"
+                "vnpack4.vv     v3, v28, v28, 3         \n\t"
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"
+                "vmadotsu.hp    v17, v3, v5, v0, 5, i4  \n\t"
+                "vmadotsu.hp    v18, v3, v6, v0, 6, i4  \n\t"
+                "vmadotsu.hp    v19, v3, v7, v0, 7, i4  \n\t"
+                "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"
+                "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
+                "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
+                "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
+
+                // row1: same arithmetic order as m1
+                "flh            fa2, (s2)               \n\t"
+                "addi           s2, s2, 2               \n\t"
+                "flh            ft3, (%[A1])            \n\t"
+                "addi           %[A1], %[A1], 2         \n\t"
+                "vsetvli        t0, x0, e8, mf4         \n\t"
+                "vle8.v         v3, (%[A1])             \n\t"
+                "addi           %[A1], %[A1], 32        \n\t"
+                "vsetvli        t0, x0, e16, mf2        \n\t"
+                "vfmul.vf       v8, v11, ft3            \n\t"
+                "vfmul.vf       v9, v8, fa0             \n\t"
+                "vfmul.vf       v10, v8, fa2            \n\t"
+                "vfwmacc.vf     v31, ft2, v10           \n\t"
+                "vsetvli        t0, x0, e8, m1          \n\t"
+                "vpack.vv       v0, v8, v9, 3           \n\t"
+                "vsrl.vi        v28, v3, 4              \n\t"
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vnpack4.vv     v2, v3, v3, 3           \n\t"
+                "vnpack4.vv     v3, v28, v28, 3         \n\t"
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vmadotsu.hp    v20, v3, v4, v0, 4, i4  \n\t"
+                "vmadotsu.hp    v21, v3, v5, v0, 5, i4  \n\t"
+                "vmadotsu.hp    v22, v3, v6, v0, 6, i4  \n\t"
+                "vmadotsu.hp    v23, v3, v7, v0, 7, i4  \n\t"
+                "vmadotu.hp     v20, v2, v4, v0, 0, i4  \n\t"
+                "vmadotu.hp     v21, v2, v5, v0, 1, i4  \n\t"
+                "vmadotu.hp     v22, v2, v6, v0, 2, i4  \n\t"
+                "vmadotu.hp     v23, v2, v7, v0, 3, i4  \n\t"
+
+                ".endr                                   \n\t"
+                "addi           t5, t5, -1              \n\t"
+                "bgtz           t5, INNER_BLK_LOOP%=    \n\t"
+
+                "vpack.vv       v8, v16, v17, 1         \n\t"
+                "vpack.vv       v12, v18, v19, 1        \n\t"
+                "vpack.vv       v24, v8, v12, 2         \n\t"
+                "vsetvli        t0, x0, e16, mf2        \n\t"
+                "vfwmacc.vf     v30, ft1, v24           \n\t"
+
+                "vsetvli        t0, x0, e16, m1         \n\t"
+                "vpack.vv       v8, v20, v21, 1         \n\t"
+                "vpack.vv       v12, v22, v23, 1        \n\t"
+                "vpack.vv       v24, v8, v12, 2         \n\t"
+                "vsetvli        t0, x0, e16, mf2        \n\t"
+                "vfwmacc.vf     v31, ft2, v24           \n\t"
+
+                "addi           t4, t4, -1              \n\t"
+                "addi           %[A0], t6, 2            \n\t"
+                "addi           %[A1], s2, 2            \n\t"
+                "bgtz           t4, BLK_LOOP%=          \n\t"
+
+                "vsetvli        t0, x0, e32, m1         \n\t"
+                "vse32.v        v30, (%[DST0])          \n\t"
+                "vse32.v        v31, (%[DST1])          \n\t"
+                : [A0] "+r"(a_data0), [A1] "+r"(a_data1), [B] "+r"(b_data)
+                : [DST0] "r"(dst_c0), [DST1] "r"(dst_c1), [BK] "r"(k_blks)
+                : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s2", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
+                  "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21",
+                  "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "ft0",
+                  "ft1", "ft2", "ft3");
+        }
+    } else {
+        GGML_ABORT("gemm_kernel_i8i4_hp_m2 with quant_b_zp is not supported yet");
     }
 }
 
@@ -4776,9 +5095,9 @@ void gemm_kernel_i8i8_m1(size_t          blk_len,
                          const uint8_t * quant_b_zp,
                          float *         c_ptr,
                          size_t          count_m,
-                         size_t          count_n,
-                         size_t          k_blks,
-                         size_t          ldc) {
+	                         size_t          count_n,
+	                         size_t          k_blks,
+	                         size_t          ldc) {
     for (size_t n = 0; n < count_n; n += 32) {
         size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
         uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data +      //
@@ -5625,6 +5944,14 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
         gemm_kernel_i8i4_hp_m4(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
 #endif
         return 4;
+    } else if (count_m >= 2) {
+#if 0
+        gemm_kernel_i8i4_hp_mrow_ref<2, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
+                                            k_blks, ldc);
+#else
+        gemm_kernel_i8i4_hp_m2(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+#endif
+        return 2;
     } else {
 #if 0
         gemm_kernel_i8i4_hp_mrow_ref<1, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,

@@ -1588,7 +1588,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_layer = tn.bid == -1 || (flags & TENSOR_SKIP) ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);

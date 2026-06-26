@@ -336,6 +336,8 @@ private:
 
     ggml_threadpool_t threadpool       = nullptr;
     ggml_threadpool_t threadpool_batch = nullptr;
+    ggml_threadpool_t graph_compute_threadpool = nullptr;
+    int32_t           graph_compute_n_threads  = -1;
 
     ggml_abort_callback abort_callback      = nullptr;
     void *              abort_callback_data = nullptr;
@@ -348,7 +350,9 @@ private:
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
     llm_graph_result_ptr gf_res_prev;
+    llm_graph_result_ptr gf_res_prev_alt;
     llm_graph_result_ptr gf_res_reserve;
+    llm_graph_result * gf_res_sched = nullptr;
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
@@ -360,6 +364,7 @@ private:
 
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
+    bool graph_cache_2way = false;
 
     // perf
     mutable int64_t t_start_us  = 0;

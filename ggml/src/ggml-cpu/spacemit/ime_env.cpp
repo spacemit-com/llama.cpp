@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <thread>
@@ -176,13 +177,13 @@ spine_env_info::spine_env_info() {
     }
 
     char * spine_perfer_core_arch_str = getenv("SPACEMIT_PERFER_CORE_ARCH");
-    if (spine_perfer_core_arch_str != nullptr && spine_perfer_core_arch_str != "") {
+    if (spine_perfer_core_arch_str != nullptr && spine_perfer_core_arch_str[0] != '\0') {
         perfer_core_arch_id = spine_core_arch_id{ hex_string_to_u16(spine_perfer_core_arch_str) };
     }
 
     char *           spine_perfer_core_id_str = getenv("SPACEMIT_PERFER_CORE_ID");
     std::vector<int> perfer_core_id_vec;
-    if (spine_perfer_core_id_str != nullptr && spine_perfer_core_id_str != "") {
+    if (spine_perfer_core_id_str != nullptr && spine_perfer_core_id_str[0] != '\0') {
         std::string perfer_core_id_str(spine_perfer_core_id_str);
         size_t      start = 0;
         size_t      end   = 0;
@@ -296,8 +297,7 @@ spine_env_info::spine_env_info() {
     if (init_barrier != nullptr) {
         init_barrier_is_shared_mem = true;
     } else {
-        GGML_LOG_WARN("CPU_RISCV64_SPACEMIT: failed to allocate init_barrier from shared mem, falling back to heap\n",
-                      __func__);
+        GGML_LOG_WARN("CPU_RISCV64_SPACEMIT: failed to allocate init_barrier from shared mem, falling back to heap\n");
         init_barrier = new spine_barrier_t[spine_init_barrier_count];
     }
 

@@ -83,6 +83,14 @@ float ggml_table_f32_f16[1 << 16];
 // precomputed f32 table for e8m0 half (1 KB) (simd-mappings.h)
 float ggml_table_f32_e8m0_half[1 << 8];
 
+static bool ggml_cpu_fuse_swiglu_down_q8_enabled(void) {
+    static int enabled = -1;
+    if (enabled < 0) {
+        enabled = getenv("GGML_CPU_FUSE_SWIGLU_DOWN_Q8") != NULL;
+    }
+    return enabled != 0;
+}
+
 #if defined(__ARM_ARCH)
 struct ggml_arm_arch_features_type {
     int sve_cnt;
@@ -1156,6 +1164,102 @@ void ggml_set_f32_nd(const struct ggml_tensor * tensor, int i0, int i1, int i2, 
 
 // ggml_compute_forward_mul_mat
 
+static bool ggml_cpu_can_fuse_swiglu_down_q8_mul_mat(
+        const struct ggml_tensor * dst,
+        const enum ggml_type vec_dot_type) {
+    if (!ggml_cpu_fuse_swiglu_down_q8_enabled()) {
+        return false;
+    }
+
+    const struct ggml_tensor * src0 = dst->src[0];
+    const struct ggml_tensor * src1 = dst->src[1];
+
+    if (dst->op != GGML_OP_MUL_MAT || src0 == NULL || src1 == NULL) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_Q4_0 || vec_dot_type != GGML_TYPE_Q8_0) {
+        return false;
+    }
+    if (src1->op != GGML_OP_GLU || ggml_get_glu_op(src1) != GGML_GLU_OP_SWIGLU) {
+        return false;
+    }
+    if (src1->type != GGML_TYPE_F32 || src1->src[0] == NULL || src1->src[1] == NULL) {
+        return false;
+    }
+
+    const struct ggml_tensor * gate = src1->src[0];
+    const struct ggml_tensor * up   = src1->src[1];
+
+    if (gate->type != GGML_TYPE_F32 || up->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (gate->ne[0] != src1->ne[0] || up->ne[0] != src1->ne[0]) {
+        return false;
+    }
+    if (src0->ne[0] != src1->ne[0]) {
+        return false;
+    }
+    if (ggml_nrows(src1) != 1) {
+        return false;
+    }
+    if (src1->nb[0] != sizeof(float) || gate->nb[0] != sizeof(float) || up->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (!ggml_is_contiguous_1(src1) || !ggml_is_contiguous_1(gate) || !ggml_is_contiguous_1(up)) {
+        return false;
+    }
+
+    return true;
+}
+
+static void ggml_cpu_quantize_swiglu_to_q8(
+        const struct ggml_compute_params * params,
+        const struct ggml_tensor * src1,
+        char * wdata,
+        const enum ggml_type vec_dot_type,
+        ggml_from_float_t from_float,
+        const int64_t ne10,
+        const int64_t ne11,
+        const int64_t ne12,
+        const int64_t ne13) {
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const struct ggml_tensor * gate = src1->src[0];
+    const struct ggml_tensor * up   = src1->src[1];
+
+    const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+    const size_t nbw2 = nbw1 * ne11;
+    const size_t nbw3 = nbw2 * ne12;
+
+    const size_t bs = ggml_blck_size(vec_dot_type);
+    const int64_t ne10_block_start = (ith * ne10 / bs) / nth;
+    const int64_t ne10_block_end   = ((ith + 1) * ne10 / bs) / nth;
+    const int64_t offset = ne10_block_start * (int64_t) bs;
+    const int64_t len = (ne10_block_end - ne10_block_start) * (int64_t) bs;
+
+    if (len <= 0) {
+        return;
+    }
+
+    float * tmp = (float *) alloca((size_t) len * sizeof(float));
+
+    for (int64_t i13 = 0; i13 < ne13; ++i13) {
+        for (int64_t i12 = 0; i12 < ne12; ++i12) {
+            for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                const int64_t row = i11 + i12 * ne11 + i13 * ne12 * ne11;
+                const float * gate_row = (const float *) ((const char *) gate->data + row * gate->nb[1]);
+                const float * up_row   = (const float *) ((const char *) up->data   + row * up->nb[1]);
+
+                ggml_vec_swiglu_f32((int) len, tmp, gate_row + offset, up_row + offset);
+                from_float(tmp,
+                           (void *) (wdata + i13 * nbw3 + i12 * nbw2 + i11 * nbw1 + ne10_block_start * ggml_type_size(vec_dot_type)),
+                           len);
+            }
+        }
+    }
+}
+
 static void ggml_compute_forward_mul_mat_one_chunk(
     const struct ggml_compute_params * params,
     struct ggml_tensor * dst,
@@ -1325,30 +1429,34 @@ UseGgmlGemm1:;
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
 
+        if (ggml_cpu_can_fuse_swiglu_down_q8_mul_mat(dst, vec_dot_type)) {
+            ggml_cpu_quantize_swiglu_to_q8(params, src1, wdata, vec_dot_type, from_float, ne10, ne11, ne12, ne13);
+        } else {
     #if 0
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                ne10);
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                                    ne10);
+                    }
                 }
             }
-        }
     #else
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = 0; i11 < ne11; ++i11) {
-                    size_t bs = ggml_blck_size(vec_dot_type);
-                    int64_t ne10_block_start = (ith * ne10/bs) / nth;
-                    int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
-                               (ne10_block_end - ne10_block_start) * bs);
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    for (int64_t i11 = 0; i11 < ne11; ++i11) {
+                        size_t bs = ggml_blck_size(vec_dot_type);
+                        int64_t ne10_block_start = (ith * ne10/bs) / nth;
+                        int64_t ne10_block_end   = ((ith + 1) * ne10/bs) / nth;
+                        from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11 + ne10_block_start*bs*nb10),
+                                   (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1 + ne10_block_start*nbw0),
+                                   (ne10_block_end - ne10_block_start) * bs);
+                    }
                 }
             }
-        }
     #endif
+        }
     }
 
     if (ith == 0) {
@@ -2982,8 +3090,11 @@ struct ggml_cplan ggml_graph_plan(
 }
 
 
+#define GGML_CPU_FUSE_SKIP_CURRENT (-1)
+
 // Try to fuse the current node with subsequent nodes for better performance.
-// Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
+// Returns the number of nodes skipped by fusion (>=1), GGML_CPU_FUSE_SKIP_CURRENT,
+// or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
 static int ggml_cpu_try_fuse_ops(
@@ -2997,6 +3108,17 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_GLU && node_n + 1 < cgraph->n_nodes) {
+        struct ggml_tensor * mul_mat = cgraph->nodes[node_n + 1];
+        if (mul_mat->op == GGML_OP_MUL_MAT &&
+            mul_mat->src[0] != NULL &&
+            mul_mat->src[1] == node &&
+            ggml_node_has_n_uses(cgraph, node_n, 1) &&
+            ggml_cpu_can_fuse_swiglu_down_q8_mul_mat(mul_mat, type_traits_cpu[mul_mat->src[0]->type].vec_dot_type)) {
+            return GGML_CPU_FUSE_SKIP_CURRENT;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
@@ -3065,7 +3187,9 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         ggml_profile_log_op_begin(node, state->ith, params.nth);
 
         const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
-        if (n_fused > 0) {
+        if (n_fused == GGML_CPU_FUSE_SKIP_CURRENT) {
+            // The following MUL_MAT will consume this GLU node's inputs directly.
+        } else if (n_fused > 0) {
             node_n += n_fused;
         } else {
             ggml_compute_forward(&params, node);

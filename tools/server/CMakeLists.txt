@@ -27,6 +27,16 @@ target_include_directories(${TARGET} PRIVATE ../mtmd)
 target_include_directories(${TARGET} PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC llama-common mtmd ${CMAKE_THREAD_LIBS_INIT})
 
+if(LLAMA_BUILD_SPEECH)
+    target_sources(${TARGET} PRIVATE
+        server-speech-backend.h
+        server-speech.cpp
+        server-speech.h
+        server-speech-qwen3-tts.cpp
+        server-speech-qwen3-tts.h
+    )
+endif()
+
 if(LLAMA_SERVER_SMT_VISION)
     if(WIN32)
         message(FATAL_ERROR "LLAMA_SERVER_SMT_VISION is not supported on Windows because the SMT audio backend depends on POSIX dlopen APIs")

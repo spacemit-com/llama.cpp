@@ -1,0 +1,63 @@
+#!/bin/sh
+set -e
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+model=${Q3TTS_MODEL_DIR:-${HOME:-/tmp}/.cache/models/tts/qwen3-tts}
+testdata=${Q3TTS_TESTDATA_DIR:-$root/examples/testdata}
+work=${Q3TTS_RUN_DIR:-/tmp/q3tts-k3-run}
+mkdir -p "$work"
+
+if [ -d "$model/onnx" ]; then
+  for name in codec_decoder_t25.q.onnx codec_decoder_t50.q.onnx codec_decoder_t75.q.onnx; do
+    [ -e "$model/onnx/$name" ] && ln -sfn "$model/onnx/$name" "$work/$name"
+  done
+fi
+if [ -d "$testdata" ]; then
+  [ -e "$testdata/e2e_long.npz" ] && ln -sfn "$testdata/e2e_long.npz" "$work/e2e_long.npz"
+  [ -e "$testdata/e2e_spk.npz" ] && ln -sfn "$testdata/e2e_spk.npz" "$work/e2e_spk.npz"
+fi
+
+cd "$work"
+if [ -z "${Q3TTS_SPACEMIT_EP_LIB+x}" ]; then
+  for ep in "$root/lib/libspacemit_ep.so" "$root/lib/libspacemit_ep.so.2" "$root/lib/libspacemit_ep.so.2.0.3"; do
+    if [ -e "$ep" ]; then
+      export Q3TTS_SPACEMIT_EP_LIB="$ep"
+      break
+    fi
+  done
+fi
+if [ -z "${Q3TTS_DISABLE_SWIGLU_DOWN_FUSION+x}" ]; then
+  export GGML_CPU_FUSE_SWIGLU_DOWN_Q8=1
+else
+  unset GGML_CPU_FUSE_SWIGLU_DOWN_Q8
+fi
+
+exec env \
+  LD_LIBRARY_PATH="$root/lib:${LD_LIBRARY_PATH:-}" \
+  Q3TTS_CODEC_BUCKETS="${Q3TTS_CODEC_BUCKETS:-50}" \
+  Q3TTS_CODEC_FIRST_CHUNK="${Q3TTS_CODEC_FIRST_CHUNK:-50}" \
+  Q3TTS_CODEC_CHUNK="${Q3TTS_CODEC_CHUNK:-50}" \
+  Q3TTS_OUTPUT_ONLY_EMBEDDINGS="${Q3TTS_OUTPUT_ONLY_EMBEDDINGS:-1}" \
+  Q3TTS_CP_EMBED_ONLY="${Q3TTS_CP_EMBED_ONLY:-1}" \
+  Q3TTS_HEADS_BASE="${Q3TTS_HEADS_BASE:-2}" \
+  Q3TTS_HEADS_MAIN_WORK="${Q3TTS_HEADS_MAIN_WORK:-1}" \
+  Q3TTS_HEAD_ARGMAX="${Q3TTS_HEAD_ARGMAX:-1}" \
+  Q3TTS_CP_META_CLEAR="${Q3TTS_CP_META_CLEAR:-1}" \
+  Q3TTS_CP_PROFILE="${Q3TTS_CP_PROFILE:-0}" \
+  Q3TTS_LLAMA_THREADPOOL_POLL="${Q3TTS_LLAMA_THREADPOOL_POLL:-100}" \
+  Q3TTS_CP_ACTIVE_HEADS="${Q3TTS_CP_ACTIVE_HEADS:-15}" \
+  Q3TTS_CP_FILL_CODE="${Q3TTS_CP_FILL_CODE:-0}" \
+  Q3TTS_TALKER_CTX="${Q3TTS_TALKER_CTX:-128}" \
+  Q3TTS_TALKER_BATCH="${Q3TTS_TALKER_BATCH:-128}" \
+  Q3TTS_TALKER_UBATCH="${Q3TTS_TALKER_UBATCH:-16}" \
+  Q3TTS_NOREF_CODEC_BUCKETS="${Q3TTS_NOREF_CODEC_BUCKETS:-25}" \
+  Q3TTS_NOREF_CODEC_FIRST_CHUNK="${Q3TTS_NOREF_CODEC_FIRST_CHUNK:-25}" \
+  Q3TTS_NOREF_CODEC_CHUNK="${Q3TTS_NOREF_CODEC_CHUNK:-25}" \
+  Q3TTS_CODEC_THREADS="${Q3TTS_CODEC_THREADS:-4}" \
+  Q3TTS_CODEC_AFFINITY="${Q3TTS_CODEC_AFFINITY:-14;15;8;9}" \
+  Q3TTS_MODEL_DIR="$model" \
+  SPACEMIT_Q4_HP_M1_N64="${SPACEMIT_Q4_HP_M1_N64:-1}" \
+  SPACEMIT_PERFER_CORE_ID="${SPACEMIT_PERFER_CORE_ID:-10,11,12,13}" \
+  TALKER_DRIVER="${TALKER_DRIVER:-$root/bin/talker_driver.qwen3tts-k3}" \
+  TALKER_CPUSET="${TALKER_CPUSET:-4-7}" \
+  "$root/bin/q3tts-runner" --npz e2e_long.npz --wav /tmp/q3tts.wav "$@"

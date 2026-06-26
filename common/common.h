@@ -571,7 +571,7 @@ struct common_params {
     struct common_params_model mmproj;
     bool mmproj_use_gpu = true;     // use GPU for multimodal model
     bool no_mmproj = false;         // explicitly disable multimodal model
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION) || defined(LLAMA_SERVER_SPEECH)
     std::string media_backend = "auto"; // multimodal backend: auto|mtmd|smt
     std::string smt_config_dir;         // SMT config dir (config.json + ONNX)
 #endif

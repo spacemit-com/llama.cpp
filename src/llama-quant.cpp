@@ -294,6 +294,10 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
 
     const std::string name = ggml_get_name(tensor);
 
+    if (name.rfind("q3tts.", 0) == 0) {
+        return false;
+    }
+
     // This used to be a regex, but <regex> has an extreme cost to compile times.
     bool quantize = name.rfind("weight") == name.size() - 6; // ends with 'weight'?
 

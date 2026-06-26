@@ -111,6 +111,8 @@ option(LLAMA_BUILD_SERVER    "llama: build server example"                      
 option(LLAMA_BUILD_APP       "llama: build the unified binary"                                                   ${LLAMA_STANDALONE})
 option(LLAMA_BUILD_UI        "llama: build the embedded Web UI for server"                                       ON)
 option(LLAMA_USE_PREBUILT_UI "llama: use prebuilt UI from HF Bucket when available (requires LLAMA_BUILD_UI=ON)" ON)
+option(LLAMA_BUILD_SPEECH    "llama: build speech synthesis server support and tools"                           OFF)
+option(LLAMA_BUILD_Q3TTS     "llama: build SpaceMIT Qwen3-TTS speech backend; deprecated alias for speech"       OFF)
 
 option(LLAMA_TOOLS_INSTALL "llama: install tools" ${LLAMA_TOOLS_INSTALL_DEFAULT})
 option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
@@ -119,6 +121,14 @@ option(LLAMA_TESTS_INSTALL "llama: install tests" ON)
 option(LLAMA_OPENSSL    "llama: use openssl to support HTTPS" ON)
 option(LLAMA_LLGUIDANCE "llama-common: include LLGuidance library for structured output in common utils" OFF)
 option(LLAMA_SERVER_SMT_VISION "llama: enable SpacemiT multimodal SMT extensions" OFF)
+
+if (LLAMA_BUILD_Q3TTS)
+    set(LLAMA_BUILD_SPEECH ON CACHE BOOL "llama: build speech synthesis server support and tools" FORCE)
+endif()
+
+if (LLAMA_BUILD_SPEECH)
+    add_compile_definitions(LLAMA_SERVER_SPEECH=1)
+endif()
 
 if (LLAMA_SERVER_SMT_VISION)
     add_compile_definitions(LLAMA_SERVER_SMT_VISION=1)

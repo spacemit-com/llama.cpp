@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     switch (hparams.n_layer) {
@@ -27,6 +29,13 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
     // output rerank head
     cls_out = create_tensor(tn(LLM_TENSOR_CLS_OUT, "weight"), {n_embd, hparams.n_cls_out}, TENSOR_NOT_REQUIRED);
 
+    create_tensor(tn(LLM_TENSOR_Q3TTS_CODEC_EMBD,      "weight"), {n_embd, 3072}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    create_tensor(tn(LLM_TENSOR_Q3TTS_TALKER_HEAD,     "weight"), {n_embd, 3072}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    for (int i = 0; i < 15; ++i) {
+        create_tensor(tn(LLM_TENSOR_Q3TTS_CP_EMBD,     "weight", i), {n_embd, 2048}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+        create_tensor(tn(LLM_TENSOR_Q3TTS_CP_HEAD_F16, "weight", i), {n_embd, 2048}, TENSOR_NOT_REQUIRED | TENSOR_SKIP);
+    }
+
     for (int i = 0; i < n_layer; ++i) {
         auto & layer = layers[i];
 
@@ -39,9 +48,10 @@ void llama_model_qwen3::load_arch_tensors(llama_model_loader &) {
         layer.attn_q_norm = create_tensor(tn(LLM_TENSOR_ATTN_Q_NORM, "weight", i), {n_embd_head_k}, 0);
 
         layer.ffn_norm = create_tensor(tn(LLM_TENSOR_FFN_NORM, "weight", i), {n_embd}, 0);
-        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_gate_up = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP, "weight", i), {n_embd, 2*n_ff}, TENSOR_NOT_REQUIRED);
+        layer.ffn_gate = create_tensor(tn(LLM_TENSOR_FFN_GATE, "weight", i), {n_embd,   n_ff}, layer.ffn_gate_up ? TENSOR_NOT_REQUIRED : 0);
         layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {  n_ff, n_embd}, 0);
-        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, 0);
+        layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", i), {n_embd,   n_ff}, layer.ffn_gate_up ? TENSOR_NOT_REQUIRED : 0);
     }
 }
 
@@ -121,12 +131,29 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
                 LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
 
-        cur = build_ffn(cur,
-                model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
-                model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
-                model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
-                NULL,
-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+        if (model.layers[il].ffn_gate_up) {
+            ggml_tensor * gate_up = build_lora_mm(model.layers[il].ffn_gate_up, cur);
+            cb(gate_up, "ffn_gate_up", il);
+
+            const int64_t n_ff = gate_up->ne[0] / 2;
+            ggml_tensor * gate = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], 0);
+            cb(gate, "ffn_gate", il);
+            ggml_tensor * up = ggml_view_2d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->nb[1], n_ff * ggml_element_size(gate_up));
+            cb(up, "ffn_up", il);
+
+            cur = ggml_swiglu_split(ctx0, gate, up);
+            cb(cur, "ffn_swiglu", il);
+
+            cur = build_lora_mm(model.layers[il].ffn_down, cur, model.layers[il].ffn_down_s);
+            cb(cur, "ffn_down", il);
+        } else {
+            cur = build_ffn(cur,
+                    model.layers[il].ffn_up,   NULL, model.layers[il].ffn_up_s,
+                    model.layers[il].ffn_gate, NULL, model.layers[il].ffn_gate_s,
+                    model.layers[il].ffn_down, NULL, model.layers[il].ffn_down_s,
+                    NULL,
+                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+        }
         cb(cur, "ffn_out", il);
 
         cur = ggml_add(ctx0, cur, ffn_inp);
@@ -146,11 +173,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    const bool embed_only = cparams.embeddings && std::getenv("LLAMA_QWEN3_EMBED_ONLY") != nullptr;
+    if (!embed_only) {
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

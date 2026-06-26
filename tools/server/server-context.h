@@ -115,6 +115,7 @@ struct server_routes {
     server_http_context::handler_t post_control;
     server_http_context::handler_t post_responses_oai;
     server_http_context::handler_t post_transcriptions_oai;
+    server_http_context::handler_t post_speech_oai;
     server_http_context::handler_t post_anthropic_messages;
     server_http_context::handler_t post_anthropic_count_tokens;
     server_http_context::handler_t post_apply_template;

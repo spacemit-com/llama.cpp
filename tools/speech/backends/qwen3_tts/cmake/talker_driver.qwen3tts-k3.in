@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+root=$(CDPATH= cd -- "$dir/.." && pwd)
+model=${Q3TTS_MODEL_DIR:-${HOME:-/tmp}/.cache/models/tts/qwen3-tts}
+: "${SPACEMIT_Q4_HP_M1_N64:=1}"
+export SPACEMIT_Q4_HP_M1_N64
+
+resolve_gguf() {
+  case "$1" in
+    /*|*/*) printf '%s\n' "$1" ;;
+    *) printf '%s\n' "$model/gguf/$1" ;;
+  esac
+}
+
+if [ "$#" -ge 2 ]; then
+  exec "$dir/talker_driver.headmain" "$@"
+fi
+
+talker=$(resolve_gguf "${Q3TTS_TALKER_GGUF:-qwen3-tts-0.6b-talker-qkv-gateup-q8_0-side.gguf}")
+cp=$(resolve_gguf "${Q3TTS_CP_GGUF:-qwen3-tts-0.6b-cp-qkv-gateup-rawq4.gguf}")
+exec "$dir/talker_driver.headmain" "$talker" "$cp" "$@"

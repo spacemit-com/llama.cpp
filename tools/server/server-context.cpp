@@ -14,6 +14,9 @@
 #include "server-http.h"
 #include "server-queue.h"
 #include "server-smt-vision.h"
+#if defined(LLAMA_SERVER_SPEECH)
+#    include "server-speech.h"
+#endif
 #include "server-task.h"
 #include "speculative.h"
 
@@ -22,8 +25,13 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <utility>
+#include <vector>
+
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -37,6 +45,7 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -71,7 +80,7 @@ enum server_state {
 enum server_vision_backend_mode {
     SERVER_VISION_BACKEND_NONE,
     SERVER_VISION_BACKEND_MTMD,
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION) || defined(LLAMA_SERVER_SPEECH)
     SERVER_VISION_BACKEND_SMT,
 #endif
 };
@@ -715,7 +724,7 @@ struct server_context_impl {
 
     common_context_seq_rm_type ctx_tgt_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
-    bool model_less_reconstruction = false;
+    bool model_less_backend = false;
 
     common_speculative_ptr spec;
 
@@ -756,7 +765,7 @@ struct server_context_impl {
         switch (vision_backend) {
             case SERVER_VISION_BACKEND_MTMD:
                 return "mtmd";
-#if defined(LLAMA_SERVER_SMT_VISION)
+#if defined(LLAMA_SERVER_SMT_VISION) || defined(LLAMA_SERVER_SPEECH)
             case SERVER_VISION_BACKEND_SMT:
                 return "smt";
 #endif
@@ -835,7 +844,7 @@ struct server_context_impl {
             }
 
             vision_backend = SERVER_VISION_BACKEND_SMT;
-            model_less_reconstruction = true;
+            model_less_backend = true;
             chat_params = {
                 /* use_jinja             */ params_base.use_jinja,
                 /* prefill_assistant     */ params_base.prefill_assistant,
@@ -863,6 +872,47 @@ struct server_context_impl {
             model_aliases = params_base.model_alias;
             model_tags    = params_base.model_tags;
 
+            params = params_base;
+            if (!is_resume) {
+                return init();
+            }
+            return true;
+        }
+#endif
+
+#if defined(LLAMA_SERVER_SPEECH)
+        if (server_speech_config_matches(params_base)) {
+            vision_backend = SERVER_VISION_BACKEND_SMT;
+            model_less_backend = true;
+            chat_params = {
+                /* use_jinja             */ params_base.use_jinja,
+                /* prefill_assistant     */ params_base.prefill_assistant,
+                /* reasoning_format      */ params_base.reasoning_format,
+                /* chat_template_kwargs  */ params_base.default_template_kwargs,
+                /* tmpls                 */ nullptr,
+                /* allow_image           */ false,
+                /* allow_audio           */ false,
+                /* image_bin_only        */ false,
+                /* media_backend         */ vision_backend_name(),
+                /* enable_thinking       */ false,
+                /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
+                /* reasoning_budget_msg  */ params_base.sampling.reasoning_budget_message,
+                /* media_path            */ params_base.media_path,
+                /* force_pure_content    */ params_base.force_pure_content_parser
+            };
+
+            if (!params_base.model_alias.empty()) {
+                model_name = *params_base.model_alias.begin();
+            } else if (!params_base.model.name.empty()) {
+                model_name = params_base.model.name;
+            } else {
+                model_name = "qwen3-tts";
+            }
+            model_aliases = params_base.model_alias;
+            model_tags    = params_base.model_tags;
+
+            SRV_INF("loaded speech backend '%s' (smt), '%s'\n",
+                    server_speech_backend_name(params_base).c_str(), params_base.smt_config_dir.c_str());
             params = params_base;
             if (!is_resume) {
                 return init();
@@ -1311,7 +1361,7 @@ struct server_context_impl {
 
     // unlike load_model(), this is only called once during initialization
     bool init() {
-        if (!model_less_reconstruction) {
+        if (!model_less_backend) {
             GGML_ASSERT(ctx_tgt != nullptr);
             GGML_ASSERT(model_tgt != nullptr);
         }
@@ -1355,7 +1405,7 @@ struct server_context_impl {
             }
         }
 
-        if (model_less_reconstruction) {
+        if (model_less_backend) {
             return true;
         }
 
@@ -4222,6 +4272,10 @@ void server_routes::init_routes() {
     // IMPORTANT: all lambda functions must start with create_response()
     // this is to ensure that the server_res_generator can handle sleeping case correctly
 
+#if defined(LLAMA_SERVER_SPEECH)
+    auto speech_service = std::make_shared<server_speech_service>(params);
+#endif
+
     this->get_health = [this](const server_http_req &) {
         // error and loading states are handled by middleware
         auto res = create_response(true);
@@ -4652,6 +4706,49 @@ void server_routes::init_routes() {
         json body_parsed = oaicompat_chat_params_parse(body, meta->chat_params, files);
         return handle_completions_impl(req, SERVER_TASK_TYPE_COMPLETION, body_parsed, files,
                                        TASK_RESPONSE_TYPE_OAI_ASR);
+    };
+
+    this->post_speech_oai = [this
+#if defined(LLAMA_SERVER_SPEECH)
+        , speech_service
+#endif
+    ](const server_http_req & req) {
+        auto res = create_response(true);
+#if defined(LLAMA_SERVER_SPEECH)
+        if (!server_speech_config_matches(params)) {
+            res->error(format_error_response("The current server is not configured for a speech backend.",
+                                             ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+
+        try {
+            const json body = json::parse(req.body);
+            const auto result = speech_service->synthesize(body);
+            const double gen_rtf = result.audio_seconds > 0.0 ? result.wall_seconds / result.audio_seconds : 0.0;
+            res->status = 200;
+            res->content_type = "audio/wav";
+            res->data = result.wav;
+            res->headers["X-Speech-Backend"] = result.backend;
+            res->headers["X-Speech-Segments"] = std::to_string(result.segments);
+            res->headers["X-Speech-Audio-Seconds"] = string_format("%.3f", result.audio_seconds);
+            res->headers["X-Speech-Wall-Seconds"] = string_format("%.3f", result.wall_seconds);
+            res->headers["X-Speech-Gen-RTF"] = string_format("%.2f", gen_rtf);
+            return res;
+        } catch (const json::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        } catch (const std::invalid_argument & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        } catch (const std::exception & e) {
+            res->error(format_error_response(e.what(), ERROR_TYPE_SERVER));
+            return res;
+        }
+#else
+        res->error(format_error_response("This llama-server was not built with speech synthesis support.",
+                                         ERROR_TYPE_NOT_SUPPORTED));
+        return res;
+#endif
     };
 
     this->post_anthropic_messages = [this](const server_http_req & req) {
