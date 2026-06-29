@@ -3328,7 +3328,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    int tcm_n_threads = 0;
+#endif
+
 #ifdef GGML_USE_OPENMP
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    tcm_n_threads = n_threads;
+    ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(tcm_n_threads);
+#endif
+
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
         {
@@ -3358,11 +3367,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         n_threads = threadpool->n_threads;
     }
 
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    tcm_n_threads = n_threads;
+    ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(tcm_n_threads);
+#endif
+
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
 
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif
+
+#ifdef GGML_USE_CPU_RISCV64_SPACEMIT
+    ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(tcm_n_threads);
 #endif
 
     // don't leave affinity set on the main thread

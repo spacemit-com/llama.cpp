@@ -1664,6 +1664,25 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type_riscv64_spacemit;
 }
 
+namespace {
+
+static int ggml_spacemit_ai_cpu_id_for_thread(int thread_n) {
+    const auto & perfer_core_ids = ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
+    if (thread_n < 0 || static_cast<size_t>(thread_n) >= perfer_core_ids.size()) {
+        GGML_ABORT("thread_n %d exceeds perfer_core_ids size %zu\n", thread_n, perfer_core_ids.size());
+    }
+
+    return perfer_core_ids[static_cast<size_t>(thread_n)] -
+           ggml::cpu::riscv64_spacemit::global_spine_env_info.aicpu_id_offset;
+}
+
+static void * ggml_spacemit_tcm_buffer_for_thread(int thread_n) {
+    const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
+    return ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
+}
+
+}  // namespace
+
 extern "C" {
 static int bind_ai_thread() {
     int  fd, bytes;
@@ -1711,33 +1730,52 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
             GGML_ABORT("set thread affinity error for thread_n %d, cpu_id %d\n", thread_n, perfer_cpu_id);
         }
 
-        int ai_cpu_id = perfer_cpu_id - ggml::cpu::riscv64_spacemit::global_spine_env_info.aicpu_id_offset;
+        int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
         ggml::cpu::riscv64_spacemit::tls_context.cpu_id = ai_cpu_id;
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer =
             ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer_size =
             ggml::cpu::riscv64_spacemit::global_spine_env_info.tcm_blk_size;
     }
-#ifdef GGML_ENABLE_TCM_MEM_BARRIER
-    if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
-        void * rt =
-            ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
-        if (rt == nullptr) {
-            GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
-        }
-    }
-#endif
 }
 
 void ggml_backend_cpu_riscv64_spacemit_clear_numa_thread_affinity_threaded(int thread_n) {
-#ifdef GGML_ENABLE_TCM_MEM_BARRIER
-    if (ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer != nullptr) {
-        auto rt = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(
-            ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
-        if (rt != 0) {
-            GGML_ABORT("release tcm buffer failed for cpu_id: %d", ggml::cpu::riscv64_spacemit::tls_context.cpu_id);
+    (void) thread_n;
+}
+
+void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads) {
+    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
+        return;
+    }
+
+    for (int i = 0; i < n_threads; ++i) {
+        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
+            continue;
+        }
+
+        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
+        void *    rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ai_cpu_id);
+        if (rt == nullptr) {
+            GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ai_cpu_id);
         }
     }
-#endif
+}
+
+void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads) {
+    if (!ggml::cpu::riscv64_spacemit::global_spine_env_info.use_tcm) {
+        return;
+    }
+
+    for (int i = n_threads; i-- > 0;) {
+        if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
+            continue;
+        }
+
+        const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
+        auto      rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(ai_cpu_id);
+        if (rt != 0) {
+            GGML_ABORT("release tcm buffer failed for cpu_id: %d", ai_cpu_id);
+        }
+    }
 }
 }
