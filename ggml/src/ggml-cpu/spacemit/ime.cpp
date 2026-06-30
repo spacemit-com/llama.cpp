@@ -18,6 +18,7 @@
 #include "vec.h"
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
@@ -27,6 +28,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstdio>  // for GGML_ASSERT
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 // clang-format off
@@ -1666,6 +1668,60 @@ ggml_backend_buffer_type_t ggml_backend_cpu_riscv64_spacemit_buffer_type(void) {
 
 namespace {
 
+constexpr char GGML_SPACEMIT_TCM_GRAPH_LOCK_FILE[] = "/tmp/ggml-spacemit-tcm.lock";
+
+std::mutex & ggml_spacemit_tcm_graph_mutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+int ggml_spacemit_tcm_graph_lock_fd() {
+    static int fd = -1;
+    if (fd < 0) {
+        fd = open(GGML_SPACEMIT_TCM_GRAPH_LOCK_FILE, O_CREAT | O_CLOEXEC | O_RDWR, 0666);
+    }
+    return fd;
+}
+
+void ggml_spacemit_tcm_graph_lock() {
+    auto & mutex = ggml_spacemit_tcm_graph_mutex();
+    mutex.lock();
+
+    const int fd = ggml_spacemit_tcm_graph_lock_fd();
+    if (fd < 0) {
+        const int err = errno;
+        mutex.unlock();
+        GGML_ABORT("open tcm graph lock failed for %s, errno=%d", GGML_SPACEMIT_TCM_GRAPH_LOCK_FILE, err);
+    }
+
+    while (flock(fd, LOCK_EX) != 0) {
+        if (errno == EINTR) {
+            continue;
+        }
+
+        const int err = errno;
+        mutex.unlock();
+        GGML_ABORT("lock tcm graph lock failed for %s, errno=%d", GGML_SPACEMIT_TCM_GRAPH_LOCK_FILE, err);
+    }
+}
+
+void ggml_spacemit_tcm_graph_unlock() {
+    const int fd = ggml_spacemit_tcm_graph_lock_fd();
+    if (fd >= 0) {
+        while (flock(fd, LOCK_UN) != 0) {
+            if (errno == EINTR) {
+                continue;
+            }
+
+            GGML_LOG_ERROR("CPU_RISCV64_SPACEMIT: unlock tcm graph lock failed for %s, errno=%d\n",
+                           GGML_SPACEMIT_TCM_GRAPH_LOCK_FILE, errno);
+            break;
+        }
+    }
+
+    ggml_spacemit_tcm_graph_mutex().unlock();
+}
+
 static int ggml_spacemit_ai_cpu_id_for_thread(int thread_n) {
     const auto & perfer_core_ids = ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
     if (thread_n < 0 || static_cast<size_t>(thread_n) >= perfer_core_ids.size()) {
@@ -1730,7 +1786,7 @@ void ggml_backend_cpu_riscv64_spacemit_set_numa_thread_affinity(int thread_n) {
             GGML_ABORT("set thread affinity error for thread_n %d, cpu_id %d\n", thread_n, perfer_cpu_id);
         }
 
-        int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
+        int ai_cpu_id                                   = ggml_spacemit_ai_cpu_id_for_thread(thread_n);
         ggml::cpu::riscv64_spacemit::tls_context.cpu_id = ai_cpu_id;
         ggml::cpu::riscv64_spacemit::tls_context.tcm_buffer =
             ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_get(ai_cpu_id);
@@ -1748,6 +1804,8 @@ void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads) {
         return;
     }
 
+    ggml_spacemit_tcm_graph_lock();
+
     for (int i = 0; i < n_threads; ++i) {
         if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
             continue;
@@ -1756,6 +1814,15 @@ void ggml_backend_cpu_riscv64_spacemit_tcm_mem_wait_all(int n_threads) {
         const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
         void *    rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_wait(ai_cpu_id);
         if (rt == nullptr) {
+            for (int j = i; j-- > 0;) {
+                if (ggml_spacemit_tcm_buffer_for_thread(j) == nullptr) {
+                    continue;
+                }
+
+                const int acquired_ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(j);
+                ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(acquired_ai_cpu_id);
+            }
+            ggml_spacemit_tcm_graph_unlock();
             GGML_ABORT("wait tcm buffer failed for cpu_id: %d", ai_cpu_id);
         }
     }
@@ -1766,6 +1833,7 @@ void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads) {
         return;
     }
 
+    int first_failed_cpu_id = -1;
     for (int i = n_threads; i-- > 0;) {
         if (ggml_spacemit_tcm_buffer_for_thread(i) == nullptr) {
             continue;
@@ -1773,9 +1841,15 @@ void ggml_backend_cpu_riscv64_spacemit_tcm_mem_release_all(int n_threads) {
 
         const int ai_cpu_id = ggml_spacemit_ai_cpu_id_for_thread(i);
         auto      rt        = ggml::cpu::riscv64_spacemit::spine_mem_pool_tcm_mem_release(ai_cpu_id);
-        if (rt != 0) {
-            GGML_ABORT("release tcm buffer failed for cpu_id: %d", ai_cpu_id);
+        if (rt != 0 && first_failed_cpu_id < 0) {
+            first_failed_cpu_id = ai_cpu_id;
         }
+    }
+
+    ggml_spacemit_tcm_graph_unlock();
+
+    if (first_failed_cpu_id >= 0) {
+        GGML_ABORT("release tcm buffer failed for cpu_id: %d", first_failed_cpu_id);
     }
 }
 }

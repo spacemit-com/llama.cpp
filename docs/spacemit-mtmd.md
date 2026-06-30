@@ -27,6 +27,7 @@ cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
     -DGGML_CPU_RISCV64_SPACEMIT=ON \
     -DGGML_CPU_REPACK=OFF \
+    -DGGML_OPENMP=OFF \
     -DLLAMA_CURL=OFF \
     -DGGML_RVV=ON \
     -DGGML_RV_ZVFH=ON \
