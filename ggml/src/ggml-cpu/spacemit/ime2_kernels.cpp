@@ -132,7 +132,7 @@ void gemm_kernel_i8i3k_mrow_ref(size_t          blk_len,
                                 size_t          count_n,
                                 size_t          k_blks,
                                 size_t          ldc) {
-    using blk_type                 = nrow_block_q2_k<NB_COLS>;
+    using blk_type                 = nrow_block_q3_k<NB_COLS>;
     constexpr float refactor_scale = 16.0f;
     constexpr float factor_scale   = 1.0f / refactor_scale;
 
