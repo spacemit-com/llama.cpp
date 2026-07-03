@@ -439,55 +439,70 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
-            int64_t ni      = ith * NB_COLS;
-            int64_t nb_real = std::min(gemm_n - ni, NB_COLS);
+            // Pair-barrier lockstep: an even thread with no odd partner (odd nth) must not wait.
+            const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
-            if (ith % 2 == 0 && nb_real > 0) {
-                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b,
-                                                nb_real * row_stride_b);
+            const int64_t ni0     = (int64_t) ith * NB_COLS;
+            const int64_t nb0     = std::min(gemm_n - ni0, (int64_t) NB_COLS);
+            const bool    active0 = nb0 > 0;
+
+            if (ith % 2 == 0 && active0) {
+                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
+                                                nb0 * row_stride_b);
                 if (a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
             }
 
-            spine_barrier_wait(cur_barrier);
+            if (has_pair) {
+                spine_barrier_wait(cur_barrier);
+            }
 
-            if (ith % 2 != 0 && nb_real > 0) {
+            if (ith % 2 != 0 && active0) {
                 if (a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
                 }
-                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b,
-                                                nb_real * row_stride_b);
+                spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + ni0 * row_stride_b,
+                                                nb0 * row_stride_b);
             }
 
-            for (; ni < gemm_n; ni += NB_COLS * nth) {
-                int64_t rows_remaining = gemm_m;
-                float * c_blk          = output + ni;
-                auto *  a_row_cur      = a_row;
+            // Iterate over the even lane's column base so both lanes of a pair run in lockstep.
+            const int64_t base_start = (int64_t) (ith & ~1) * NB_COLS;
+            const int64_t lane_off   = (int64_t) (ith & 1) * NB_COLS;
+            for (int64_t base = base_start; base < gemm_n; base += NB_COLS * nth) {
+                const int64_t ni     = base + lane_off;
+                const bool    active = ni < gemm_n;
+                const int64_t nb_real = active ? std::min(gemm_n - ni, (int64_t) NB_COLS) : 0;
 
-                if (ith % 2 != 0) {
+                if (has_pair && ith % 2 != 0) {
                     spine_barrier_wait(cur_barrier);
                 }
 
-                while (rows_remaining > 0) {
-                    auto rows_handled = gemm_kernel(b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
-                                                    nb_real, b_k_blks, gemm_n);
+                if (active) {
+                    int64_t rows_remaining = gemm_m;
+                    float * c_blk          = output + ni;
+                    auto *  a_row_cur      = a_row;
 
-                    c_blk += rows_handled * gemm_n;
-                    a_row_cur += rows_handled * row_stride_a;
+                    while (rows_remaining > 0) {
+                        auto rows_handled = gemm_kernel(b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
+                                                        nb_real, b_k_blks, gemm_n);
 
-                    rows_remaining -= rows_handled;
+                        c_blk += rows_handled * gemm_n;
+                        a_row_cur += rows_handled * row_stride_a;
+
+                        rows_remaining -= rows_handled;
+                    }
                 }
 
-                if (ith % 2 == 0) {
+                if (has_pair && ith % 2 == 0) {
                     spine_barrier_wait(cur_barrier);
                 }
 
                 const int64_t next_ni = ni + NB_COLS * nth;
                 if (next_ni < gemm_n) {
-                    nb_real = std::min(gemm_n - next_ni, NB_COLS);
+                    const int64_t next_nb = std::min(gemm_n - next_ni, (int64_t) NB_COLS);
                     spacemit_kernels::rvv::memcpy1d(b_col, reinterpret_cast<uint8_t *>(w_data) + next_ni * row_stride_b,
-                                                    nb_real * row_stride_b);
+                                                    next_nb * row_stride_b);
                 }
             }
         } else {
@@ -725,6 +740,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
             valid_act_count_t == n_as && per_nb_cols_wsize <= tcm_buffer_size) {
+            // Pair-barrier lockstep: an even thread with no odd partner (odd nth) must not wait.
+            const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
             for (int64_t valid_id = ith; valid_id < valid_ep_count_t; valid_id += nth) {
                 const int64_t cur_a = valid_matrix_row_counts[valid_id];
 
@@ -756,7 +773,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     }
                 }
 
-                spine_barrier_wait(cur_barrier);
+                if (has_pair) {
+                    spine_barrier_wait(cur_barrier);
+                }
 
                 if (ith % 2 != 0) {
                     if (a_row != src1_col) {
@@ -768,13 +787,13 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                 int64_t nb_real = std::min(ne01, NB_COLS);
                 for (int64_t ni = 0; ni < ne01; ni += NB_COLS) {
-                    if (ith % 2 != 0) {
+                    if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
 
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
 
-                    if (ith % 2 == 0) {
+                    if (has_pair && ith % 2 == 0) {
                         spine_barrier_wait(cur_barrier);
                     }
 

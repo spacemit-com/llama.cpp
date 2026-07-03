@@ -2990,9 +2990,22 @@ struct server_context_impl {
                             // the largest pos_min required for a checkpoint to be useful
                             const auto pos_min_thold = std::max(0, pos_next - n_swa - 1);
 
-                            // note: disallow with multimodal contexts for now
-                            //       https://github.com/ggml-org/llama.cpp/issues/17043
-                            if (!slot.prompt.tokens.has_mtmd && n_past > 0 && n_past <= slot.prompt.n_tokens()) {
+                            // Multimodal: force full re-prefill instead of checkpoint restore or
+                            // partial seq_rm (vision state is external; KV backend may be FULL-only).
+                            // https://github.com/ggml-org/llama.cpp/issues/17043
+                            if (slot.prompt.tokens.has_mtmd &&
+                                n_past > 0 && n_past < slot.prompt.n_tokens()) {
+                                SLT_WRN(slot,
+                                        "forcing full prompt re-processing for multimodal context "
+                                        "(cannot restore vision state from checkpoint / partial "
+                                        "sequence removal unsupported); dropping %d cached tokens "
+                                        "(n_past %d -> 0)\n",
+                                        (int) slot.prompt.n_tokens() - n_past, n_past);
+                                pos_next = 0;
+                                n_past   = 0;
+                            }
+
+                            if (!slot.prompt.tokens.has_mtmd && n_past > 0 && n_past < slot.prompt.n_tokens()) {
                                 const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                                 if (pos_min == -1) {
                                     SLT_ERR(slot,

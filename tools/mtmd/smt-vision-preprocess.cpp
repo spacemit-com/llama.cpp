@@ -52,6 +52,13 @@ static ep_preproc_spec resolve_preproc_spec(const std::string & architecture) {
                  /* apply */ false };
     }
 
+    // MiniCPM-V SMT ONNX applies rescale/mean/std from config.json (no internal normalization).
+    if (contains_icase(architecture, "minicpmv") || contains_icase(architecture, "minicpm_v") ||
+        contains_icase(architecture, "minicpm-v")) {
+        return { /* target_w */ 448, /* target_h */ 448, /* normalize_to_01 */ false, /* quantize */ true,
+                 /* apply */ true };
+    }
+
     if (contains_icase(architecture, "paddleocr")) {
         return { /* target_w */ 0, /* target_h */ 0, /* normalize_to_01 */ false, /* quantize */ true,
                  /* apply */ true };
