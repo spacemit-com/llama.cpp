@@ -553,7 +553,7 @@ static lingbot_map_postprocess_result lingbot_postprocess_reconstruction(
     return result;
 }
 
-bool server_smt_vision_config_is_lingbot_map(const std::string & config_dir) {
+static bool server_smt_vision_config_has_architecture(const std::string & config_dir, const std::string & target) {
     if (config_dir.empty()) {
         return false;
     }
@@ -572,17 +572,26 @@ bool server_smt_vision_config_is_lingbot_map(const std::string & config_dir) {
         const auto & arch = config.at("architectures");
         if (arch.is_array()) {
             for (const auto & value : arch) {
-                if (value.is_string() && value.get<std::string>() == "LingBotMapFor3DReconstruction") {
+                if (value.is_string() && value.get<std::string>() == target) {
                     return true;
                 }
             }
         } else if (arch.is_string()) {
-            return arch.get<std::string>() == "LingBotMapFor3DReconstruction";
+            return arch.get<std::string>() == target;
         }
     } catch (...) {
         return false;
     }
     return false;
+}
+
+bool server_smt_vision_config_is_lingbot_map(const std::string & config_dir) {
+    return server_smt_vision_config_has_architecture(config_dir, "LingBotMapFor3DReconstruction");
+}
+
+static bool server_smt_vision_config_is_audio_only(const std::string & config_dir) {
+    return server_smt_vision_config_has_architecture(config_dir, "Gemma4Audio") ||
+           server_smt_vision_config_has_architecture(config_dir, "Qwen3ASRForConditionalGeneration");
 }
 
 static std::string fnv_hash(const uint8_t * data, size_t len) {
@@ -612,6 +621,10 @@ static bool arch_requires_mrope(const std::string & arch_name) {
 
 static bool arch_is_qwen3asr(const std::string & arch_name) {
     return contains_icase(arch_name, "qwen3asr");
+}
+
+static bool arch_is_gemma4_audio(const std::string & arch_name) {
+    return arch_name == "Gemma4Audio";
 }
 
 static bool arch_is_funasr(const std::string & arch_name) {
@@ -743,10 +756,13 @@ static std::pair<std::vector<llama_token>, std::vector<llama_token>> resolve_ima
 static std::pair<std::vector<llama_token>, std::vector<llama_token>> resolve_audio_boundary_tokens(
     llama_context *     lctx,
     const std::string & arch_name) {
-    if (!arch_is_qwen3asr(arch_name)) {
-        return {};
+    if (arch_is_qwen3asr(arch_name)) {
+        return { tokenize_exact_special(lctx, "<|audio_start|>"), tokenize_exact_special(lctx, "<|audio_end|>") };
     }
-    return { tokenize_exact_special(lctx, "<|audio_start|>"), tokenize_exact_special(lctx, "<|audio_end|>") };
+    if (arch_is_gemma4_audio(arch_name)) {
+        return { tokenize_exact_special(lctx, "<|audio>"), tokenize_exact_special(lctx, "<audio|>") };
+    }
+    return {};
 }
 
 static bool looks_like_audio_file(const std::vector<uint8_t> & data) {
@@ -968,15 +984,17 @@ server_smt_vision_context * server_smt_vision_init(llama_context * lctx, const s
         return ctx.release();
     }
 
-    try {
-        ctx->smt_vision      = smt_vision_context::create(config_dir, warmup);
-        ctx->hidden_size     = (int32_t) ctx->smt_vision->hidden_size();
-        primary_architecture = ctx->smt_vision->architecture();
-        auto boundaries      = resolve_image_boundary_tokens(lctx, primary_architecture);
-        ctx->tok_img_beg     = std::move(boundaries.first);
-        ctx->tok_img_end     = std::move(boundaries.second);
-    } catch (const std::exception & e) {
-        LOG_WRN("[server-smt] failed to initialize SMT vision backend from '%s': %s\n", config_dir.c_str(), e.what());
+    if (!server_smt_vision_config_is_audio_only(config_dir)) {
+        try {
+            ctx->smt_vision      = smt_vision_context::create(config_dir, warmup);
+            ctx->hidden_size     = (int32_t) ctx->smt_vision->hidden_size();
+            primary_architecture = ctx->smt_vision->architecture();
+            auto boundaries      = resolve_image_boundary_tokens(lctx, primary_architecture);
+            ctx->tok_img_beg     = std::move(boundaries.first);
+            ctx->tok_img_end     = std::move(boundaries.second);
+        } catch (const std::exception & e) {
+            LOG_WRN("[server-smt] failed to initialize SMT vision backend from '%s': %s\n", config_dir.c_str(), e.what());
+        }
     }
 
     try {

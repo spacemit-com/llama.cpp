@@ -22,6 +22,7 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <stdexcept>
 #include <utility>
@@ -164,6 +165,10 @@ static bool arch_requires_mrope(const std::string & arch_name) {
 
 static bool arch_is_qwen3asr(const std::string & arch_name) {
     return contains_icase(arch_name, "qwen3asr");
+}
+
+static bool arch_is_gemma4_audio(const std::string & arch_name) {
+    return arch_name == "Gemma4Audio";
 }
 
 static std::pair<int, int> infer_image_grid_xy(int n_tokens) {
@@ -378,13 +383,19 @@ resolve_image_boundary_tokens(llama_context * lctx,
 
 static std::pair<std::vector<llama_token>, std::vector<llama_token>>
 resolve_audio_boundary_tokens(llama_context * lctx, const std::string & arch_name) {
-    if (!arch_is_qwen3asr(arch_name)) {
-        return {};
+    if (arch_is_qwen3asr(arch_name)) {
+        return {
+            tokenize_exact_special(lctx, "<|audio_start|>"),
+            tokenize_exact_special(lctx, "<|audio_end|>")
+        };
     }
-    return {
-        tokenize_exact_special(lctx, "<|audio_start|>"),
-        tokenize_exact_special(lctx, "<|audio_end|>")
-    };
+    if (arch_is_gemma4_audio(arch_name)) {
+        return {
+            tokenize_exact_special(lctx, "<|audio>"),
+            tokenize_exact_special(lctx, "<audio|>")
+        };
+    }
+    return {};
 }
 
 static void replace_all(std::string & s, const std::string & from, const std::string & to) {
@@ -832,7 +843,7 @@ struct mtmd_cli_smt_context {
 
         if (try_audio) {
             try {
-                smt_audio_ctx = smt_audio_context::create(smt_config_dir);
+                smt_audio_ctx = smt_audio_context::create(smt_config_dir, params.warmup);
                 if (hidden_size == 0) {
                     hidden_size = smt_audio_ctx->hidden_size();
                 } else if (hidden_size != smt_audio_ctx->hidden_size()) {
@@ -1068,6 +1079,23 @@ static std::string format_qwen3asr_audio_prompt(const mtmd_cli_smt_context & ctx
     return prompt;
 }
 
+static std::string format_gemma4_audio_prompt(const mtmd_cli_smt_context & ctx, const common_chat_msg & msg) {
+    std::string prompt;
+    prompt.reserve(msg.content.size() + ctx.pending_media.size() * 16 + 128);
+    prompt += "<|turn>user\n";
+    for (const auto & media : ctx.pending_media) {
+        GGML_ASSERT(media.type == smt_chunk_type::audio);
+        prompt += k_media_marker;
+    }
+    const std::string user_text = strip_media_markers_from_prompt(msg.content);
+    if (!user_text.empty()) {
+        prompt += user_text;
+    }
+    prompt += "<turn|>\n";
+    prompt += "<|turn>model\n";
+    return prompt;
+}
+
 // ============================================================
 // Eval message - core multimodal processing
 // ============================================================
@@ -1100,10 +1128,19 @@ static int eval_message_smt(mtmd_cli_smt_context & ctx, common_chat_msg & msg) {
         ctx.smt_audio_ctx &&
         arch_is_qwen3asr(ctx.smt_audio_ctx->architecture()) &&
         ctx.has_pending_audio_only();
+    const bool use_gemma4_audio_prompt =
+        msg.role == "user" &&
+        ctx.smt_audio_ctx &&
+        arch_is_gemma4_audio(ctx.smt_audio_ctx->architecture()) &&
+        ctx.has_pending_audio_only();
     if (use_qwen3asr_prompt) {
         formatted_chat = format_qwen3asr_audio_prompt(ctx, msg);
         ctx.chat_history.push_back(msg);
         add_bos = false;
+    } else if (use_gemma4_audio_prompt) {
+        formatted_chat = format_gemma4_audio_prompt(ctx, msg);
+        ctx.chat_history.push_back(msg);
+        add_bos = ctx.chat_history.size() == 1;
     } else {
         formatted_chat = chat_add_and_format(ctx, msg);
     }
@@ -1267,10 +1304,10 @@ int mtmd_cli_smt_run(int argc, char ** argv, common_params params) {
         return 1;
     }
 
-    mtmd_cli_smt_context ctx(params, params.smt_config_dir);
-
     bool is_single_turn = !params.prompt.empty() && !params.image.empty();
     int n_predict = params.n_predict < 0 ? INT_MAX : params.n_predict;
+
+    mtmd_cli_smt_context ctx(params, params.smt_config_dir);
 
     // Ctrl+C handling
     {

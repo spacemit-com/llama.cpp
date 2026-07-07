@@ -908,6 +908,120 @@ bool mtmd_audio_preprocessor_granite_speech::preprocess(const float *           
 // mtmd_audio_preprocessor_gemma4a
 //
 
+bool mtmd_audio_compute_gemma4_features(const float * samples,
+                                        size_t        n_samples,
+                                        int           sample_rate,
+                                        int           n_mel,
+                                        int           n_fft,
+                                        int           window_len,
+                                        int           hop_len,
+                                        std::vector<float> & features,
+                                        int &         n_frames_out) {
+    features.clear();
+    n_frames_out = 0;
+    if (samples == nullptr || n_samples == 0 || sample_rate <= 0 || n_mel <= 0 || n_fft <= 0 ||
+        window_len <= 0 || hop_len <= 0) {
+        return false;
+    }
+
+    // Gemma4 audio frontend mirrors the original Python pipeline:
+    // truncate to 30s, right-pad waveform to a multiple of 128, left-pad by
+    // half a window, unfold 321 samples, and FFT only the first 320 samples.
+    const size_t max_length = 480000;
+    const size_t n_valid    = std::min(n_samples, max_length);
+    const size_t pad_right  = (128 - (n_valid % 128)) % 128;
+
+    std::vector<float> waveform(n_valid + pad_right, 0.0f);
+    std::copy(samples, samples + n_valid, waveform.data());
+
+    std::vector<uint8_t> attention_mask(waveform.size(), 0);
+    std::fill(attention_mask.begin(), attention_mask.begin() + n_valid, 1);
+
+    const int pad_left              = window_len / 2;
+    const int frame_size_for_unfold = window_len + 1;
+
+    std::vector<float> padded_samples((size_t) pad_left + waveform.size(), 0.0f);
+    std::copy(waveform.begin(), waveform.end(), padded_samples.begin() + pad_left);
+
+    std::vector<uint8_t> padded_mask((size_t) pad_left + attention_mask.size(), 0);
+    std::copy(attention_mask.begin(), attention_mask.end(), padded_mask.begin() + pad_left);
+
+    if (padded_samples.size() < (size_t) frame_size_for_unfold) {
+        return false;
+    }
+
+    const int n_frames = (int) ((padded_samples.size() - (size_t) frame_size_for_unfold) / (size_t) hop_len) + 1;
+    if (n_frames <= 0) {
+        return false;
+    }
+
+    mtmd_audio_cache cache;
+    cache.fill_sin_cos_table(n_fft);
+    cache.hann_window.assign(window_len, 0.0f);
+    for (uint32_t i = 0; i < (uint32_t) window_len; i++) {
+        cache.hann_window[i] = 0.5f - 0.5f * cosf((2.0f * (float) M_PI * i) / window_len);
+    }
+    cache.fill_mel_filterbank_matrix(
+        n_mel, n_fft, sample_rate,
+        0.0f, sample_rate / 2.0f,
+        /*slaney_area_norm=*/ false,
+        /*scale=*/ 1.0f,
+        /*use_htk=*/ true);
+
+    const int n_fft_bins = 1 + (n_fft / 2);
+    features.assign((size_t) n_frames * (size_t) n_mel, 0.0f);
+
+    const int n_threads = n_frames >= 128 ? std::min(4, n_frames) : 1;
+    auto      worker    = [&](int ith) {
+        std::vector<float> fft_in((size_t) n_fft * 2, 0.0f);
+        std::vector<float> fft_out((size_t) n_fft * 2 * 2 * 2, 0.0f);
+        std::vector<float> magnitudes((size_t) n_fft_bins, 0.0f);
+
+        for (int frame = ith; frame < n_frames; frame += n_threads) {
+            const int frame_start    = frame * hop_len;
+            const int frame_end_mask = frame_start + frame_size_for_unfold - 1;
+            if (frame_end_mask < 0 || frame_end_mask >= (int) padded_mask.size() || padded_mask[frame_end_mask] == 0) {
+                continue;
+            }
+
+            std::fill(fft_in.begin(), fft_in.end(), 0.0f);
+            for (int i = 0; i < window_len; ++i) {
+                fft_in[i] = padded_samples[(size_t) frame_start + (size_t) i] * cache.hann_window[(size_t) i];
+            }
+
+            fft(cache, fft_in.data(), n_fft, fft_out.data());
+
+            for (int i = 0; i < n_fft_bins; ++i) {
+                const float re = fft_out[(size_t) i * 2 + 0];
+                const float im = fft_out[(size_t) i * 2 + 1];
+                magnitudes[(size_t) i] = sqrtf(re * re + im * im);
+            }
+
+            for (int mel = 0; mel < n_mel; ++mel) {
+                double sum = 0.0;
+                for (int i = 0; i < n_fft_bins; ++i) {
+                    sum += (double) magnitudes[(size_t) i] *
+                           (double) cache.filters.data[(size_t) mel * (size_t) n_fft_bins + (size_t) i];
+                }
+                features[(size_t) frame * (size_t) n_mel + (size_t) mel] = (float) log(sum + 0.001);
+            }
+        }
+    };
+
+    std::vector<std::thread> workers;
+    workers.reserve((size_t) std::max(0, n_threads - 1));
+    for (int ith = 1; ith < n_threads; ++ith) {
+        workers.emplace_back(worker, ith);
+    }
+    worker(0);
+    for (auto & thread : workers) {
+        thread.join();
+    }
+
+    n_frames_out = n_frames;
+    return true;
+}
+
 void mtmd_audio_preprocessor_gemma4a::initialize() {
     cache.fill_sin_cos_table(hparams.audio_n_fft);
 

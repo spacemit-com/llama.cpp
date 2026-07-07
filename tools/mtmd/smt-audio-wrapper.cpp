@@ -18,6 +18,8 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -37,8 +39,12 @@ extern const OrtApi * g_ort;
 
 namespace {
 
+constexpr int32_t      k_gemma4_default_warmup_feature_frames = 135;
+constexpr const char * k_gemma4_audio_architecture            = "Gemma4Audio";
+
 struct smt_audio_config {
     std::vector<std::string>                     architectures;
+    std::string                                  encoder_model_path;
     std::string                                  frontend_model_path;
     std::string                                  backend_model_path;
     std::unordered_map<std::string, std::string> ep_config;
@@ -53,7 +59,38 @@ struct smt_audio_config {
     int32_t                                      inter_thread_num = 1;
     int32_t                                      lfr_m            = 0;
     int32_t                                      lfr_n            = 0;
+    int32_t                                      feature_frames   = 0;
 };
+
+struct gemma4_encoder_input_shape {
+    int32_t feature_frames = 0;
+    int32_t num_mel_bins   = 0;
+
+    bool dynamic_feature_frames() const {
+        return feature_frames <= 0;
+    }
+};
+
+struct gemma4_encoder_session {
+    explicit gemma4_encoder_session(Ort::Session && session_in) :
+        session(std::move(session_in)) {}
+
+    std::string model_path;
+    Ort::Session session{ nullptr };
+    std::vector<std::string> input_names;
+    std::vector<std::string> output_names;
+    std::vector<const char *> input_names_raw;
+    std::vector<const char *> output_names_raw;
+    gemma4_encoder_input_shape input_shape;
+};
+
+static bool arch_is_gemma4_audio(const std::string & arch_name) {
+    return arch_name == k_gemma4_audio_architecture;
+}
+
+static bool uses_gemma4_single_encoder(const smt_audio_config & config, const std::string & arch_name) {
+    return !config.encoder_model_path.empty() && arch_is_gemma4_audio(arch_name);
+}
 
 static std::string read_file_to_string(const std::string & path) {
     std::ifstream file(path);
@@ -86,6 +123,16 @@ static std::string trim_ascii(std::string value) {
         value.pop_back();
     }
     return value;
+}
+
+static std::string join_path(const std::string & dir, const std::string & name) {
+    if (dir.empty() || dir == ".") {
+        return name;
+    }
+    if (dir.back() == '/' || dir.back() == '\\') {
+        return dir + name;
+    }
+    return dir + "/" + name;
 }
 
 static std::string extract_string_value(const std::string & text, const std::string & key) {
@@ -327,6 +374,13 @@ static bool parse_audio_config_block(const std::string & config_dir,
 
     const std::string audio_block = content.substr(audio_block_start, audio_block_end - audio_block_start + 1);
     warn_legacy_spacemit_ep_config_if_needed(audio_block, "audio_model");
+    config.encoder_model_path = normalize_path(config_dir, extract_string_value(audio_block, "encoder_model_path"));
+    if (config.encoder_model_path.empty()) {
+        config.encoder_model_path = normalize_path(config_dir, extract_string_value(audio_block, "encoder_path"));
+    }
+    if (config.encoder_model_path.empty()) {
+        config.encoder_model_path = normalize_path(config_dir, extract_string_value(audio_block, "onnx_model_path"));
+    }
     config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_model_path"));
     if (config.frontend_model_path.empty()) {
         config.frontend_model_path = normalize_path(config_dir, extract_string_value(audio_block, "frontend_path"));
@@ -348,6 +402,7 @@ static bool parse_audio_config_block(const std::string & config_dir,
     config.hop_len      = (int32_t) extract_int64_value(audio_block, "hop_len", config.hop_len);
     config.lfr_m        = (int32_t) extract_int64_value(audio_block, "lfr_m", config.lfr_m);
     config.lfr_n        = (int32_t) extract_int64_value(audio_block, "lfr_n", config.lfr_n);
+    config.feature_frames = (int32_t) extract_int64_value(audio_block, "feature_frames", config.feature_frames);
     config.ep_config    = extract_string_map(audio_block, "ep_config");
     apply_legacy_spacemit_ep_config(audio_block, config);
     config.architectures = extract_string_array(content, "architectures");
@@ -527,6 +582,7 @@ static void append_optional_spacemit_ep(Ort::SessionOptions &    session_options
                                         const char *             session_name,
                                         const smt_audio_config & config) {
     std::unordered_map<std::string, std::string> provider_options = config.ep_config;
+
     // Add defaults if not specified in ep_config
     if (provider_options.find("SPACEMIT_EP_INTRA_THREAD_NUM") == provider_options.end()) {
         provider_options["SPACEMIT_EP_INTRA_THREAD_NUM"] = std::to_string(config.intra_thread_num);
@@ -573,10 +629,34 @@ static std::vector<std::string> get_io_names(Ort::Session & session, bool inputs
     return names;
 }
 
+static gemma4_encoder_input_shape get_gemma4_encoder_input_shape(const Ort::Session & session) {
+    for (size_t i = 0; i < session.GetInputCount(); ++i) {
+        const auto input_info = session.GetInputTypeInfo(i).GetTensorTypeAndShapeInfo();
+        const auto shape      = input_info.GetShape();
+        if (shape.size() != 3) {
+            continue;
+        }
+
+        gemma4_encoder_input_shape result;
+        result.feature_frames = shape[1] > 0 ? (int32_t) shape[1] : 0;
+        result.num_mel_bins   = shape[2] > 0 ? (int32_t) shape[2] : 0;
+        return result;
+    }
+
+    return {};
+}
+
 static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vector<float> & data) {
     Ort::MemoryInfo memory_info =
         Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
     return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
+}
+
+static Ort::Value make_tensor_bool(const std::vector<int64_t> & shape, std::vector<uint8_t> & data) {
+    Ort::MemoryInfo memory_info =
+        Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+    return Ort::Value::CreateTensor(memory_info, data.data(), data.size() * sizeof(uint8_t), shape.data(), shape.size(),
+                                    ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL);
 }
 
 }  // namespace
@@ -589,6 +669,11 @@ struct smt_audio_context::impl {
     Ort::Session        frontend_session{ nullptr };
     Ort::Session        backend_session{ nullptr };
 
+    bool                                   warmup_encoder_sessions = false;
+    std::mutex                             encoder_session_mutex;
+    std::string                            encoder_session_model_path;
+    std::unique_ptr<gemma4_encoder_session> encoder_session;
+
     std::vector<std::string>  frontend_input_names;
     std::vector<std::string>  frontend_output_names;
     std::vector<const char *> frontend_input_names_raw;
@@ -600,6 +685,76 @@ struct smt_audio_context::impl {
     std::vector<const char *> backend_output_names_raw;
 
     std::string arch_name;
+
+    void warmup_gemma4_encoder_session(gemma4_encoder_session & encoder) const {
+        std::cerr << "[SMT][audio] warmup encoder ONNX session";
+        if (!arch_name.empty()) {
+            std::cerr << " for " << arch_name;
+        }
+        std::cerr << ": " << encoder.model_path << "\n";
+
+        const int32_t warmup_frames =
+            encoder.input_shape.dynamic_feature_frames() ?
+                (config.feature_frames > 0 ? config.feature_frames : k_gemma4_default_warmup_feature_frames) :
+                encoder.input_shape.feature_frames;
+        std::vector<float>         feature_data((size_t) warmup_frames * config.num_mel_bins, 0.0f);
+        std::vector<uint8_t>       feature_mask((size_t) warmup_frames, 1);
+        const std::vector<int64_t> feature_shape = { 1, warmup_frames, config.num_mel_bins };
+        const std::vector<int64_t> mask_shape    = { 1, warmup_frames };
+        auto                       feature_tensor = make_tensor_f32(feature_shape, feature_data);
+        auto                       mask_tensor    = make_tensor_bool(mask_shape, feature_mask);
+        std::array<Ort::Value, 2>  inputs         = { std::move(feature_tensor), std::move(mask_tensor) };
+        (void) encoder.session.Run(Ort::RunOptions{ nullptr }, encoder.input_names_raw.data(), inputs.data(),
+                                   inputs.size(), encoder.output_names_raw.data(), encoder.output_names_raw.size());
+    }
+
+    gemma4_encoder_session & get_gemma4_encoder_session(const std::string & model_path) {
+        if (encoder_session && encoder_session_model_path == model_path) {
+            return *encoder_session;
+        }
+        encoder_session.reset();
+        encoder_session_model_path.clear();
+
+        Ort::SessionOptions encoder_options;
+        encoder_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+        const bool ep_affinity_is_configured = has_spacemit_ep_affinity(config);
+        if (!ep_affinity_is_configured) {
+            encoder_options.SetIntraOpNumThreads(config.intra_thread_num);
+            encoder_options.SetInterOpNumThreads(config.inter_thread_num);
+        }
+
+        std::cerr << "[SMT][audio] using ORT CPU for Gemma4 encoder: " << model_path << "\n";
+        auto encoder = std::make_unique<gemma4_encoder_session>(Ort::Session(env, model_path.c_str(), encoder_options));
+        encoder->model_path       = model_path;
+        encoder->input_names      = get_io_names(encoder->session, true);
+        encoder->output_names     = get_io_names(encoder->session, false);
+        encoder->input_names_raw  = make_name_ptrs(encoder->input_names);
+        encoder->output_names_raw = make_name_ptrs(encoder->output_names);
+        encoder->input_shape      = get_gemma4_encoder_input_shape(encoder->session);
+
+        if (encoder->input_names_raw.size() != 2 || encoder->output_names_raw.size() != 2) {
+            throw std::runtime_error("Unexpected SMT audio single-encoder ONNX IO signature");
+        }
+        if (encoder->input_shape.num_mel_bins <= 0) {
+            encoder->input_shape.num_mel_bins = config.num_mel_bins;
+        }
+        if (encoder->input_shape.feature_frames <= 0 && config.feature_frames > 0) {
+            encoder->input_shape.feature_frames = config.feature_frames;
+        }
+        if (encoder->input_shape.num_mel_bins > 0 && encoder->input_shape.num_mel_bins != config.num_mel_bins) {
+            throw std::runtime_error("Gemma4 audio encoder num_mel_bins mismatch: config " +
+                                     std::to_string(config.num_mel_bins) + ", ONNX " +
+                                     std::to_string(encoder->input_shape.num_mel_bins));
+        }
+
+        if (warmup_encoder_sessions) {
+            warmup_gemma4_encoder_session(*encoder);
+        }
+
+        encoder_session_model_path = model_path;
+        encoder_session            = std::move(encoder);
+        return *encoder_session;
+    }
 };
 
 smt_audio_context::~smt_audio_context() = default;
@@ -619,11 +774,22 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
         d.arch_name = "Qwen3ASRForConditionalGeneration";
     }
 
-    if (d.config.frontend_model_path.empty() || d.config.backend_model_path.empty()) {
-        throw std::runtime_error("Missing SMT audio frontend/backend model path");
+    const bool gemma4_single_encoder = uses_gemma4_single_encoder(d.config, d.arch_name);
+    if (!d.config.encoder_model_path.empty() && !gemma4_single_encoder) {
+        throw std::runtime_error("SMT audio encoder_model_path is currently supported only for Gemma4 audio models");
     }
-    if (d.config.d_model <= 0 || d.config.hidden_size <= 0) {
-        throw std::runtime_error("Invalid SMT audio model dimensions");
+
+    if (gemma4_single_encoder) {
+        if (d.config.hidden_size <= 0) {
+            throw std::runtime_error("Invalid Gemma4 audio single-encoder hidden_size");
+        }
+    } else {
+        if (d.config.frontend_model_path.empty() || d.config.backend_model_path.empty()) {
+            throw std::runtime_error("Missing SMT audio frontend/backend model path");
+        }
+        if (d.config.d_model <= 0 || d.config.hidden_size <= 0) {
+            throw std::runtime_error("Invalid SMT audio model dimensions");
+        }
     }
 
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
@@ -642,105 +808,109 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
                   << " to avoid conflicting with EP-managed affinity\n";
     }
 
-    append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
-    append_optional_spacemit_ep(d.backend_options, "backend", d.config);
+    if (gemma4_single_encoder) {
+        d.warmup_encoder_sessions = warmup;
+    } else {
+        append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
+        append_optional_spacemit_ep(d.backend_options, "backend", d.config);
 
-    d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
-    d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(), d.backend_options);
+        d.frontend_session = Ort::Session(d.env, d.config.frontend_model_path.c_str(), d.frontend_options);
+        d.backend_session  = Ort::Session(d.env, d.config.backend_model_path.c_str(), d.backend_options);
 
-    d.frontend_input_names      = get_io_names(d.frontend_session, true);
-    d.frontend_output_names     = get_io_names(d.frontend_session, false);
-    d.frontend_input_names_raw  = make_name_ptrs(d.frontend_input_names);
-    d.frontend_output_names_raw = make_name_ptrs(d.frontend_output_names);
+        d.frontend_input_names      = get_io_names(d.frontend_session, true);
+        d.frontend_output_names     = get_io_names(d.frontend_session, false);
+        d.frontend_input_names_raw  = make_name_ptrs(d.frontend_input_names);
+        d.frontend_output_names_raw = make_name_ptrs(d.frontend_output_names);
 
-    d.backend_input_names      = get_io_names(d.backend_session, true);
-    d.backend_output_names     = get_io_names(d.backend_session, false);
-    d.backend_input_names_raw  = make_name_ptrs(d.backend_input_names);
-    d.backend_output_names_raw = make_name_ptrs(d.backend_output_names);
+        d.backend_input_names      = get_io_names(d.backend_session, true);
+        d.backend_output_names     = get_io_names(d.backend_session, false);
+        d.backend_input_names_raw  = make_name_ptrs(d.backend_input_names);
+        d.backend_output_names_raw = make_name_ptrs(d.backend_output_names);
 
-    if (d.frontend_input_names_raw.size() != 1 || d.frontend_output_names_raw.size() != 1 ||
-        (d.backend_input_names_raw.size() != 1 && d.backend_input_names_raw.size() != 2) ||
-        d.backend_output_names_raw.size() != 1) {
-        throw std::runtime_error("Unexpected SMT audio ONNX IO signature");
-    }
-
-    if (warmup) {
-        std::cerr << "[SMT][audio] warmup ONNX sessions";
-        if (!d.arch_name.empty()) {
-            std::cerr << " for " << d.arch_name;
-        }
-        std::cerr << "\n";
-
-        int                warmup_t_out;
-        std::vector<float> warmup_hidden;
-
-        if (d.config.lfr_m > 0) {
-            const int warmup_frames = 10;
-            const int feat_dim      = d.config.num_mel_bins * d.config.lfr_m;
-
-            std::vector<float>         frontend_input_data((size_t) warmup_frames * feat_dim, 0.0f);
-            const std::vector<int64_t> frontend_input_shape = { 1, warmup_frames, (int64_t) feat_dim };
-            auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
-
-            std::cerr << "[SMT][audio] warmup frontend ONNX session (FunASR): " << d.config.frontend_model_path << "\n";
-            auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
-                                                           &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
-            if (frontend_outputs.empty()) {
-                throw std::runtime_error("SMT audio warmup frontend returned no outputs");
-            }
-            const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
-            if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-                throw std::runtime_error("SMT audio warmup frontend output must be float32");
-            }
-            auto shape    = frontend_output_info.GetShape();
-            warmup_t_out  = (int) shape[1];
-            warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
-            const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
-            std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
-        } else {
-            const int chunk_frames = 100;
-            const int chunk_tokens = 13;
-            warmup_t_out           = chunk_tokens;
-
-            std::vector<float>         frontend_input_data((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
-            const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
-            auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
-
-            std::cerr << "[SMT][audio] warmup frontend ONNX session: " << d.config.frontend_model_path << "\n";
-            auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
-                                                           &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
-
-            warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
-            if (frontend_outputs.empty()) {
-                throw std::runtime_error("SMT audio warmup frontend returned no outputs");
-            }
-            const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
-            if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-                throw std::runtime_error("SMT audio warmup frontend output must be float32");
-            }
-            const int64_t frontend_output_elems = frontend_output_info.GetElementCount();
-            if (frontend_output_elems < 0 || (size_t) frontend_output_elems < warmup_hidden.size()) {
-                throw std::runtime_error("SMT audio warmup frontend output is smaller than expected");
-            }
-            const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
-            std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
+        if (d.frontend_input_names_raw.size() != 1 || d.frontend_output_names_raw.size() != 1 ||
+            (d.backend_input_names_raw.size() != 1 && d.backend_input_names_raw.size() != 2) ||
+            d.backend_output_names_raw.size() != 1) {
+            throw std::runtime_error("Unexpected SMT audio ONNX IO signature");
         }
 
-        const std::vector<int64_t> backend_hidden_shape = { 1, warmup_t_out, d.config.d_model };
-        auto                      hidden_tensor        = make_tensor_f32(backend_hidden_shape, warmup_hidden);
+        if (warmup) {
+            std::cerr << "[SMT][audio] warmup ONNX sessions";
+            if (!d.arch_name.empty()) {
+                std::cerr << " for " << d.arch_name;
+            }
+            std::cerr << "\n";
 
-        std::cerr << "[SMT][audio] warmup backend ONNX session: " << d.config.backend_model_path << "\n";
-        if (d.backend_input_names_raw.size() == 2) {
-            std::vector<float>         attention_mask((size_t) warmup_t_out * (size_t) warmup_t_out, 0.0f);
-            const std::vector<int64_t> backend_mask_shape = { 1, 1, warmup_t_out, warmup_t_out };
-            auto                       mask_tensor        = make_tensor_f32(backend_mask_shape, attention_mask);
-            std::array<Ort::Value, 2>  backend_inputs     = { std::move(hidden_tensor), std::move(mask_tensor) };
-            (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
-                                         backend_inputs.data(), backend_inputs.size(),
-                                         d.backend_output_names_raw.data(), 1);
-        } else {
-            (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
-                                         &hidden_tensor, 1, d.backend_output_names_raw.data(), 1);
+            int                warmup_t_out;
+            std::vector<float> warmup_hidden;
+
+            if (d.config.lfr_m > 0) {
+                const int warmup_frames = 10;
+                const int feat_dim      = d.config.num_mel_bins * d.config.lfr_m;
+
+                std::vector<float>         frontend_input_data((size_t) warmup_frames * feat_dim, 0.0f);
+                const std::vector<int64_t> frontend_input_shape = { 1, warmup_frames, (int64_t) feat_dim };
+                auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
+
+                std::cerr << "[SMT][audio] warmup frontend ONNX session (FunASR): " << d.config.frontend_model_path << "\n";
+                auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                               &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+                if (frontend_outputs.empty()) {
+                    throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+                }
+                const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
+                if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                    throw std::runtime_error("SMT audio warmup frontend output must be float32");
+                }
+                auto shape    = frontend_output_info.GetShape();
+                warmup_t_out  = (int) shape[1];
+                warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
+                const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
+                std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
+            } else {
+                const int chunk_frames = 100;
+                const int chunk_tokens = 13;
+                warmup_t_out           = chunk_tokens;
+
+                std::vector<float>         frontend_input_data((size_t) d.config.num_mel_bins * chunk_frames, 0.0f);
+                const std::vector<int64_t> frontend_input_shape = { 1, d.config.num_mel_bins, chunk_frames };
+                auto                       frontend_input       = make_tensor_f32(frontend_input_shape, frontend_input_data);
+
+                std::cerr << "[SMT][audio] warmup frontend ONNX session: " << d.config.frontend_model_path << "\n";
+                auto frontend_outputs = d.frontend_session.Run(Ort::RunOptions{ nullptr }, d.frontend_input_names_raw.data(),
+                                                               &frontend_input, 1, d.frontend_output_names_raw.data(), 1);
+
+                warmup_hidden.resize((size_t) warmup_t_out * (size_t) d.config.d_model, 0.0f);
+                if (frontend_outputs.empty()) {
+                    throw std::runtime_error("SMT audio warmup frontend returned no outputs");
+                }
+                const auto frontend_output_info = frontend_outputs[0].GetTensorTypeAndShapeInfo();
+                if (frontend_output_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                    throw std::runtime_error("SMT audio warmup frontend output must be float32");
+                }
+                const int64_t frontend_output_elems = frontend_output_info.GetElementCount();
+                if (frontend_output_elems < 0 || (size_t) frontend_output_elems < warmup_hidden.size()) {
+                    throw std::runtime_error("SMT audio warmup frontend output is smaller than expected");
+                }
+                const float * frontend_output = frontend_outputs[0].GetTensorData<float>();
+                std::memcpy(warmup_hidden.data(), frontend_output, warmup_hidden.size() * sizeof(float));
+            }
+
+            const std::vector<int64_t> backend_hidden_shape = { 1, warmup_t_out, d.config.d_model };
+            auto                       hidden_tensor        = make_tensor_f32(backend_hidden_shape, warmup_hidden);
+
+            std::cerr << "[SMT][audio] warmup backend ONNX session: " << d.config.backend_model_path << "\n";
+            if (d.backend_input_names_raw.size() == 2) {
+                std::vector<float>         attention_mask((size_t) warmup_t_out * (size_t) warmup_t_out, 0.0f);
+                const std::vector<int64_t> backend_mask_shape = { 1, 1, warmup_t_out, warmup_t_out };
+                auto                       mask_tensor        = make_tensor_f32(backend_mask_shape, attention_mask);
+                std::array<Ort::Value, 2>  backend_inputs     = { std::move(hidden_tensor), std::move(mask_tensor) };
+                (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                             backend_inputs.data(), backend_inputs.size(),
+                                             d.backend_output_names_raw.data(), 1);
+            } else {
+                (void) d.backend_session.Run(Ort::RunOptions{ nullptr }, d.backend_input_names_raw.data(),
+                                             &hidden_tensor, 1, d.backend_output_names_raw.data(), 1);
+            }
         }
     }
 
@@ -761,6 +931,112 @@ std::vector<float> smt_audio_context::encode_audio(const std::string & audio_pat
         throw std::runtime_error("failed to decode audio file: " + audio_path);
     }
     ggml_trace_log_end("decode_audio_file", "Audio", NULL);
+
+    if (uses_gemma4_single_encoder(d.config, d.arch_name)) {
+        std::vector<float> features;
+        int                n_feature_frames = 0;
+        ggml_trace_log_begin("compute_gemma4_features", "Audio", NULL);
+        if (!mtmd_audio_compute_gemma4_features(samples.data(), samples.size(), d.config.sample_rate,
+                                                d.config.num_mel_bins, d.config.n_fft, d.config.window_len,
+                                                d.config.hop_len, features, n_feature_frames)) {
+            ggml_trace_log_end("compute_gemma4_features", "Audio", NULL);
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("failed to compute Gemma4 audio features");
+        }
+        ggml_trace_log_end("compute_gemma4_features", "Audio", NULL);
+
+        const std::string & encoder_model_path = d.config.encoder_model_path;
+        if (encoder_model_path.empty()) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("Gemma4 audio encoder_model_path is empty");
+        }
+
+        std::lock_guard<std::mutex> encoder_lock(d.encoder_session_mutex);
+        auto &                      encoder = d.get_gemma4_encoder_session(encoder_model_path);
+
+        const int32_t encoder_feature_frames =
+            encoder.input_shape.dynamic_feature_frames() ? n_feature_frames : encoder.input_shape.feature_frames;
+        if (encoder_feature_frames <= 0) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("Gemma4 audio feature length must be positive");
+        }
+
+        if (!encoder.input_shape.dynamic_feature_frames() && n_feature_frames > encoder_feature_frames) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("Gemma4 audio feature length " + std::to_string(n_feature_frames) +
+                                     " exceeds ONNX static feature_frames " +
+                                     std::to_string(encoder_feature_frames) + " for " + encoder.model_path);
+        }
+
+        std::vector<float> feature_data((size_t) encoder_feature_frames * d.config.num_mel_bins, 0.0f);
+        for (int frame = 0; frame < n_feature_frames; ++frame) {
+            std::memcpy(feature_data.data() + (size_t) frame * d.config.num_mel_bins,
+                        features.data() + (size_t) frame * d.config.num_mel_bins,
+                        (size_t) d.config.num_mel_bins * sizeof(float));
+        }
+        std::vector<uint8_t> feature_mask((size_t) encoder_feature_frames, 0);
+        std::fill(feature_mask.begin(), feature_mask.begin() + n_feature_frames, (uint8_t) 1);
+
+        const std::vector<int64_t> feature_shape = { 1, encoder_feature_frames, d.config.num_mel_bins };
+        const std::vector<int64_t> mask_shape    = { 1, encoder_feature_frames };
+        auto                       feature_tensor = make_tensor_f32(feature_shape, feature_data);
+        auto                       mask_tensor    = make_tensor_bool(mask_shape, feature_mask);
+        std::array<Ort::Value, 2>  inputs         = { std::move(feature_tensor), std::move(mask_tensor) };
+
+        ggml_trace_log_begin("encoder_session_run", "Audio", NULL);
+        auto outputs = encoder.session.Run(Ort::RunOptions{ nullptr }, encoder.input_names_raw.data(),
+                                           inputs.data(), inputs.size(), encoder.output_names_raw.data(),
+                                           encoder.output_names_raw.size());
+        ggml_trace_log_end("encoder_session_run", "Audio", NULL);
+
+        if (outputs.size() < 2) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("Gemma4 audio encoder returned fewer than 2 outputs");
+        }
+
+        const auto embd_info = outputs[0].GetTensorTypeAndShapeInfo();
+        if (embd_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("Gemma4 audio_embeddings output must be float32");
+        }
+        const int64_t embd_elems = embd_info.GetElementCount();
+        if (embd_elems <= 0 || embd_elems % d.config.hidden_size != 0) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("invalid Gemma4 audio_embeddings shape");
+        }
+        const int n_audio_tokens = (int) (embd_elems / d.config.hidden_size);
+
+        const auto mask_info = outputs[1].GetTensorTypeAndShapeInfo();
+        if (mask_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_BOOL ||
+            mask_info.GetElementCount() < (size_t) n_audio_tokens) {
+            ggml_trace_log_end("encode_audio", "Audio", NULL);
+            ggml_profile_flush_tls();
+            throw std::runtime_error("invalid Gemma4 audio_token_mask shape");
+        }
+
+        const float * embd = outputs[0].GetTensorData<float>();
+        const bool *  mask = outputs[1].GetTensorData<bool>();
+        std::vector<float> audio_embd;
+        audio_embd.reserve((size_t) n_audio_tokens * (size_t) d.config.hidden_size);
+        for (int token = 0; token < n_audio_tokens; ++token) {
+            if (!mask[token]) {
+                continue;
+            }
+            const float * src = embd + (size_t) token * (size_t) d.config.hidden_size;
+            audio_embd.insert(audio_embd.end(), src, src + d.config.hidden_size);
+        }
+
+        ggml_trace_log_end("encode_audio", "Audio", NULL);
+        ggml_profile_flush_tls();
+        return audio_embd;
+    }
 
     int                t_out;
     std::vector<float> hidden_states;

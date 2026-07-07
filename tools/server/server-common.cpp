@@ -1087,6 +1087,55 @@ static common_chat_params build_qwen3asr_audio_chat_params(const common_chat_tem
     return params;
 }
 
+static common_chat_templates_inputs remove_media_from_chat_inputs(const common_chat_templates_inputs & inputs) {
+    common_chat_templates_inputs out = inputs;
+    for (auto & msg : out.messages) {
+        msg.content = collect_message_text_without_media(msg);
+        msg.content_parts.clear();
+    }
+    return out;
+}
+
+static common_chat_params build_gemma4_audio_chat_params(const server_chat_params &             opt,
+                                                         const common_chat_templates_inputs & inputs) {
+    common_chat_params params = common_chat_templates_apply(opt.tmpls.get(), remove_media_from_chat_inputs(inputs));
+
+    size_t      media_marker_count = 0;
+    std::string user_text;
+
+    for (const auto & msg : inputs.messages) {
+        bool        has_media = false;
+        std::string text      = collect_message_text_without_media(msg, &has_media);
+        media_marker_count += count_message_media_markers(msg);
+        if ((msg.role == "system" || msg.role == "developer") && !text.empty()) {
+            if (!user_text.empty()) {
+                user_text += "\n";
+            }
+            user_text += text;
+        } else if (msg.role == "user" && has_media) {
+            if (!user_text.empty() && !text.empty()) {
+                user_text += "\n";
+            }
+            user_text += std::move(text);
+        }
+    }
+
+    params.prompt = "<|turn>user\n";
+    for (size_t i = 0; i < media_marker_count; ++i) {
+        params.prompt += "<__media__>";
+    }
+    if (!user_text.empty()) {
+        params.prompt += user_text;
+    }
+    params.prompt += "<turn|>\n";
+    if (inputs.add_generation_prompt) {
+        params.prompt += params.generation_prompt.empty() ? "<|turn>model\n" : params.generation_prompt;
+    }
+    params.message_spans.clear();
+
+    return params;
+}
+
 static bool should_use_qwen3asr_audio_prompt(const server_chat_params &      opt,
                                              const std::vector<raw_buffer> & out_files) {
     if (out_files.empty() || !opt.allow_audio || opt.media_backend != "smt" || opt.tmpls == nullptr) {
@@ -1096,6 +1145,21 @@ static bool should_use_qwen3asr_audio_prompt(const server_chat_params &      opt
     const std::string tmpl_src = common_chat_templates_source(opt.tmpls.get(), "");
     return tmpl_src.find("<|audio_start|><|audio_pad|><|audio_end|>") != std::string::npos &&
            tmpl_src.find("<|im_start|>assistant") != std::string::npos &&
+           tmpl_src.find("media_marker") == std::string::npos;
+}
+
+static bool should_use_gemma4_audio_prompt(const server_chat_params &      opt,
+                                           bool                            has_audio_media,
+                                           bool                            has_image_media,
+                                           const std::vector<raw_buffer> & out_files) {
+    const bool has_audio_input = has_audio_media || (!has_image_media && !out_files.empty());
+    if (!has_audio_input || has_image_media || !opt.allow_audio || opt.media_backend != "smt" || opt.tmpls == nullptr) {
+        return false;
+    }
+
+    const std::string tmpl_src = common_chat_templates_source(opt.tmpls.get(), "");
+    return tmpl_src.find("<|turn>model") != std::string::npos &&
+           tmpl_src.find("<|channel>thought") != std::string::npos &&
            tmpl_src.find("media_marker") == std::string::npos;
 }
 #endif
@@ -1519,6 +1583,8 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
     }
 #if defined(LLAMA_SERVER_SMT_VISION)
     apply_vision_history_mode(messages, vision_history);
+    bool has_image_media = false;
+    bool has_audio_media = false;
 #endif
 
     for (auto & msg : messages) {
@@ -1554,6 +1620,9 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
 
                 json image_url = json_value(p, "image_url", json::object());
                 handle_media(out_files, image_url, opt.media_path, opt.image_bin_only);
+#if defined(LLAMA_SERVER_SMT_VISION)
+                has_image_media = true;
+#endif
 
                 p["type"] = "media_marker";
                 p["text"] = get_media_marker();
@@ -1573,6 +1642,9 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
                 }
                 auto decoded_data = base64_decode(data);  // expected to be base64 encoded
                 out_files.push_back(decoded_data);
+#if defined(LLAMA_SERVER_SMT_VISION)
+                has_audio_media = true;
+#endif
 
                 // TODO: add audio_url support by reusing handle_media()
 
@@ -1651,6 +1723,8 @@ json oaicompat_chat_params_parse(json &                     body, /* openai api 
         chat_params = build_paddleocr_chat_params(inputs);
     } else if (should_use_qwen3asr_audio_prompt(opt, out_files)) {
         chat_params = build_qwen3asr_audio_chat_params(inputs);
+    } else if (should_use_gemma4_audio_prompt(opt, has_audio_media, has_image_media, out_files)) {
+        chat_params = build_gemma4_audio_chat_params(opt, inputs);
     } else
 #endif
     {

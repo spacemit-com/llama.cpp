@@ -111,6 +111,17 @@ bool mtmd_audio_compute_log_mel_spectrogram(const float * samples,
                                             bool          use_natural_log,
                                             bool          norm_per_feature,
                                             mtmd_audio_mel & out);
+
+// Gemma4 audio frontend features. Output layout: [n_frames, n_mel].
+bool mtmd_audio_compute_gemma4_features(const float * samples,
+                                        size_t        n_samples,
+                                        int           sample_rate,
+                                        int           n_mel,
+                                        int           n_fft,
+                                        int           window_len,
+                                        int           hop_len,
+                                        std::vector<float> & features,
+                                        int &         n_frames_out);
 struct mtmd_audio_preprocessor_qwen3a : mtmd_audio_preprocessor {
     mtmd_audio_preprocessor_qwen3a(const clip_ctx * ctx) : mtmd_audio_preprocessor(ctx) {}
     void initialize() override;
