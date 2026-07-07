@@ -39,7 +39,6 @@ extern const OrtApi * g_ort;
 
 namespace {
 
-constexpr int32_t      k_gemma4_default_warmup_feature_frames = 135;
 constexpr const char * k_gemma4_audio_architecture            = "Gemma4Audio";
 
 struct smt_audio_config {
@@ -123,16 +122,6 @@ static std::string trim_ascii(std::string value) {
         value.pop_back();
     }
     return value;
-}
-
-static std::string join_path(const std::string & dir, const std::string & name) {
-    if (dir.empty() || dir == ".") {
-        return name;
-    }
-    if (dir.back() == '/' || dir.back() == '\\') {
-        return dir + name;
-    }
-    return dir + "/" + name;
 }
 
 static std::string extract_string_value(const std::string & text, const std::string & key) {
@@ -669,7 +658,6 @@ struct smt_audio_context::impl {
     Ort::Session        frontend_session{ nullptr };
     Ort::Session        backend_session{ nullptr };
 
-    bool                                   warmup_encoder_sessions = false;
     std::mutex                             encoder_session_mutex;
     std::string                            encoder_session_model_path;
     std::unique_ptr<gemma4_encoder_session> encoder_session;
@@ -685,28 +673,6 @@ struct smt_audio_context::impl {
     std::vector<const char *> backend_output_names_raw;
 
     std::string arch_name;
-
-    void warmup_gemma4_encoder_session(gemma4_encoder_session & encoder) const {
-        std::cerr << "[SMT][audio] warmup encoder ONNX session";
-        if (!arch_name.empty()) {
-            std::cerr << " for " << arch_name;
-        }
-        std::cerr << ": " << encoder.model_path << "\n";
-
-        const int32_t warmup_frames =
-            encoder.input_shape.dynamic_feature_frames() ?
-                (config.feature_frames > 0 ? config.feature_frames : k_gemma4_default_warmup_feature_frames) :
-                encoder.input_shape.feature_frames;
-        std::vector<float>         feature_data((size_t) warmup_frames * config.num_mel_bins, 0.0f);
-        std::vector<uint8_t>       feature_mask((size_t) warmup_frames, 1);
-        const std::vector<int64_t> feature_shape = { 1, warmup_frames, config.num_mel_bins };
-        const std::vector<int64_t> mask_shape    = { 1, warmup_frames };
-        auto                       feature_tensor = make_tensor_f32(feature_shape, feature_data);
-        auto                       mask_tensor    = make_tensor_bool(mask_shape, feature_mask);
-        std::array<Ort::Value, 2>  inputs         = { std::move(feature_tensor), std::move(mask_tensor) };
-        (void) encoder.session.Run(Ort::RunOptions{ nullptr }, encoder.input_names_raw.data(), inputs.data(),
-                                   inputs.size(), encoder.output_names_raw.data(), encoder.output_names_raw.size());
-    }
 
     gemma4_encoder_session & get_gemma4_encoder_session(const std::string & model_path) {
         if (encoder_session && encoder_session_model_path == model_path) {
@@ -745,10 +711,6 @@ struct smt_audio_context::impl {
             throw std::runtime_error("Gemma4 audio encoder num_mel_bins mismatch: config " +
                                      std::to_string(config.num_mel_bins) + ", ONNX " +
                                      std::to_string(encoder->input_shape.num_mel_bins));
-        }
-
-        if (warmup_encoder_sessions) {
-            warmup_gemma4_encoder_session(*encoder);
         }
 
         encoder_session_model_path = model_path;
@@ -809,7 +771,8 @@ std::unique_ptr<smt_audio_context> smt_audio_context::create(const std::string &
     }
 
     if (gemma4_single_encoder) {
-        d.warmup_encoder_sessions = warmup;
+        // Keep dynamic Gemma4 encoder sessions lazy; initializing them during server warmup regresses
+        // ORT CPU dynamic-shape runs on K3.
     } else {
         append_optional_spacemit_ep(d.frontend_options, "frontend", d.config);
         append_optional_spacemit_ep(d.backend_options, "backend", d.config);

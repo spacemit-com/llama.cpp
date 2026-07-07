@@ -1101,28 +1101,39 @@ static common_chat_params build_gemma4_audio_chat_params(const server_chat_param
     common_chat_params params = common_chat_templates_apply(opt.tmpls.get(), remove_media_from_chat_inputs(inputs));
 
     size_t      media_marker_count = 0;
+    std::string system_text;
     std::string user_text;
+    auto append_text = [](std::string & dst, std::string text) {
+        if (text.empty()) {
+            return;
+        }
+        if (!dst.empty()) {
+            dst += "\n";
+        }
+        dst += std::move(text);
+    };
 
     for (const auto & msg : inputs.messages) {
         bool        has_media = false;
         std::string text      = collect_message_text_without_media(msg, &has_media);
         media_marker_count += count_message_media_markers(msg);
         if ((msg.role == "system" || msg.role == "developer") && !text.empty()) {
-            if (!user_text.empty()) {
-                user_text += "\n";
-            }
-            user_text += text;
+            append_text(system_text, std::move(text));
         } else if (msg.role == "user" && has_media) {
-            if (!user_text.empty() && !text.empty()) {
-                user_text += "\n";
-            }
-            user_text += std::move(text);
+            append_text(user_text, std::move(text));
         }
     }
 
-    params.prompt = "<|turn>user\n";
+    params.prompt.clear();
+    params.prompt += "<|turn>user\n";
     for (size_t i = 0; i < media_marker_count; ++i) {
         params.prompt += "<__media__>";
+    }
+    // A Gemma4 system turn can push speech translation into thinking-only output.
+    // Keep the instruction text in the user turn so ASR/translation returns content.
+    if (!system_text.empty()) {
+        params.prompt += system_text;
+        params.prompt += "\n";
     }
     if (!user_text.empty()) {
         params.prompt += user_text;
