@@ -1055,6 +1055,19 @@ static std::string collect_system_text(const mtmd_cli_smt_context & ctx) {
     return system_text;
 }
 
+static std::string collect_instruction_text(const mtmd_cli_smt_context & ctx) {
+    std::string instruction_text;
+    for (const auto & msg : ctx.chat_history) {
+        if ((msg.role == "system" || msg.role == "developer") && !msg.content.empty()) {
+            if (!instruction_text.empty()) {
+                instruction_text += "\n";
+            }
+            instruction_text += msg.content;
+        }
+    }
+    return instruction_text;
+}
+
 static std::string strip_media_markers_from_prompt(const std::string & prompt) {
     std::string text = prompt;
     replace_all(text, k_legacy_image_marker, k_media_marker);
@@ -1080,12 +1093,19 @@ static std::string format_qwen3asr_audio_prompt(const mtmd_cli_smt_context & ctx
 }
 
 static std::string format_gemma4_audio_prompt(const mtmd_cli_smt_context & ctx, const common_chat_msg & msg) {
+    const std::string instruction_text = ctx.n_past == 0 ? collect_instruction_text(ctx) : std::string();
     std::string prompt;
-    prompt.reserve(msg.content.size() + ctx.pending_media.size() * 16 + 128);
+    prompt.reserve(instruction_text.size() + msg.content.size() + ctx.pending_media.size() * 16 + 128);
     prompt += "<|turn>user\n";
     for (const auto & media : ctx.pending_media) {
         GGML_ASSERT(media.type == smt_chunk_type::audio);
         prompt += k_media_marker;
+    }
+    // A Gemma4 system turn can push speech translation into thinking-only output.
+    // Keep the instruction text in the user turn so ASR/translation returns content.
+    if (!instruction_text.empty()) {
+        prompt += instruction_text;
+        prompt += "\n";
     }
     const std::string user_text = strip_media_markers_from_prompt(msg.content);
     if (!user_text.empty()) {
