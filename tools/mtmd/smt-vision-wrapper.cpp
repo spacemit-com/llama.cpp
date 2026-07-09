@@ -7,6 +7,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
@@ -121,10 +122,34 @@ static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vecto
     return Ort::Value::CreateTensor<float>(memory_info, data.data(), data.size(), shape.data(), shape.size());
 }
 
+static bool is_qwen3vl_architecture(const std::string & architecture) {
+    const std::string pattern = "qwen3vl";
+    if (architecture.size() < pattern.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i + pattern.size() <= architecture.size(); ++i) {
+        size_t j = 0;
+        for (; j < pattern.size(); ++j) {
+            const char a = (char) std::tolower((unsigned char) architecture[i + j]);
+            if (a != pattern[j]) {
+                break;
+            }
+        }
+        if (j == pattern.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 class smt_ort_vision_engine {
 public:
-    smt_ort_vision_engine(std::string model_path, std::unordered_map<std::string, std::string> ep_config) :
+    smt_ort_vision_engine(std::string                                  model_path,
+                          std::string                                  architecture,
+                          std::unordered_map<std::string, std::string> ep_config) :
         model_path_(std::move(model_path)),
+        architecture_(std::move(architecture)),
         ep_config_(std::move(ep_config)),
         env_(ORT_LOGGING_LEVEL_WARNING, "smt-vision") {}
 
@@ -159,7 +184,8 @@ public:
         input_names_raw_  = make_name_ptrs(input_names_);
         output_names_raw_ = make_name_ptrs(output_names_);
 
-        if (input_names_raw_.size() != 1 || output_names_raw_.size() != 1) {
+        if (input_names_raw_.size() != 1 || output_names_raw_.empty() ||
+            (!is_qwen3vl_architecture(architecture_) && output_names_raw_.size() != 1)) {
             throw std::runtime_error("Unexpected SMT vision ONNX IO signature");
         }
 
@@ -271,6 +297,78 @@ public:
             throw std::runtime_error("SMT vision ONNX returned no outputs");
         }
 
+        if (!is_qwen3vl_architecture(architecture_) && output_tensors.size() != 1) {
+            throw std::runtime_error("Unexpected multi-output SMT vision ONNX model");
+        }
+
+        if (is_qwen3vl_architecture(architecture_) && output_tensors.size() > 1) {
+            struct output_view {
+                const float * data       = nullptr;
+                int64_t       n_tokens   = 0;
+                int64_t       n_embd     = 0;
+                size_t        n_elements = 0;
+            };
+
+            std::vector<output_view> outputs;
+            outputs.reserve(output_tensors.size());
+
+            for (Ort::Value & output : output_tensors) {
+                auto tensor_info = output.GetTensorTypeAndShapeInfo();
+                auto shape       = tensor_info.GetShape();
+                if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                    throw std::runtime_error("Expected float32 output from Qwen3VL vision model");
+                }
+
+                if (shape.size() == 3 && shape[0] == 1) {
+                    shape = { shape[1], shape[2] };
+                }
+                if (shape.size() != 2) {
+                    throw std::runtime_error("Unexpected output shape from Qwen3VL vision encoder");
+                }
+
+                const int64_t n_tokens = shape[0];
+                const int64_t n_embd   = shape[1];
+                if (n_tokens <= 0 || n_embd <= 0) {
+                    throw std::runtime_error("Invalid output shape from Qwen3VL vision encoder");
+                }
+
+                const size_t n_elements = tensor_info.GetElementCount();
+                if (n_elements != (size_t) n_tokens * (size_t) n_embd) {
+                    throw std::runtime_error("Qwen3VL vision output element count does not match shape");
+                }
+
+                outputs.push_back({ output.GetTensorData<float>(), n_tokens, n_embd, n_elements });
+            }
+
+            const int64_t n_tokens = outputs[0].n_tokens;
+            const int64_t n_embd   = outputs[0].n_embd;
+            for (size_t i = 1; i < outputs.size(); ++i) {
+                if (outputs[i].n_tokens != n_tokens || outputs[i].n_embd != n_embd) {
+                    throw std::runtime_error(
+                        "Qwen3VL vision multi-output tensors must have identical [tokens, hidden] shape");
+                }
+            }
+
+            const size_t n_outputs      = outputs.size();
+            const size_t out_n_embd     = (size_t) n_embd * n_outputs;
+            const size_t total_elements = (size_t) n_tokens * out_n_embd;
+            std::vector<float> result(total_elements);
+
+            for (int64_t token = 0; token < n_tokens; ++token) {
+                float * dst = result.data() + (size_t) token * out_n_embd;
+                for (size_t output_idx = 0; output_idx < n_outputs; ++output_idx) {
+                    const output_view & output = outputs[output_idx];
+                    const float *       src    = output.data + (size_t) token * (size_t) n_embd;
+                    std::copy(src, src + (size_t) n_embd, dst + output_idx * (size_t) n_embd);
+                }
+            }
+
+            std::cerr << "[SMT][vision] Qwen3VL concatenated " << n_outputs << " outputs [" << n_tokens << ", "
+                      << n_embd << "] -> [" << n_tokens << ", " << out_n_embd << "]\n";
+
+            return result;
+        }
+
         Ort::Value & output      = output_tensors[0];
         auto         tensor_info = output.GetTensorTypeAndShapeInfo();
         auto         shape       = tensor_info.GetShape();
@@ -292,6 +390,7 @@ public:
 
 private:
     std::string                                  model_path_;
+    std::string                                  architecture_;
     std::unordered_map<std::string, std::string> ep_config_;
     std::unordered_map<std::string, std::string> provider_options_;
     Ort::Env                                     env_;
@@ -832,7 +931,8 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
     // 3. Create vision engine and session
-    d.vision_engine = std::make_unique<smt_ort_vision_engine>(d.config.vision_model_path, d.config.ep_config);
+    d.vision_engine =
+        std::make_unique<smt_ort_vision_engine>(d.config.vision_model_path, d.arch_name, d.config.ep_config);
     (void) d.vision_engine->create_session();
     if (warmup) {
         warmup_vision_engine(*d.vision_engine, d.arch_name);
