@@ -122,10 +122,13 @@ static Ort::Value make_tensor_f32(const std::vector<int64_t> & shape, std::vecto
 }
 
 class smt_ort_vision_engine {
-public:
-    smt_ort_vision_engine(std::string model_path, std::unordered_map<std::string, std::string> ep_config) :
+  public:
+    smt_ort_vision_engine(std::string                                  model_path,
+                          std::unordered_map<std::string, std::string> ep_config,
+                          std::string                                  arch_name) :
         model_path_(std::move(model_path)),
         ep_config_(std::move(ep_config)),
+        arch_name_(std::move(arch_name)),
         env_(ORT_LOGGING_LEVEL_WARNING, "smt-vision") {}
 
     Ort::Session & create_session() {
@@ -159,7 +162,7 @@ public:
         input_names_raw_  = make_name_ptrs(input_names_);
         output_names_raw_ = make_name_ptrs(output_names_);
 
-        if (input_names_raw_.size() != 1 || output_names_raw_.size() != 1) {
+        if (input_names_raw_.size() != 1 || output_names_raw_.empty()) {
             throw std::runtime_error("Unexpected SMT vision ONNX IO signature");
         }
 
@@ -239,8 +242,8 @@ public:
     }
 
     Ort::Value make_zero_input_tensor() {
-        auto                      type_info   = session_.GetInputTypeInfo(0);
-        auto                      tensor_info = type_info.GetTensorTypeAndShapeInfo();
+        auto                       type_info   = session_.GetInputTypeInfo(0);
+        auto                       tensor_info = type_info.GetTensorTypeAndShapeInfo();
         const std::vector<int64_t> input_shape = tensor_info.GetShape();
 
         if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
@@ -262,6 +265,27 @@ public:
         return make_tensor_f32(input_shape, warmup_data_);
     }
 
+    static std::vector<int64_t> normalize_output_shape(std::vector<int64_t> shape) {
+        if (shape.size() == 3 && shape[0] == 1) {
+            shape = { shape[1], shape[2] };
+        }
+        return shape;
+    }
+
+    static std::vector<float> output_to_vector(const Ort::Value & output) {
+        auto tensor_info = output.GetTensorTypeAndShapeInfo();
+        if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+            throw std::runtime_error("Expected float32 output from SMT vision model");
+        }
+        std::vector<int64_t> shape = normalize_output_shape(tensor_info.GetShape());
+        if (shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0) {
+            throw std::runtime_error("Unexpected output shape from SMT vision encoder");
+        }
+        const size_t  total = static_cast<size_t>(shape[0]) * static_cast<size_t>(shape[1]);
+        const float * data  = output.GetTensorData<float>();
+        return std::vector<float>(data, data + total);
+    }
+
     std::vector<float> run_session(Ort::Value & input_tensor) {
         std::vector<Ort::Value> output_tensors =
             session_.Run(Ort::RunOptions{ nullptr }, input_names_raw_.data(), &input_tensor, input_names_raw_.size(),
@@ -271,28 +295,60 @@ public:
             throw std::runtime_error("SMT vision ONNX returned no outputs");
         }
 
-        Ort::Value & output      = output_tensors[0];
-        auto         tensor_info = output.GetTensorTypeAndShapeInfo();
-        auto         shape       = tensor_info.GetShape();
-        if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-            throw std::runtime_error("Expected float32 output from SMT vision model");
+        const size_t n_outputs = output_tensors.size();
+
+        if (n_outputs == 1) {
+            return output_to_vector(output_tensors[0]);
         }
 
-        if (shape.size() == 3 && shape[0] == 1) {
-            shape = { shape[1], shape[2] };
-        }
-        if (shape.size() != 2) {
-            throw std::runtime_error("Unexpected output shape from SMT vision encoder");
+        if (arch_name_ != "Qwen3VL") {
+            std::cerr << "[SMT][vision] warning: ONNX model has " << n_outputs << " outputs but architecture '"
+                      << arch_name_ << "' is not deepstack-aware; only the first output is used\n";
+            return output_to_vector(output_tensors[0]);
         }
 
-        const size_t total_elements = static_cast<size_t>(shape[0]) * static_cast<size_t>(shape[1]);
-        const float * data          = output.GetTensorData<float>();
-        return std::vector<float>(data, data + total_elements);
+        int64_t                    n_tokens = 0;
+        int64_t                    n_embd   = 0;
+        std::vector<const float *> out_data(n_outputs, nullptr);
+
+        for (size_t i = 0; i < n_outputs; ++i) {
+            auto tensor_info = output_tensors[i].GetTensorTypeAndShapeInfo();
+            if (tensor_info.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+                throw std::runtime_error("Expected float32 output from SMT vision model");
+            }
+
+            std::vector<int64_t> shape = normalize_output_shape(tensor_info.GetShape());
+            if (shape.size() != 2 || shape[0] <= 0 || shape[1] <= 0) {
+                throw std::runtime_error("Unexpected output shape from SMT vision encoder");
+            }
+
+            if (i == 0) {
+                n_tokens = shape[0];
+                n_embd   = shape[1];
+            } else if (shape[0] != n_tokens || shape[1] != n_embd) {
+                throw std::runtime_error("SMT vision outputs have mismatched shapes");
+            }
+
+            out_data[i] = output_tensors[i].GetTensorData<float>();
+        }
+
+        const size_t tokens   = static_cast<size_t>(n_tokens);
+        const size_t embd     = static_cast<size_t>(n_embd);
+        const size_t row_size = embd * n_outputs;
+
+        std::vector<float> result(tokens * row_size);
+        for (size_t t = 0; t < tokens; ++t) {
+            for (size_t o = 0; o < n_outputs; ++o) {
+                std::memcpy(result.data() + t * row_size + o * embd, out_data[o] + t * embd, embd * sizeof(float));
+            }
+        }
+        return result;
     }
 
-private:
+  private:
     std::string                                  model_path_;
     std::unordered_map<std::string, std::string> ep_config_;
+    std::string                                  arch_name_;
     std::unordered_map<std::string, std::string> provider_options_;
     Ort::Env                                     env_;
     Ort::SessionOptions                          session_options_;
@@ -832,7 +888,8 @@ std::unique_ptr<smt_vision_context> smt_vision_context::create(const std::string
     onnxruntime::g_ort = OrtGetApiBase()->GetApi(ORT_API_VERSION);
 
     // 3. Create vision engine and session
-    d.vision_engine = std::make_unique<smt_ort_vision_engine>(d.config.vision_model_path, d.config.ep_config);
+    d.vision_engine =
+        std::make_unique<smt_ort_vision_engine>(d.config.vision_model_path, d.config.ep_config, d.arch_name);
     (void) d.vision_engine->create_session();
     if (warmup) {
         warmup_vision_engine(*d.vision_engine, d.arch_name);
