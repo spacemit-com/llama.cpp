@@ -17,7 +17,6 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -360,7 +359,6 @@ class talker_process {
                 protocol::reader reader(message.payload);
                 const uint32_t reported_frames = reader.u32();
                 const bool hit_limit = reader.u32() != 0;
-                (void) reader.f64();
                 if (reader.remaining() != 0 || reported_frames != frames.size()) {
                     throw std::runtime_error("invalid Qwen3-TTS talker completion");
                 }

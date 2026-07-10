@@ -5,8 +5,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <algorithm>
-#include <cerrno>
 #include <cmath>
 #include <csignal>
 #include <cstdint>

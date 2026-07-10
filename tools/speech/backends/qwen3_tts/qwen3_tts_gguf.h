@@ -2,7 +2,6 @@
 
 #include "gguf.h"
 
-#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>

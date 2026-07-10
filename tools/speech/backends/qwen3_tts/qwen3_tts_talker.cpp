@@ -8,11 +8,11 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -87,13 +87,9 @@ class f16_gemv {
     f16_gemv(const f16_gemv &) = delete;
     f16_gemv & operator=(const f16_gemv &) = delete;
 
-    int argmax(const ggml_fp16_t * weight, int rows, const float * input, float * best_value = nullptr) {
+    int argmax(const ggml_fp16_t * weight, int rows, const float * input) {
         prepare(input);
-        const result best = execute(weight, rows, nullptr);
-        if (best_value != nullptr) {
-            *best_value = best.value;
-        }
-        return best.index;
+        return execute(weight, rows, nullptr).index;
     }
 
     void multiply(const ggml_fp16_t * weight, int rows, const float * input, float * output) {
@@ -435,7 +431,6 @@ class talker_engine {
         std::vector<uint8_t> done;
         qwen3_tts::protocol::append_u32(done, frame_count);
         qwen3_tts::protocol::append_u32(done, ended_by_eos ? 0U : 1U);
-        qwen3_tts::protocol::append_f64(done, seconds_since(start));
         qwen3_tts::protocol::send(fd, qwen3_tts::protocol::message_type::talker_done, done);
         std::fprintf(stderr, "qwen3-tts: generated %u frames in %.3f s%s\n",
                      frame_count, seconds_since(start), ended_by_eos ? "" : " (frame limit)");
@@ -503,7 +498,6 @@ int main(int argc, char ** argv) {
             }
         }
         llama_backend_free();
-        backend_initialized = false;
         return 0;
     } catch (const std::exception & error) {
         std::fprintf(stderr, "qwen3-tts talker: %s\n", error.what());
