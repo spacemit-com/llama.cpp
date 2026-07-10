@@ -94,6 +94,19 @@ target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_include_directories(${TARGET} PRIVATE ../mtmd ${CMAKE_SOURCE_DIR})
 target_link_libraries(${TARGET} PUBLIC server-context llama-ui cpp-httplib ${CMAKE_THREAD_LIBS_INIT})
 
+if(LLAMA_SERVER_SMT_VISION)
+    target_sources(${TARGET} PRIVATE
+        server-speech-backend.h
+        server-speech.cpp
+        server-speech.h
+        server-speech-qwen3-tts.cpp
+        server-speech-qwen3-tts.h
+    )
+    target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/tools/speech/backends/qwen3_tts
+    )
+endif()
+
 if(LLAMA_TOOLS_INSTALL)
     install(TARGETS ${TARGET} LIBRARY)
 endif()

@@ -4,6 +4,9 @@
 #include "server-cors-proxy.h"
 #include "server-tools.h"
 #include "server-smt-vision.h"
+#if defined(LLAMA_SERVER_SMT_VISION)
+#include "server-speech.h"
+#endif
 
 #include "arg.h"
 #include "build-info.h"
@@ -72,6 +75,79 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+#if defined(LLAMA_SERVER_SMT_VISION)
+static int run_speech_server(const common_params & params) {
+    server_http_context ctx_http;
+    if (!ctx_http.init(params)) {
+        SRV_ERR("%s", "failed to initialize HTTP server\n");
+        return 1;
+    }
+
+    std::unique_ptr<server_speech_service> speech;
+    try {
+        speech = std::make_unique<server_speech_service>(params);
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to initialize speech backend: %s\n", e.what());
+        return 1;
+    }
+
+    const auto get_health = [](const server_http_req &) -> server_http_res_ptr {
+        auto res = std::make_unique<server_http_res>();
+        res->data = R"({"status":"ok"})";
+        return res;
+    };
+    const auto post_speech = [&speech](const server_http_req & req) -> server_http_res_ptr {
+        json body;
+        try {
+            body = json::parse(req.body);
+        } catch (const json::exception &) {
+            throw std::invalid_argument("request body must be valid JSON");
+        }
+
+        const server_speech_result result = speech->synthesize(body);
+        auto res = std::make_unique<server_http_res>();
+        res->content_type = "audio/wav";
+        res->data = result.wav;
+        res->headers["X-Qwen3-TTS-Backend"] = result.backend;
+        res->headers["X-Qwen3-TTS-Segments"] = std::to_string(result.segments);
+        res->headers["X-Qwen3-TTS-Audio-Seconds"] = std::to_string(result.audio_seconds);
+        res->headers["X-Qwen3-TTS-Wall-Seconds"] = std::to_string(result.wall_seconds);
+        if (result.audio_seconds > 0.0) {
+            res->headers["X-Qwen3-TTS-RTF"] = std::to_string(result.wall_seconds / result.audio_seconds);
+        }
+        return res;
+    };
+
+    ctx_http.get ("/health",          ex_wrapper(get_health));
+    ctx_http.get ("/v1/health",       ex_wrapper(get_health));
+    ctx_http.post("/v1/audio/speech", ex_wrapper(post_speech));
+
+    if (!ctx_http.start()) {
+        SRV_ERR("%s", "exiting due to HTTP server error\n");
+        return 1;
+    }
+    ctx_http.is_ready.store(true);
+    shutdown_handler = [&](int) {
+        ctx_http.stop();
+    };
+
+    struct sigaction action;
+    action.sa_handler = signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+
+    SRV_INF("speech server (%s) is listening on %s\n",
+            server_speech_backend_name(params).c_str(), ctx_http.listening_address.c_str());
+    if (ctx_http.thread.joinable()) {
+        ctx_http.thread.join();
+    }
+    speech.reset();
+    return 0;
+}
+#endif
+
 // satisfies -Wmissing-declarations
 int llama_server(int argc, char ** argv);
 
@@ -86,6 +162,13 @@ int llama_server(int argc, char ** argv) {
     if (!common_params_parse(argc, argv, params, LLAMA_EXAMPLE_SERVER)) {
         return 1;
     }
+
+#if defined(LLAMA_SERVER_SMT_VISION)
+    if (server_speech_config_matches(params)) {
+        common_params_print_info(params, false);
+        return run_speech_server(params);
+    }
+#endif
 
     llama_backend_init();
     llama_numa_init(params.numa);
