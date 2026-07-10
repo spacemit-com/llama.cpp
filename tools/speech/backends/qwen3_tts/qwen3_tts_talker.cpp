@@ -9,14 +9,17 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -49,36 +52,158 @@ float dot_f16(const ggml_fp16_t * weight, const ggml_fp16_t * input) {
 
 class f16_gemv {
   public:
+    f16_gemv() {
+        int started = 0;
+        try {
+            for (; started < worker_count; ++started) {
+                workers_[started] = std::thread([this, started] { worker_loop(started); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+                ++generation_;
+            }
+            start_cv_.notify_all();
+            for (int id = 0; id < started; ++id) {
+                workers_[id].join();
+            }
+            throw;
+        }
+    }
+
+    ~f16_gemv() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+            ++generation_;
+        }
+        start_cv_.notify_all();
+        for (auto & worker : workers_) {
+            worker.join();
+        }
+    }
+
+    f16_gemv(const f16_gemv &) = delete;
+    f16_gemv & operator=(const f16_gemv &) = delete;
+
     int argmax(const ggml_fp16_t * weight, int rows, const float * input, float * best_value = nullptr) {
         prepare(input);
-        int best_index = 0;
-        float best = -std::numeric_limits<float>::infinity();
-        for (int row = 0; row < rows; ++row) {
-            const float value = dot_f16(weight + static_cast<size_t>(row) * hidden_size, input_f16_.data());
-            if (value > best) {
-                best = value;
-                best_index = row;
-            }
-        }
+        const result best = execute(weight, rows, nullptr);
         if (best_value != nullptr) {
-            *best_value = best;
+            *best_value = best.value;
         }
-        return best_index;
+        return best.index;
     }
 
     void multiply(const ggml_fp16_t * weight, int rows, const float * input, float * output) {
         prepare(input);
-        for (int row = 0; row < rows; ++row) {
-            output[row] = dot_f16(weight + static_cast<size_t>(row) * hidden_size, input_f16_.data());
-        }
+        execute(weight, rows, output);
     }
 
   private:
+    static constexpr int worker_count = 7;  // The caller runs the eighth K3 partition.
+
+    struct job {
+        const ggml_fp16_t * weight = nullptr;
+        float * output = nullptr;
+        int rows = 0;
+        int rows_per_part = 0;
+    };
+
+    struct result {
+        int index = 0;
+        float value = -std::numeric_limits<float>::infinity();
+    };
+
     void prepare(const float * input) {
         ggml_fp32_to_fp16_row(input, input_f16_.data(), hidden_size);
     }
 
+    result compute_part(const job & current, int part) const {
+        const int first = std::min(part * current.rows_per_part, current.rows);
+        const int last = std::min(first + current.rows_per_part, current.rows);
+        result best;
+        best.index = first;
+        for (int row = first; row < last; ++row) {
+            const float value = dot_f16(
+                current.weight + static_cast<size_t>(row) * hidden_size, input_f16_.data());
+            if (current.output != nullptr) {
+                current.output[row] = value;
+            } else if (value > best.value) {
+                best.value = value;
+                best.index = row;
+            }
+        }
+        return best;
+    }
+
+    result execute(const ggml_fp16_t * weight, int rows, float * output) {
+        job current;
+        current.weight = weight;
+        current.output = output;
+        current.rows = rows;
+        current.rows_per_part = (rows + worker_count) / (worker_count + 1);
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            job_ = current;
+            completed_ = 0;
+            ++generation_;
+        }
+        start_cv_.notify_all();
+
+        result best = compute_part(current, worker_count);
+        std::unique_lock<std::mutex> lock(mutex_);
+        done_cv_.wait(lock, [this] { return completed_ == worker_count; });
+        if (output == nullptr) {
+            for (const result & candidate : results_) {
+                if (candidate.value > best.value ||
+                    (candidate.value == best.value && candidate.index < best.index)) {
+                    best = candidate;
+                }
+            }
+        }
+        return best;
+    }
+
+    void worker_loop(int id) {
+        uint64_t observed_generation = 0;
+        for (;;) {
+            job current;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                start_cv_.wait(lock, [this, observed_generation] {
+                    return stopping_ || generation_ != observed_generation;
+                });
+                if (stopping_) {
+                    return;
+                }
+                observed_generation = generation_;
+                current = job_;
+            }
+
+            const result local = compute_part(current, id);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                results_[id] = local;
+                if (++completed_ == worker_count) {
+                    done_cv_.notify_one();
+                }
+            }
+        }
+    }
+
     std::array<ggml_fp16_t, hidden_size> input_f16_{};
+    std::array<std::thread, worker_count> workers_{};
+    std::array<result, worker_count> results_{};
+    std::mutex mutex_;
+    std::condition_variable start_cv_;
+    std::condition_variable done_cv_;
+    job job_;
+    uint64_t generation_ = 0;
+    int completed_ = 0;
+    bool stopping_ = false;
 };
 
 class batch_holder {
@@ -176,7 +301,7 @@ class talker_engine {
         }
 
         llama_context_params cp_params = llama_context_default_params();
-        cp_params.n_ctx = 64;
+        cp_params.n_ctx = code_groups;
         cp_params.n_batch = 16;
         cp_params.n_ubatch = 16;
         cp_params.n_threads = threads;
