@@ -1,5 +1,7 @@
 #include "models.h"
 
+#include <cstdlib>
+
 void llama_model_qwen3::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     switch (hparams.n_layer) {
@@ -146,11 +148,14 @@ llama_model_qwen3::graph::graph(const llama_model & model, const llm_graph_param
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    // lm_head
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    const bool embeddings_only = cparams.embeddings && std::getenv("LLAMA_QWEN3_EMBED_ONLY") != nullptr;
+    if (!embeddings_only) {
+        // lm_head
+        cur = build_lora_mm(model.output, cur, model.output_s);
 
-    cb(cur, "result_output", -1);
-    res->t_logits = cur;
+        cb(cur, "result_output", -1);
+        res->t_logits = cur;
+    }
 
     ggml_build_forward_expand(gf, cur);
 }

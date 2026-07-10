@@ -480,6 +480,7 @@ int main(int argc, char ** argv) {
         const int max_prefill = parse_positive(argv[5], "max prefill");
         const int max_frames = parse_positive(argv[6], "max frames");
         const int threads = parse_positive(argv[7], "thread count");
+        setenv("LLAMA_QWEN3_EMBED_ONLY", "1", 1);
         llama_log_set(log_errors, nullptr);
         llama_backend_init();
         backend_initialized = true;

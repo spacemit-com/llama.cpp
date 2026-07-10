@@ -439,6 +439,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
+            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) ||
+                          (std::is_same_v<BLOC_TYPE, block_q8_0> && INTER_SIZE == 32  && NB_COLS == 32)) {
+                if (gemm_m == 1 && a_row != quant_a_buffer) {
+                    spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
+                    constexpr int64_t tile_cols = std::is_same_v<BLOC_TYPE, block_q4_0> ? 4 * NB_COLS : 2 * NB_COLS;
+                    for (int64_t ni = (int64_t) ith * tile_cols; ni < gemm_n; ni += tile_cols * nth) {
+                        const int64_t nb_real = std::min(gemm_n - ni, tile_cols);
+                        uint8_t * b_row = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
+                        uint8_t * b_row_zp = block_type_has_zp<BLOC_TYPE>() ? b_row : nullptr;
+                        gemm_kernel(b_blk_len, a_row, b_row, b_row_zp, output + ni, 1, nb_real, b_k_blks, gemm_n);
+                    }
+                    return;
+                }
+            }
+
             // Pair-barrier lockstep: an even thread with no odd partner (odd nth) must not wait.
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
