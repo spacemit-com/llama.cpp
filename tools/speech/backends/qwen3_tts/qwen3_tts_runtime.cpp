@@ -12,14 +12,20 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <mutex>
+#include <queue>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -44,6 +50,10 @@ constexpr int code_vocab = 2048;
 constexpr int codec_bucket = 50;
 constexpr int codec_context = 25;
 constexpr int samples_per_frame = 1920;
+constexpr char k3_talker_cores[] = "10,11,12,13";
+constexpr char k3_codec_affinity[] = "14;15;8;9";
+
+using code_frame = std::array<int32_t, code_groups>;
 
 constexpr int text_tts_pad = 151671;
 constexpr int text_tts_bos = 151672;
@@ -161,6 +171,9 @@ runtime_config load_config(const std::string & config_dir) {
     }
     config.ep_config.try_emplace("SPACEMIT_EP_INTRA_THREAD_NUM", std::to_string(config.codec_threads));
     config.ep_config.try_emplace("SPACEMIT_EP_INTER_THREAD_NUM", "1");
+    if (config.codec_threads == 4) {
+        config.ep_config.try_emplace("SPACEMIT_EP_INTRA_THREAD_AFFINITY", k3_codec_affinity);
+    }
 
     for (const std::string * path : {&config.tokenizer_model, &config.text_embedding_model,
                                      &config.codec_decoder_model, &config.talker_model,
@@ -261,6 +274,11 @@ class talker_process {
             if (prctl(PR_SET_PDEATHSIG, SIGTERM) != 0 || getppid() != parent) {
                 _exit(125);
             }
+            const char * preferred_cores = std::getenv("SPACEMIT_PERFER_CORE_ID");
+            if ((preferred_cores == nullptr || preferred_cores[0] == '\0') &&
+                setenv("SPACEMIT_PERFER_CORE_ID", k3_talker_cores, 1) != 0) {
+                _exit(124);
+            }
             if (sockets[1] != 3) {
                 if (dup2(sockets[1], 3) < 0) {
                     _exit(126);
@@ -320,11 +338,13 @@ class talker_process {
         }
     }
 
-    std::vector<std::array<int32_t, code_groups>> generate(
+    template <typename FrameCallback>
+    void generate(
             const std::vector<float> & prefill,
             const std::vector<float> & trailing,
             const std::array<float, hidden_size> & pad,
-            uint32_t max_frames) {
+            uint32_t max_frames,
+            FrameCallback && on_frame) {
         const uint32_t n_prefill = static_cast<uint32_t>(prefill.size() / hidden_size);
         const uint32_t n_trailing = static_cast<uint32_t>(trailing.size() / hidden_size);
         std::vector<uint8_t> payload;
@@ -337,7 +357,7 @@ class talker_process {
         protocol::append_bytes(payload, pad.data(), pad.size() * sizeof(float));
         protocol::send(fd_, protocol::message_type::talker_job, payload);
 
-        std::vector<std::array<int32_t, code_groups>> frames;
+        uint32_t frame_count = 0;
         protocol::message message;
         while (protocol::receive(fd_, message)) {
             if (message.type == protocol::message_type::error) {
@@ -345,27 +365,28 @@ class talker_process {
             }
             if (message.type == protocol::message_type::talker_frame) {
                 protocol::reader reader(message.payload);
-                std::array<int32_t, code_groups> frame{};
+                code_frame frame{};
                 for (auto & code : frame) {
                     code = static_cast<int32_t>(reader.u32());
                 }
                 if (reader.remaining() != 0) {
                     throw std::runtime_error("invalid Qwen3-TTS code frame");
                 }
-                frames.push_back(frame);
+                on_frame(frame);
+                ++frame_count;
                 continue;
             }
             if (message.type == protocol::message_type::talker_done) {
                 protocol::reader reader(message.payload);
                 const uint32_t reported_frames = reader.u32();
                 const bool hit_limit = reader.u32() != 0;
-                if (reader.remaining() != 0 || reported_frames != frames.size()) {
+                if (reader.remaining() != 0 || reported_frames != frame_count) {
                     throw std::runtime_error("invalid Qwen3-TTS talker completion");
                 }
                 if (hit_limit) {
                     throw std::runtime_error("Qwen3-TTS generation reached the frame limit without EOS");
                 }
-                return frames;
+                return;
             }
             throw std::runtime_error("unexpected Qwen3-TTS talker response");
         }
@@ -714,7 +735,7 @@ struct runtime::impl {
     }
 
     std::vector<float> decode_codec_chunk(
-            const std::vector<std::array<int32_t, code_groups>> & codes,
+            const std::vector<code_frame> & codes,
             int context_frames) {
         if (codes.empty() || codes.size() > codec_bucket || context_frames < 0 ||
             context_frames > static_cast<int>(codes.size())) {
@@ -743,22 +764,94 @@ struct runtime::impl {
         return std::vector<float>(output + begin, output + end);
     }
 
-    std::vector<float> decode_codec(const std::vector<std::array<int32_t, code_groups>> & frames) {
-        std::vector<float> audio;
-        size_t completed = 0;
-        while (completed < frames.size()) {
-            const size_t new_frames = std::min<size_t>(codec_bucket, frames.size() - completed);
-            const size_t context = std::min({completed, static_cast<size_t>(codec_context),
-                                             static_cast<size_t>(codec_bucket) - new_frames});
-            std::vector<std::array<int32_t, code_groups>> chunk(
-                frames.begin() + static_cast<std::ptrdiff_t>(completed - context),
-                frames.begin() + static_cast<std::ptrdiff_t>(completed + new_frames));
-            auto decoded = decode_codec_chunk(chunk, static_cast<int>(context));
-            audio.insert(audio.end(), decoded.begin(), decoded.end());
-            completed += new_frames;
+    class codec_worker {
+      public:
+        explicit codec_worker(impl & owner) : owner_(owner), thread_([this] { run(); }) {}
+
+        codec_worker(const codec_worker &) = delete;
+        codec_worker & operator=(const codec_worker &) = delete;
+
+        ~codec_worker() {
+            close(false);
         }
-        return audio;
-    }
+
+        void submit(std::vector<code_frame> codes, int context_frames) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (error_) {
+                    return;
+                }
+                jobs_.push({std::move(codes), context_frames});
+            }
+            ready_.notify_one();
+        }
+
+        std::vector<float> finish() {
+            close(true);
+            if (error_) {
+                std::rethrow_exception(error_);
+            }
+            return std::move(audio_);
+        }
+
+      private:
+        struct job {
+            std::vector<code_frame> codes;
+            int context_frames;
+        };
+
+        void close(bool drain) noexcept {
+            if (!thread_.joinable()) {
+                return;
+            }
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stop_ = true;
+                if (!drain) {
+                    while (!jobs_.empty()) {
+                        jobs_.pop();
+                    }
+                }
+            }
+            ready_.notify_one();
+            thread_.join();
+        }
+
+        void run() noexcept {
+            try {
+                while (true) {
+                    job next;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        ready_.wait(lock, [this] { return stop_ || !jobs_.empty(); });
+                        if (jobs_.empty()) {
+                            return;
+                        }
+                        next = std::move(jobs_.front());
+                        jobs_.pop();
+                    }
+                    auto decoded = owner_.decode_codec_chunk(next.codes, next.context_frames);
+                    audio_.reserve(audio_.size() + decoded.size());
+                    audio_.insert(audio_.end(), decoded.begin(), decoded.end());
+                }
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_ = std::current_exception();
+                while (!jobs_.empty()) {
+                    jobs_.pop();
+                }
+            }
+        }
+
+        impl & owner_;
+        std::mutex mutex_;
+        std::condition_variable ready_;
+        std::queue<job> jobs_;
+        std::vector<float> audio_;
+        std::exception_ptr error_;
+        bool stop_ = false;
+        std::thread thread_;
+    };
 
     synthesis_result synthesize(const std::string & text) {
         const auto start = clock_type::now();
@@ -770,8 +863,29 @@ struct runtime::impl {
         const size_t pause_samples = static_cast<size_t>(config.sample_rate) * config.segment_pause_ms / 1000;
         for (size_t index = 0; index < segments.size(); ++index) {
             const frontend_input input = make_frontend(segments[index]);
-            const auto codes = talker->generate(input.prefill, input.trailing, input.pad, config.max_frames);
-            const auto audio = decode_codec(codes);
+            std::vector<code_frame> frames;
+            frames.reserve(static_cast<size_t>(config.max_frames));
+            size_t scheduled_frames = 0;
+            codec_worker decoder(*this);
+            talker->generate(input.prefill, input.trailing, input.pad, config.max_frames,
+                [&](const code_frame & frame) {
+                    frames.push_back(frame);
+                    if (frames.size() - scheduled_frames == codec_bucket) {
+                        std::vector<code_frame> chunk(
+                            frames.begin() + static_cast<std::ptrdiff_t>(scheduled_frames), frames.end());
+                        decoder.submit(std::move(chunk), 0);
+                        scheduled_frames = frames.size();
+                    }
+                });
+            if (scheduled_frames < frames.size()) {
+                const size_t new_frames = frames.size() - scheduled_frames;
+                const size_t context = std::min({scheduled_frames, static_cast<size_t>(codec_context),
+                                                 static_cast<size_t>(codec_bucket) - new_frames});
+                std::vector<code_frame> chunk(
+                    frames.begin() + static_cast<std::ptrdiff_t>(scheduled_frames - context), frames.end());
+                decoder.submit(std::move(chunk), static_cast<int>(context));
+            }
+            std::vector<float> audio = decoder.finish();
             if (audio.empty()) {
                 throw std::runtime_error("Qwen3-TTS codec produced empty audio");
             }
