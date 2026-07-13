@@ -201,13 +201,17 @@ llama_context::llama_context(
     }
 
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+    const char * ctx_pad_env = getenv("LLAMA_CTX_PAD");
+    const int requested_ctx_pad = ctx_pad_env ? atoi(ctx_pad_env) : 0;
+    const uint32_t ctx_pad = requested_ctx_pad > 0 && (requested_ctx_pad & (requested_ctx_pad - 1)) == 0 ?
+        static_cast<uint32_t>(requested_ctx_pad) : 256;
+    cparams.n_ctx = GGML_PAD(cparams.n_ctx, ctx_pad);
 
     if (cparams.kv_unified) {
         cparams.n_ctx_seq = cparams.n_ctx;
     } else {
         cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
+        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, ctx_pad);
 
         if (cparams.n_ctx_seq == 0) {
             throw std::runtime_error("n_ctx_seq == 0");

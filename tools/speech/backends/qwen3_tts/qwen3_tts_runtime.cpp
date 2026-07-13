@@ -493,12 +493,15 @@ std::vector<std::string> split_by_length(const std::string & text, size_t maximu
     std::vector<std::string> result;
     std::string current;
     size_t characters = 0;
+    const size_t total = utf8_length(text);
+    const size_t chunks = (total + maximum_chars - 1) / maximum_chars;
+    const size_t target = chunks > 0 ? (total + chunks - 1) / chunks : maximum_chars;
     for (size_t i = 0; i < text.size();) {
         const size_t size = std::min(utf8_char_size(static_cast<unsigned char>(text[i])), text.size() - i);
         current.append(text, i, size);
         i += size;
         ++characters;
-        if (characters >= maximum_chars) {
+        if (characters >= target) {
             std::string segment = trim(current);
             if (!segment.empty()) result.push_back(std::move(segment));
             current.clear();
@@ -513,23 +516,32 @@ std::vector<std::string> split_by_length(const std::string & text, size_t maximu
 std::string ensure_sentence_end(std::string segment) {
     segment = trim(std::move(segment));
     if (segment.empty()) return segment;
+    const std::string mark = contains_cjk(segment) ? "\xE3\x80\x82" : ".";
+    const std::vector<std::string> weak = {
+        "\xEF\xBC\x8C", ",", "\xE3\x80\x81", "\xEF\xBC\x9A", ":"};
+    for (const auto & ending : weak) {
+        if (ends_with(segment, ending)) {
+            segment.replace(segment.size() - ending.size(), ending.size(), mark);
+            return segment;
+        }
+    }
     const std::vector<std::string> endings = {
         "\xE3\x80\x82", ".", "\xEF\xBC\x81", "\xEF\xBC\x9F", "!", "?", "\xEF\xBC\x9B", ";"};
     for (const auto & ending : endings) {
         if (ends_with(segment, ending)) return segment;
     }
-    segment += contains_cjk(segment) ? "\xE3\x80\x82" : ".";
+    segment += mark;
     return segment;
 }
 
 std::vector<std::string> split_text(const std::string & text) {
-    const size_t maximum_chars = contains_cjk(text) ? 48 : 96;
     const std::vector<std::string> strong = {
         "\xE3\x80\x82", ".", "\xEF\xBC\x81", "\xEF\xBC\x9F", "!", "?", "\xEF\xBC\x9B", ";"};
     const std::vector<std::string> weak = {
         "\xEF\xBC\x8C", ",", "\xE3\x80\x81", "\xEF\xBC\x9A", ":"};
     std::vector<std::string> result;
     for (const auto & sentence : split_on_punctuation(text, strong, 1)) {
+        const size_t maximum_chars = contains_cjk(sentence) ? 48 : 96;
         if (utf8_length(sentence) <= maximum_chars) {
             result.push_back(ensure_sentence_end(sentence));
             continue;
@@ -537,10 +549,11 @@ std::vector<std::string> split_text(const std::string & text) {
         auto parts = split_on_punctuation(sentence, weak, 24);
         if (parts.size() <= 1) parts = split_by_length(sentence, maximum_chars);
         for (const auto & part : parts) {
-            if (utf8_length(part) <= maximum_chars) {
+            const size_t part_maximum_chars = contains_cjk(part) ? 48 : 96;
+            if (utf8_length(part) <= part_maximum_chars) {
                 result.push_back(ensure_sentence_end(part));
             } else {
-                for (const auto & item : split_by_length(part, maximum_chars)) {
+                for (const auto & item : split_by_length(part, part_maximum_chars)) {
                     result.push_back(ensure_sentence_end(item));
                 }
             }
@@ -859,14 +872,16 @@ struct runtime::impl {
         if (segments.empty()) {
             throw std::invalid_argument("Qwen3-TTS input is empty after segmentation");
         }
-        std::vector<int16_t> pcm;
+        std::vector<size_t> segment_samples;
+        segment_samples.reserve(segments.size());
+        size_t expected_samples = 0;
+        codec_worker decoder(*this);
         const size_t pause_samples = static_cast<size_t>(config.sample_rate) * config.segment_pause_ms / 1000;
         for (size_t index = 0; index < segments.size(); ++index) {
             const frontend_input input = make_frontend(segments[index]);
             std::vector<code_frame> frames;
             frames.reserve(static_cast<size_t>(config.max_frames));
             size_t scheduled_frames = 0;
-            codec_worker decoder(*this);
             talker->generate(input.prefill, input.trailing, input.pad, config.max_frames,
                 [&](const code_frame & frame) {
                     frames.push_back(frame);
@@ -885,14 +900,20 @@ struct runtime::impl {
                     frames.begin() + static_cast<std::ptrdiff_t>(scheduled_frames - context), frames.end());
                 decoder.submit(std::move(chunk), static_cast<int>(context));
             }
-            std::vector<float> audio = decoder.finish();
-            if (audio.empty()) {
-                throw std::runtime_error("Qwen3-TTS codec produced empty audio");
-            }
-            if (index > 0) pcm.insert(pcm.end(), pause_samples, 0);
-            pcm.reserve(pcm.size() + audio.size());
-            for (float sample : audio) {
-                const float clipped = std::clamp(sample, -1.0f, 1.0f);
+            segment_samples.push_back(frames.size() * samples_per_frame);
+            expected_samples += segment_samples.back();
+        }
+        std::vector<float> audio = decoder.finish();
+        if (audio.size() != expected_samples) {
+            throw std::runtime_error("unexpected Qwen3-TTS codec output length");
+        }
+        std::vector<int16_t> pcm;
+        pcm.reserve(audio.size() + pause_samples * (segments.size() - 1));
+        size_t offset = 0;
+        for (size_t count : segment_samples) {
+            if (offset > 0) pcm.insert(pcm.end(), pause_samples, 0);
+            for (size_t end = offset + count; offset < end; ++offset) {
+                const float clipped = std::clamp(audio[offset], -1.0f, 1.0f);
                 pcm.push_back(static_cast<int16_t>(std::lrint(clipped * 32767.0f)));
             }
         }

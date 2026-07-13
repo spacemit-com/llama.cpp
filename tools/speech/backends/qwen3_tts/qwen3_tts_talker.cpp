@@ -5,8 +5,13 @@
 #include "llama.h"
 #include "vec.h"
 
+#if defined(__riscv_vector) && defined(__riscv_zvfh)
+#include <riscv_vector.h>
+#endif
+
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <csignal>
@@ -17,6 +22,8 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <pthread.h>
+#include <sched.h>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -43,11 +50,27 @@ void log_errors(ggml_log_level level, const char * text, void *) {
 }
 
 float dot_f16(const ggml_fp16_t * weight, const ggml_fp16_t * input) {
+#if defined(__riscv_vector) && defined(__riscv_zvfh)
+    const size_t vl = __riscv_vsetvl_e16m4(128);
+    vfloat32m8_t accumulator = __riscv_vfmv_v_f_f32m8(0.0f, vl);
+    for (int offset = 0; offset < hidden_size; offset += static_cast<int>(vl)) {
+        accumulator = __riscv_vfwmacc_vv_f32m8(
+            accumulator,
+            __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16 *>(weight + offset), vl),
+            __riscv_vle16_v_f16m4(reinterpret_cast<const _Float16 *>(input + offset), vl),
+            vl);
+    }
+    const size_t vl32 = __riscv_vsetvl_e32m8(vl);
+    const vfloat32m1_t reduced = __riscv_vfredusum_vs_f32m8_f32m1(
+        accumulator, __riscv_vfmv_v_f_f32m1(0.0f, 1), vl32);
+    return __riscv_vfmv_f_s_f32m1_f32(reduced);
+#else
     float sum = 0.0f;
     ggml_vec_dot_f16(hidden_size, &sum, 0,
                      const_cast<ggml_fp16_t *>(weight), 0,
                      const_cast<ggml_fp16_t *>(input), 0, 1);
     return sum;
+#endif
 }
 
 class f16_gemv {
@@ -59,11 +82,7 @@ class f16_gemv {
                 workers_[started] = std::thread([this, started] { worker_loop(started); });
             }
         } catch (...) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping_ = true;
-                ++generation_;
-            }
+            stopping_.store(true, std::memory_order_release);
             start_cv_.notify_all();
             for (int id = 0; id < started; ++id) {
                 workers_[id].join();
@@ -73,11 +92,7 @@ class f16_gemv {
     }
 
     ~f16_gemv() {
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            stopping_ = true;
-            ++generation_;
-        }
+        stopping_.store(true, std::memory_order_release);
         start_cv_.notify_all();
         for (auto & worker : workers_) {
             worker.join();
@@ -86,6 +101,15 @@ class f16_gemv {
 
     f16_gemv(const f16_gemv &) = delete;
     f16_gemv & operator=(const f16_gemv &) = delete;
+
+    void begin() {
+        active_.store(true, std::memory_order_release);
+        start_cv_.notify_all();
+    }
+
+    void end() {
+        active_.store(false, std::memory_order_release);
+    }
 
     int argmax(const ggml_fp16_t * weight, int rows, const float * input) {
         prepare(input);
@@ -98,7 +122,7 @@ class f16_gemv {
     }
 
   private:
-    static constexpr int worker_count = 7;  // The caller runs the eighth K3 partition.
+    static constexpr int worker_count = 4;
 
     struct job {
         const ggml_fp16_t * weight = nullptr;
@@ -113,7 +137,17 @@ class f16_gemv {
     };
 
     void prepare(const float * input) {
+#if defined(__riscv_vector) && defined(__riscv_zvfh)
+        for (int offset = 0; offset < hidden_size;) {
+            const size_t vl = __riscv_vsetvl_e32m4(hidden_size - offset);
+            const vfloat16m2_t narrowed = __riscv_vfncvt_f_f_w_f16m2(
+                __riscv_vle32_v_f32m4(input + offset, vl), vl);
+            __riscv_vse16_v_f16m2(reinterpret_cast<_Float16 *>(input_f16_.data() + offset), narrowed, vl);
+            offset += static_cast<int>(vl);
+        }
+#else
         ggml_fp32_to_fp16_row(input, input_f16_.data(), hidden_size);
+#endif
     }
 
     result compute_part(const job & current, int part) const {
@@ -122,6 +156,7 @@ class f16_gemv {
         result best;
         best.index = first;
         for (int row = first; row < last; ++row) {
+            __builtin_prefetch(current.weight + static_cast<size_t>(row + 1) * hidden_size);
             const float value = dot_f16(
                 current.weight + static_cast<size_t>(row) * hidden_size, input_f16_.data());
             if (current.output != nullptr) {
@@ -139,19 +174,21 @@ class f16_gemv {
         current.weight = weight;
         current.output = output;
         current.rows = rows;
-        current.rows_per_part = (rows + worker_count) / (worker_count + 1);
+        current.rows_per_part = (rows + worker_count - 1) / worker_count;
 
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            job_ = current;
-            completed_ = 0;
-            ++generation_;
+        job_ = current;
+        const uint64_t generation = generation_.fetch_add(1, std::memory_order_release) + 1;
+
+        for (int id = 0; id < worker_count; ++id) {
+            while (completed_[id].load(std::memory_order_acquire) != generation) {
+#if defined(__riscv_zihintpause)
+                __asm__ volatile("pause");
+#else
+                std::this_thread::yield();
+#endif
+            }
         }
-        start_cv_.notify_all();
-
-        result best = compute_part(current, worker_count);
-        std::unique_lock<std::mutex> lock(mutex_);
-        done_cv_.wait(lock, [this] { return completed_ == worker_count; });
+        result best;
         if (output == nullptr) {
             for (const result & candidate : results_) {
                 if (candidate.value > best.value ||
@@ -164,28 +201,41 @@ class f16_gemv {
     }
 
     void worker_loop(int id) {
+#if defined(__linux__)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+        CPU_SET(2 + id, &cpuset);
+        (void) pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+#endif
         uint64_t observed_generation = 0;
         for (;;) {
-            job current;
             {
-                std::unique_lock<std::mutex> lock(mutex_);
-                start_cv_.wait(lock, [this, observed_generation] {
-                    return stopping_ || generation_ != observed_generation;
+                std::unique_lock<std::mutex> lock(start_mutex_);
+                start_cv_.wait(lock, [this] {
+                    return stopping_.load(std::memory_order_acquire) ||
+                           active_.load(std::memory_order_acquire);
                 });
-                if (stopping_) {
+            }
+            if (stopping_.load(std::memory_order_acquire)) {
+                return;
+            }
+            while (active_.load(std::memory_order_acquire)) {
+                if (stopping_.load(std::memory_order_acquire)) {
                     return;
                 }
-                observed_generation = generation_;
-                current = job_;
-            }
-
-            const result local = compute_part(current, id);
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                results_[id] = local;
-                if (++completed_ == worker_count) {
-                    done_cv_.notify_one();
+                const uint64_t generation = generation_.load(std::memory_order_acquire);
+                if (generation == observed_generation) {
+#if defined(__riscv_zihintpause)
+                    __asm__ volatile("pause");
+#else
+                    std::this_thread::yield();
+#endif
+                    continue;
                 }
+                const job current = job_;
+                results_[id] = compute_part(current, id);
+                completed_[id].store(generation, std::memory_order_release);
+                observed_generation = generation;
             }
         }
     }
@@ -193,13 +243,13 @@ class f16_gemv {
     std::array<ggml_fp16_t, hidden_size> input_f16_{};
     std::array<std::thread, worker_count> workers_{};
     std::array<result, worker_count> results_{};
-    std::mutex mutex_;
+    std::array<std::atomic<uint64_t>, worker_count> completed_{};
+    std::mutex start_mutex_;
     std::condition_variable start_cv_;
-    std::condition_variable done_cv_;
     job job_;
-    uint64_t generation_ = 0;
-    int completed_ = 0;
-    bool stopping_ = false;
+    std::atomic<uint64_t> generation_{0};
+    std::atomic<bool> active_{false};
+    std::atomic<bool> stopping_{false};
 };
 
 class batch_holder {
@@ -333,6 +383,11 @@ class talker_engine {
         bool ended_by_eos = false;
         uint32_t frame_count = 0;
         const auto start = clock_type::now();
+        gemv_.begin();
+        struct gemv_guard {
+            f16_gemv & gemv;
+            ~gemv_guard() { gemv.end(); }
+        } guard{gemv_};
 
         for (uint32_t frame = 0; frame < job.max_frames; ++frame) {
             const float * hidden = llama_get_embeddings_ith(talker_context_.get(), talker_batch.n_tokens - 1);
@@ -427,7 +482,7 @@ class talker_engine {
                 throw std::runtime_error("Qwen3-TTS talker step failed");
             }
         }
-
+        gemv_.end();
         std::vector<uint8_t> done;
         qwen3_tts::protocol::append_u32(done, frame_count);
         qwen3_tts::protocol::append_u32(done, ended_by_eos ? 0U : 1U);
@@ -480,6 +535,7 @@ int main(int argc, char ** argv) {
         const int max_prefill = parse_positive(argv[5], "max prefill");
         const int max_frames = parse_positive(argv[6], "max frames");
         const int threads = parse_positive(argv[7], "thread count");
+        setenv("LLAMA_CTX_PAD", "16", 0);
         setenv("LLAMA_QWEN3_EMBED_ONLY", "1", 1);
         llama_log_set(log_errors, nullptr);
         llama_backend_init();

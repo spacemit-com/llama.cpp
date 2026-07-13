@@ -52,6 +52,12 @@ target_include_directories(llama-qwen3-tts-talker PRIVATE
 )
 target_link_libraries(llama-qwen3-tts-talker PRIVATE llama ggml-cpu ggml-base Threads::Threads)
 target_compile_features(llama-qwen3-tts-talker PRIVATE cxx_std_17)
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND GGML_CPU_RISCV64_SPACEMIT)
+    target_compile_options(llama-qwen3-tts-talker PRIVATE
+        $<$<CXX_COMPILER_ID:GNU>:-march=rv64gcv_zfh_zvfh_zba_zicbop_zihintpause>
+        $<$<CXX_COMPILER_ID:GNU>:-mabi=lp64d>
+    )
+endif()
 
 if (TARGET llama-server)
     add_dependencies(llama-server llama-qwen3-tts-runner llama-qwen3-tts-talker)
