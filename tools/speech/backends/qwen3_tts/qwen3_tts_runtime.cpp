@@ -539,15 +539,27 @@ std::vector<std::string> split_text(const std::string & text) {
         "\xE3\x80\x82", ".", "\xEF\xBC\x81", "\xEF\xBC\x9F", "!", "?", "\xEF\xBC\x9B", ";"};
     const std::vector<std::string> weak = {
         "\xEF\xBC\x8C", ",", "\xE3\x80\x81", "\xEF\xBC\x9A", ":"};
+    constexpr size_t weak_split_minimum_chars = 12;
     std::vector<std::string> result;
     for (const auto & sentence : split_on_punctuation(text, strong, 1)) {
-        const size_t maximum_chars = contains_cjk(sentence) ? 48 : 96;
-        if (utf8_length(sentence) <= maximum_chars) {
-            result.push_back(ensure_sentence_end(sentence));
-            continue;
+        const bool has_cjk = contains_cjk(sentence);
+        const size_t sentence_chars = utf8_length(sentence);
+        const size_t maximum_chars = has_cjk ? 48 : 96;
+        std::vector<std::string> parts;
+        if (sentence_chars <= maximum_chars) {
+            if (has_cjk && sentence_chars > 28) {
+                auto candidates = split_on_punctuation(sentence, weak, weak_split_minimum_chars);
+                const bool safe = candidates.size() > 1 &&
+                    std::all_of(candidates.begin(), candidates.end(), [](const std::string & part) {
+                        return utf8_length(part) >= weak_split_minimum_chars;
+                    });
+                if (safe) parts = std::move(candidates);
+            }
+            if (parts.empty()) parts.push_back(sentence);
+        } else {
+            parts = split_on_punctuation(sentence, weak, 24);
+            if (parts.size() <= 1) parts = split_by_length(sentence, maximum_chars);
         }
-        auto parts = split_on_punctuation(sentence, weak, 24);
-        if (parts.size() <= 1) parts = split_by_length(sentence, maximum_chars);
         for (const auto & part : parts) {
             const size_t part_maximum_chars = contains_cjk(part) ? 48 : 96;
             if (utf8_length(part) <= part_maximum_chars) {

@@ -23,7 +23,10 @@ add_library(qwen3-tts-runtime STATIC
     qwen3_tts_gguf.h
     qwen3_tts_protocol.h
 )
-target_include_directories(qwen3-tts-runtime PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_include_directories(qwen3-tts-runtime PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_SOURCE_DIR}/vendor
+)
 target_include_directories(qwen3-tts-runtime SYSTEM PRIVATE
     ${QWEN3_TTS_ORT_INCLUDE_DIR}
 )
