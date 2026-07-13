@@ -1356,13 +1356,16 @@ server_smt_image_chunk server_smt_vision_encode_image_bin(server_smt_vision_cont
         out.t_encode_ms  = (ggml_time_us() - t0) / 1e3;
     }
 
-    if (ctx->hidden_size <= 0 || out.embd.empty() || out.embd.size() % (size_t) ctx->hidden_size != 0) {
+    const int32_t embd_width = ctx->hidden_size;
+    if (embd_width <= 0 || out.embd.empty() || out.embd.size() % (size_t) embd_width != 0) {
         throw std::runtime_error("Invalid SMT embedding shape");
     }
 
-    const int32_t n_image_tokens = (int32_t) (out.embd.size() / (size_t) ctx->hidden_size);
+    const int32_t n_image_tokens = (int32_t) (out.embd.size() / (size_t) embd_width);
     auto          grid           = infer_image_grid_xy(n_image_tokens);
 
+    out.n_embd_tokens       = n_image_tokens;
+    out.embd_width          = embd_width;
     const int32_t n_pos_img = ctx->use_mrope_pos ? std::max(grid.first, grid.second) : n_image_tokens;
     out.n_tokens            = (int32_t) ctx->tok_img_beg.size() + n_image_tokens + (int32_t) ctx->tok_img_end.size();
     out.n_pos               = (int32_t) ctx->tok_img_beg.size() + n_pos_img + (int32_t) ctx->tok_img_end.size();
@@ -1405,11 +1408,13 @@ server_smt_image_chunk server_smt_vision_encode_media_bin(server_smt_vision_cont
         }
 
         const int32_t n_audio_tokens = (int32_t) (out.embd.size() / (size_t) ctx->hidden_size);
-        out.n_tokens = (int32_t) ctx->tok_audio_beg.size() + n_audio_tokens + (int32_t) ctx->tok_audio_end.size();
-        out.n_pos    = out.n_tokens;
-        out.grid_nx  = n_audio_tokens;
-        out.grid_ny  = 1;
-        out.id       = std::string("audio:") + fnv_hash(data.data(), data.size());
+        out.n_embd_tokens = n_audio_tokens;
+        out.embd_width    = ctx->hidden_size;
+        out.n_tokens      = (int32_t) ctx->tok_audio_beg.size() + n_audio_tokens + (int32_t) ctx->tok_audio_end.size();
+        out.n_pos         = out.n_tokens;
+        out.grid_nx       = n_audio_tokens;
+        out.grid_ny       = 1;
+        out.id            = std::string("audio:") + fnv_hash(data.data(), data.size());
         return out;
     }
 #endif
@@ -1428,8 +1433,12 @@ int32_t server_smt_vision_decode_chunk(llama_context *                   lctx,
         return -1;
     }
 
-    const int32_t n_embd_tokens = (int32_t) (chunk.embd.size() / (size_t) ctx->hidden_size);
+    const int32_t n_embd_tokens = chunk.n_embd_tokens;
     if (n_embd_tokens <= 0) {
+        return -1;
+    }
+    const int32_t n_chunk_embd = chunk.embd_width;
+    if (n_chunk_embd <= 0 || chunk.embd.size() != (size_t) n_embd_tokens * (size_t) n_chunk_embd) {
         return -1;
     }
 
@@ -1453,8 +1462,16 @@ int32_t server_smt_vision_decode_chunk(llama_context *                   lctx,
         }
     }
 
-    const bool logits_on_embd = logits_last && tok_end->empty();
-    if (decode_embd(lctx, chunk.embd.data(), n_embd_tokens, ctx->hidden_size, n_past, seq_id, n_batch, logits_on_embd,
+    const bool          logits_on_embd   = logits_last && tok_end->empty();
+    const llama_model * model            = llama_get_model(lctx);
+    const int32_t       n_model_embd_inp = model ? llama_model_n_embd_inp(model) : ctx->hidden_size;
+    if (chunk.type == server_smt_media_type::image && n_model_embd_inp > 0 && n_chunk_embd != n_model_embd_inp) {
+        LOG_ERR("[server-smt] image embedding width mismatch: chunk width=%d, model input width=%d; "
+                "Qwen3-VL requires a deepstack ONNX that returns the full input width\n",
+                n_chunk_embd, n_model_embd_inp);
+        return -1;
+    }
+    if (decode_embd(lctx, chunk.embd.data(), n_embd_tokens, n_chunk_embd, n_past, seq_id, n_batch, logits_on_embd,
                     use_mrope_pos, grid_nx, grid_ny) != 0) {
         return -1;
     }

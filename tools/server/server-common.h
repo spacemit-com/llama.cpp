@@ -391,3 +391,9 @@ server_tokens format_prompt_rerank(
         mtmd_context * mctx,
         const std::string & query,
         const std::string & doc);
+
+std::string format_prompt_qwen3vl_reranker(
+        const std::string & query,
+        const std::string & doc,
+        size_t n_query_media = 0,
+        size_t n_doc_media = 0);

@@ -696,7 +696,8 @@ static std::string normalize_path(const std::string & base_dir, const std::strin
 
 static std::string canonicalize_vision_architecture(std::string arch) {
     const std::string trimmed = trim_ascii(arch);
-    if (trimmed == "Qwen3_5ForConditionalGeneration") {
+    if (trimmed == "Qwen3_5ForConditionalGeneration" ||
+        trimmed == "Qwen3VLForConditionalGeneration") {
         return "Qwen3VL";
     }
     return trimmed;
