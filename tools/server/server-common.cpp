@@ -230,6 +230,27 @@ static inline raw_buffer base64_decode(const std::string & encoded_string) {
     return ret;
 }
 
+static inline raw_buffer base64_decode_multimodal_data(const std::string & data) {
+    if (data.rfind("data:", 0) != 0) {
+        return base64_decode(data);
+    }
+
+    const size_t comma = data.find(',');
+    if (comma == std::string::npos) {
+        throw std::runtime_error("Invalid multimodal data URL");
+    }
+
+    std::string header = data.substr(0, comma);
+    std::transform(header.begin(), header.end(), header.begin(), [](unsigned char c) {
+        return (char) std::tolower(c);
+    });
+    if (header.find(";base64") == std::string::npos) {
+        throw std::runtime_error("Multimodal data URL must be base64 encoded");
+    }
+
+    return base64_decode(data.substr(comma + 1));
+}
+
 //
 // server_tokens implementation
 //
@@ -1240,21 +1261,31 @@ server_tokens process_smt_prompt(server_smt_vision_context * smt_ctx,
 
     server_tokens out(llama_tokens{}, true);
 
+    if (add_special && llama_vocab_get_add_bos(vocab)) {
+        out.push_back(llama_vocab_bos(vocab));
+    }
+
     size_t media_idx        = 0;
-    bool   add_special_once = add_special;
     for (const auto & part : parts) {
         if (part == k_media_marker) {
             auto chunk = server_smt_vision_encode_media_bin(smt_ctx, files[media_idx++]);
             out.push_back(chunk);
-            add_special_once = false;
             continue;
         }
 
-        auto toks = common_tokenize(vocab, part, add_special_once, parse_special);
+        auto toks = common_tokenize(vocab, part, /* add_special */ false, parse_special);
         for (auto tok : toks) {
             out.push_back(tok);
         }
-        add_special_once = false;
+    }
+
+    if (add_special && llama_vocab_get_add_eos(vocab)) {
+        out.push_back(llama_vocab_eos(vocab));
+    }
+
+    if (const char * debug_tokens = getenv("LLAMA_SMT_DEBUG_TOKENS");
+        debug_tokens != nullptr && debug_tokens[0] != '\0') {
+        LOG_INF("process_smt_prompt: %s\n", out.str().c_str());
     }
 
     return out;
@@ -1296,7 +1327,7 @@ static server_tokens tokenize_input_subprompt(const llama_vocab *         vocab,
             // JSON object with prompt and multimodal key.
             std::vector<raw_buffer> files;
             for (const auto & entry : json_prompt.at(JSON_MTMD_DATA_KEY)) {
-                files.push_back(base64_decode(entry));
+                files.push_back(base64_decode_multimodal_data(entry));
             }
             if (server_smt_vision_supports_prompt_embeddings(smt_ctx)) {
                 return process_smt_prompt(smt_ctx, vocab, json_prompt.at(JSON_STRING_PROMPT_KEY), files, add_special,
@@ -2679,9 +2710,14 @@ server_tokens format_prompt_rerank(const struct llama_model * model,
                                    const std::string &        doc) {
     server_tokens result = {};
 
-    const char * rerank_prompt = llama_model_chat_template(model, "rerank");
+    const char * reranker_prompt = llama_model_chat_template(model, "reranker");
+    const char * rerank_prompt   = llama_model_chat_template(model, "rerank");
 
-    if (rerank_prompt != nullptr) {
+    if (reranker_prompt != nullptr) {
+        server_tokens tokens = tokenize_input_subprompt(vocab, mctx, nullptr,
+                                                       format_prompt_qwen3vl_reranker(query, doc), false, true);
+        result.push_back(tokens);
+    } else if (rerank_prompt != nullptr) {
         std::string prompt = rerank_prompt;
         string_replace_all(prompt, "{query}", query);
         string_replace_all(prompt, "{document}", doc);
@@ -2713,4 +2749,46 @@ server_tokens format_prompt_rerank(const struct llama_model * model,
     }
 
     return result;
+}
+
+static void append_media_markers(std::string & prompt, size_t n_media) {
+    for (size_t i = 0; i < n_media; ++i) {
+        prompt += "<__media__>";
+    }
+}
+
+static size_t count_media_markers(const std::string & text, const std::string & marker) {
+    size_t count = 0;
+    size_t pos   = 0;
+    while ((pos = text.find(marker, pos)) != std::string::npos) {
+        ++count;
+        pos += marker.size();
+    }
+    return count;
+}
+
+static size_t media_markers_to_insert(const std::string & text, size_t n_media) {
+    const size_t existing = count_media_markers(text, "<__media__>") + count_media_markers(text, "<__image__>");
+    return existing >= n_media ? 0 : n_media - existing;
+}
+
+std::string format_prompt_qwen3vl_reranker(const std::string & query,
+                                           const std::string & doc,
+                                           size_t              n_query_media,
+                                           size_t              n_doc_media) {
+    std::string prompt =
+        "<|im_start|>system\n"
+        "Judge whether the Document meets the requirements based on the Query and the Instruct provided. "
+        "Note that the answer can only be \"yes\" or \"no\".<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<Instruct>: Given a search query, retrieve relevant candidates that answer the query."
+        "<Query>:";
+    append_media_markers(prompt, media_markers_to_insert(query, n_query_media));
+    prompt += query;
+    prompt += "\n<Document>:";
+    append_media_markers(prompt, media_markers_to_insert(doc, n_doc_media));
+    prompt += doc;
+    prompt += "<|im_end|>\n"
+              "<|im_start|>assistant\n";
+    return prompt;
 }

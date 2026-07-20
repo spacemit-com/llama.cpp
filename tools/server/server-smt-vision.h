@@ -17,12 +17,15 @@ struct server_smt_image_chunk {
     server_smt_media_type type = server_smt_media_type::image;
     std::vector<float> embd;
 
+    int32_t n_embd_tokens = 0;
+    int32_t embd_width = 0;
     int32_t n_tokens = 0;
     int32_t n_pos = 0;
     int32_t grid_nx = 0;
     int32_t grid_ny = 0;
 
     double t_encode_ms = 0.0; // encoder wall-clock time in ms
+    double t_image_decode_ms = 0.0; // image embedding decode wall-clock time in ms
 };
 
 struct server_smt_vision_context;
