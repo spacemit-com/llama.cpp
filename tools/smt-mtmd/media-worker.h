@@ -58,6 +58,11 @@ class media_worker {
                                   << "' end on thread " << tid_str << "\n";
                         promise->set_value(std::move(result));
                     }
+                } catch (const std::invalid_argument & e) {
+                    const std::string message = "media backend '" + name_ + "' worker rejected " +
+                                                stage_name + " on thread " + tid_str + ": " + e.what();
+                    std::cerr << "[media-worker] " << message << "\n";
+                    promise->set_exception(std::make_exception_ptr(std::invalid_argument(message)));
                 } catch (const std::exception & e) {
                     const std::string message = "media backend '" + name_ + "' worker failed during " +
                                                 stage_name + " on thread " + tid_str + ": " + e.what();

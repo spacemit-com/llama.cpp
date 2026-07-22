@@ -13,6 +13,17 @@
 
 class media_worker;
 
+#if defined(LLAMA_SERVER_SMT_MTMD)
+struct server_media_tts_result {
+    std::vector<uint8_t> wav;
+    std::string backend;
+    uint32_t segments = 0;
+    uint32_t sample_rate = 0;
+    uint64_t samples = 0;
+    double wall_seconds = 0.0;
+};
+#endif
+
 enum class server_media_backend {
     none,
     mtmd,
@@ -33,6 +44,11 @@ struct server_media_context {
             const mtmd_context_params & mtmd_params,
             std::unique_ptr<media_worker> worker = nullptr);
 
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    static bool tts_config_matches(const common_params & params);
+    static std::unique_ptr<server_media_context> init_tts(const common_params & params);
+#endif
+
     server_media_backend backend() const;
     const char * backend_name() const;
 
@@ -42,6 +58,12 @@ struct server_media_context {
     bool supports_vision() const;
     bool supports_audio() const;
     bool supports_video() const;
+
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    const char * tts_backend_name() const;
+
+    server_media_tts_result synthesize(const std::string & text) const;
+#endif
 
     server_tokens process_prompt(
             const std::string & prompt,

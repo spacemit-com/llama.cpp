@@ -44,6 +44,12 @@ add_library(${TARGET}
     server-models.cpp
     server-models.h
 )
+if (LLAMA_SERVER_SMT_MTMD)
+    target_sources(${TARGET} PRIVATE
+        server-tts.cpp
+        server-tts.h
+    )
+endif()
 set_target_properties(${TARGET} PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
 
 target_include_directories(${TARGET} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})

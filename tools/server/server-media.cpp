@@ -13,6 +13,7 @@
 
 #if defined(LLAMA_SERVER_SMT_MTMD)
 #    include "smt-audio-wrapper.h"
+#    include "smt-tts-wrapper.h"
 #    include "smt-vision-preprocess.h"
 #    include "smt-vision-wrapper.h"
 
@@ -80,6 +81,7 @@ struct server_media_context::impl {
 #if defined(LLAMA_SERVER_SMT_MTMD)
     std::unique_ptr<smt_vision_context> smt_vision;
     std::unique_ptr<smt_audio_context> smt_audio;
+    std::unique_ptr<smt_tts_context> smt_tts;
 
     int32_t hidden_size = 0;
     bool use_mrope_pos = false;
@@ -114,7 +116,15 @@ mtmd_context * server_media_context::mtmd() const {
 }
 
 bool server_media_context::supports_prompt_embeddings() const {
-    return pimpl->mode == server_media_backend::mtmd || pimpl->mode == server_media_backend::smt;
+    if (pimpl->mode == server_media_backend::mtmd) {
+        return true;
+    }
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    if (pimpl->mode == server_media_backend::smt) {
+        return pimpl->smt_vision != nullptr || pimpl->smt_audio != nullptr;
+    }
+#endif
+    return false;
 }
 
 bool server_media_context::supports_vision() const {
@@ -146,6 +156,30 @@ bool server_media_context::supports_video() const {
 }
 
 #if defined(LLAMA_SERVER_SMT_MTMD)
+const char * server_media_context::tts_backend_name() const {
+    if (pimpl->smt_tts) {
+        return pimpl->smt_tts->backend_name();
+    }
+    return "none";
+}
+
+server_media_tts_result server_media_context::synthesize(const std::string & text) const {
+    if (!pimpl->smt_tts || !pimpl->worker) {
+        throw std::runtime_error("media backend does not support TTS");
+    }
+    smt_tts_result synthesis = pimpl->worker->invoke("smt_tts_synthesize", [&]() {
+        return pimpl->smt_tts->synthesize(text);
+    });
+    server_media_tts_result result;
+    result.wav = std::move(synthesis.wav);
+    result.backend = std::move(synthesis.backend);
+    result.segments = synthesis.segments;
+    result.sample_rate = synthesis.sample_rate;
+    result.samples = synthesis.samples;
+    result.wall_seconds = synthesis.wall_seconds;
+    return result;
+}
+
 static std::string server_media_to_lower_ascii(std::string s) {
     std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return (char) std::tolower(c); });
     return s;
@@ -615,6 +649,33 @@ static int server_media_decode_embd(
     }
 
     return 0;
+}
+#endif
+
+#if defined(LLAMA_SERVER_SMT_MTMD)
+bool server_media_context::tts_config_matches(const common_params & params) {
+    return !params.smt_config_dir.empty() &&
+           (params.media_backend == "auto" || params.media_backend == "smt") &&
+           smt_tts_context::matches(params.smt_config_dir);
+}
+
+std::unique_ptr<server_media_context> server_media_context::init_tts(const common_params & params) {
+    if (!tts_config_matches(params)) {
+        throw std::runtime_error("SMT config is not a supported TTS model bundle");
+    }
+
+    auto ctx = std::unique_ptr<server_media_context>(new server_media_context());
+    ctx->pimpl->mode = server_media_backend::smt;
+    ctx->pimpl->worker = std::make_unique<media_worker>("smt-tts");
+    ctx->pimpl->smt_tts = ctx->pimpl->worker->invoke("smt_tts_init", [&]() {
+        return smt_tts_context::create(params.smt_config_dir, params.vocoder.speaker_file);
+    });
+    if (!ctx->pimpl->smt_tts) {
+        throw std::runtime_error("failed to initialize SMT TTS backend");
+    }
+    SRV_INF("media backend '%s' worker thread id = %zu\n", ctx->pimpl->smt_tts->backend_name(),
+            std::hash<std::thread::id>{}(ctx->pimpl->worker->thread_id()));
+    return ctx;
 }
 #endif
 

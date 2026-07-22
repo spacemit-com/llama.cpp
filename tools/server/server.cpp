@@ -5,6 +5,11 @@
 #include "server-stream.h"
 #include "server-tools.h"
 
+#if defined(LLAMA_SERVER_SMT_MTMD)
+#    include "server-media.h"
+#    include "server-tts.h"
+#endif
+
 #include "arg.h"
 #include "build-info.h"
 #include "common.h"
@@ -85,6 +90,79 @@ static server_http_context::handler_t ex_wrapper(server_http_context::handler_t 
     };
 }
 
+#if defined(LLAMA_SERVER_SMT_MTMD)
+static int run_tts_server(const common_params & params) {
+    server_http_context ctx_http;
+    if (!ctx_http.init(params)) {
+        SRV_ERR("%s", "failed to initialize HTTP server\n");
+        server_stream_session_manager_stop();
+        llama_backend_free();
+        return 1;
+    }
+
+    std::unique_ptr<server_media_context> media;
+    try {
+        media = server_media_context::init_tts(params);
+    } catch (const std::exception & e) {
+        SRV_ERR("failed to initialize TTS media backend: %s\n", e.what());
+        server_stream_session_manager_stop();
+        llama_backend_free();
+        return 1;
+    }
+
+    const auto get_health = [](const server_http_req &) -> server_http_res_ptr {
+        auto response = std::make_unique<server_http_res>();
+        response->data = R"({"status":"ok"})";
+        return response;
+    };
+    const auto post_speech = [&media](const server_http_req & request) -> server_http_res_ptr {
+        server_tts_validate_body_size(request.body.size());
+        json body;
+        try {
+            body = json::parse(request.body);
+        } catch (const json::exception &) {
+            throw std::invalid_argument("request body must be valid JSON");
+        }
+        return server_tts_make_response(media->synthesize(server_tts_request_text(body)));
+    };
+
+    ctx_http.get ("/health",          ex_wrapper(get_health));
+    ctx_http.get ("/v1/health",       ex_wrapper(get_health));
+    ctx_http.post("/v1/audio/speech", ex_wrapper(post_speech));
+
+    if (!ctx_http.start()) {
+        SRV_ERR("%s", "exiting due to HTTP server error\n");
+        media.reset();
+        server_stream_session_manager_stop();
+        llama_backend_free();
+        return 1;
+    }
+    ctx_http.is_ready.store(true);
+    shutdown_handler = [&](int) {
+        ctx_http.stop();
+    };
+
+#if defined(__unix__) || (defined(__APPLE__) && defined(__MACH__))
+    struct sigaction action;
+    action.sa_handler = signal_handler;
+    sigemptyset(&action.sa_mask);
+    action.sa_flags = 0;
+    sigaction(SIGINT, &action, nullptr);
+    sigaction(SIGTERM, &action, nullptr);
+#endif
+
+    SRV_INF("TTS media backend '%s' is listening on %s\n",
+            media->tts_backend_name(), ctx_http.listening_address.c_str());
+    if (ctx_http.thread.joinable()) {
+        ctx_http.thread.join();
+    }
+    media.reset();
+    server_stream_session_manager_stop();
+    llama_backend_free();
+    return 0;
+}
+#endif
+
 int llama_server(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -103,6 +181,19 @@ int llama_server(int argc, char ** argv) {
 
     llama_backend_init();
     llama_numa_init(params.numa);
+
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    if (server_media_context::tts_config_matches(params)) {
+        if (!params.model.empty() || !params.model.url.empty() || !params.model.hf_file.empty() ||
+            !params.models_dir.empty() || !params.models_preset.empty()) {
+            SRV_ERR("%s", "TTS server mode cannot be combined with an LLM model or router preset\n");
+            llama_backend_free();
+            return 1;
+        }
+        common_params_print_info(params, false);
+        return run_tts_server(params);
+    }
+#endif
 
     return llama_server(params, argc, argv);
 }

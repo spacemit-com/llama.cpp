@@ -48,10 +48,17 @@ if(LLAMA_SERVER_SMT_MTMD)
         smt/smt-media-common.cpp
         smt/smt-media-common.h
         smt/smt-profile.h
+        smt/smt-tts-wrapper.cpp
+        smt/smt-tts-wrapper.h
         smt/smt-vision-preprocess.cpp
         smt/smt-vision-preprocess.h
         smt/smt-vision-wrapper.cpp
         smt/smt-vision-wrapper.h
+        smt/qwen3-tts/qwen3_tts_gguf.h
+        smt/qwen3-tts/qwen3_tts_runtime.cpp
+        smt/qwen3-tts/qwen3_tts_runtime.h
+        smt/qwen3-tts/qwen3_tts_talker.cpp
+        smt/qwen3-tts/qwen3_tts_talker.h
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_vision_engine.cc
         ${SPACEMIT_ORT_SAMPLE_DIR}/spine_llm_argparser.cc
     )
@@ -61,11 +68,23 @@ if(LLAMA_SERVER_SMT_MTMD)
     target_include_directories(${TARGET} PRIVATE
         ${CMAKE_SOURCE_DIR}/tools/mtmd
         ${CMAKE_SOURCE_DIR}/vendor
+        ${CMAKE_SOURCE_DIR}/ggml/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/smt/qwen3-tts
         ${SPACEMIT_ORT_SAMPLE_DIR}
         ${SPACEMIT_ORT_INC_DIR}
     )
-    target_link_libraries(${TARGET} PRIVATE mtmd ${ONNXRUNTIME_LIB})
+    target_link_libraries(${TARGET} PRIVATE mtmd llama ggml-cpu ${ONNXRUNTIME_LIB})
     if(CMAKE_DL_LIBS)
         target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
+    endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND GGML_CPU_RISCV64_SPACEMIT)
+        get_target_property(QWEN3_TTS_RISCV_OPTIONS ggml-cpu COMPILE_OPTIONS)
+        if(QWEN3_TTS_RISCV_OPTIONS)
+            list(FILTER QWEN3_TTS_RISCV_OPTIONS INCLUDE REGEX "^-m(arch|abi)=")
+            set_source_files_properties(
+                smt/qwen3-tts/qwen3_tts_talker.cpp
+                PROPERTIES COMPILE_OPTIONS "${QWEN3_TTS_RISCV_OPTIONS}"
+            )
+        endif()
     endif()
 endif()
