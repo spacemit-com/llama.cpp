@@ -1,5 +1,6 @@
 #include "qwen3_tts_talker.h"
 
+#include "ggml-cpu.h"
 #include "ggml.h"
 #include "llama.h"
 #include "qwen3_tts_gguf.h"
@@ -229,6 +230,12 @@ class batch_holder {
     llama_batch batch_{};
 };
 
+struct threadpool_deleter {
+    void operator()(ggml_threadpool * threadpool) const { ggml_threadpool_free(threadpool); }
+};
+
+using threadpool_ptr = std::unique_ptr<ggml_threadpool, threadpool_deleter>;
+
 }  // namespace
 
 struct talker_engine::impl {
@@ -293,6 +300,15 @@ struct talker_engine::impl {
         if (!cp_context_) {
             throw std::runtime_error("failed to create Qwen3-TTS code predictor context");
         }
+
+        ggml_threadpool_params threadpool_params = ggml_threadpool_params_default(threads);
+        threadpool_.reset(ggml_threadpool_new(&threadpool_params));
+        if (!threadpool_) {
+            throw std::runtime_error("failed to create Qwen3-TTS threadpool");
+        }
+        // Generation alternates between these contexts on one worker, so they share one persistent pool.
+        llama_attach_threadpool(talker_context_.get(), threadpool_.get(), nullptr);
+        llama_attach_threadpool(cp_context_.get(), threadpool_.get(), nullptr);
     }
 
     void generate(const std::vector<float> &             prefill,
@@ -446,6 +462,7 @@ struct talker_engine::impl {
     std::array<const ggml_fp16_t *, code_groups - 1> cp_heads_{};
     std::unique_ptr<llama_model, model_deleter>      talker_model_;
     std::unique_ptr<llama_model, model_deleter>      cp_model_;
+    threadpool_ptr                                   threadpool_;
     std::unique_ptr<llama_context, context_deleter>  talker_context_;
     std::unique_ptr<llama_context, context_deleter>  cp_context_;
     batch_holder                                     talker_batch_;
