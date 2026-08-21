@@ -2381,6 +2381,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.smt_config_dir = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_SMT_CONFIG_DIR"));
+    add_opt(common_arg(
+        {"--smt-multi-asr"},
+        "enable the isolated legacy multi-ASR FIFO service (default: disabled)",
+        [](common_params & params) {
+            params.smt_multi_asr = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SMT_MULTI_ASR"));
 #endif
     add_opt(common_arg(
         {"--image", "--audio", "--video"}, "FILE",

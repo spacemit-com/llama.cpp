@@ -45,6 +45,16 @@ if(LLAMA_SERVER_SMT_MTMD)
     target_sources(${TARGET} PRIVATE
         smt/smt-audio-wrapper.cpp
         smt/smt-audio-wrapper.h
+        smt/multi-asr/multi-asr-common.cpp
+        smt/multi-asr/multi-asr-common.h
+        smt/multi-asr/multi-asr-encoder.cpp
+        smt/multi-asr/multi-asr-encoder.h
+        smt/multi-asr/multi-asr-decoder.cpp
+        smt/multi-asr/multi-asr-decoder.h
+        smt/multi-asr/multi-asr-orchestrator.cpp
+        smt/multi-asr/multi-asr-orchestrator.h
+        smt/multi-asr/multi-asr-service.cpp
+        smt/multi-asr/multi-asr-service.h
         smt/smt-media-common.cpp
         smt/smt-media-common.h
         smt/smt-profile.h
@@ -64,8 +74,10 @@ if(LLAMA_SERVER_SMT_MTMD)
     )
     target_include_directories(${TARGET} PUBLIC
         ${CMAKE_CURRENT_SOURCE_DIR}/smt
+        ${CMAKE_CURRENT_SOURCE_DIR}/smt/multi-asr
     )
     target_include_directories(${TARGET} PRIVATE
+        ${CMAKE_SOURCE_DIR}/common
         ${CMAKE_SOURCE_DIR}/tools/mtmd
         ${CMAKE_SOURCE_DIR}/vendor
         ${CMAKE_SOURCE_DIR}/ggml/src

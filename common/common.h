@@ -598,6 +598,7 @@ struct common_params {
 #if defined(LLAMA_SERVER_SMT_MTMD)
     std::string media_backend = "auto"; // multimodal backend: auto|mtmd|smt
     std::string smt_config_dir;         // SMT config dir (config.json + ONNX)
+    bool smt_multi_asr = false;         // opt in to the isolated legacy multi-ASR FIFO service
 #endif
     std::vector<std::string> image; // path to image file(s) ; TODO: change the name to "media"
     int image_min_tokens = -1;

@@ -8,6 +8,9 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#if defined(LLAMA_SERVER_SMT_MTMD)
+#include "multi-asr-service.h"
+#endif
 
 #include "build-info.h"
 #include "common.h"
@@ -894,6 +897,9 @@ public:
     server_media_context * media = nullptr;
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    std::unique_ptr<smt_multi_asr_service> smt_asr_service;
+#endif
 
     server_queue    queue_tasks;
     server_response queue_results;
@@ -972,6 +978,11 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+#if defined(LLAMA_SERVER_SMT_MTMD)
+        // The isolated ASR context borrows model_tgt; tear it down before the
+        // owning common_init_result releases the model.
+        smt_asr_service.reset();
+#endif
         spec.reset();
         spec_init.reset();
 
@@ -1050,14 +1061,34 @@ private:
 #if defined(LLAMA_SERVER_SMT_MTMD)
         const bool has_smt_media = !params.smt_config_dir.empty() &&
                 (params.media_backend == "auto" || params.media_backend == "smt");
+        const bool use_multi_asr = has_smt_media && !has_mmproj && params.smt_multi_asr;
 #else
         const bool has_smt_media = false;
+        const bool use_multi_asr = false;
 #endif
         const bool has_draft = params.speculative.has_dft();
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
+
+#if defined(LLAMA_SERVER_SMT_MTMD)
+        // Initialize the legacy ASR stack before loading the server's own
+        // llama model.  SpacemiT's backend keeps process-wide state, and the
+        // proven standalone implementation is sensitive to a second model
+        // being loaded ahead of it.
+        if (use_multi_asr && !smt_asr_service) {
+            try {
+                smt_asr_service = std::make_unique<smt_multi_asr_service>();
+                smt_asr_service->init(nullptr, params_base);
+                SRV_INF("%s", "initialized isolated SMT multi-ASR service\n");
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize isolated SMT multi-ASR service: %s\n", e.what());
+                smt_asr_service.reset();
+                return false;
+            }
+        }
+#endif
 
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
@@ -1078,7 +1109,9 @@ private:
         }
 
         std::unique_ptr<media_worker> media_worker_init;
-        if (has_mmproj || has_smt_media) {
+        // Default SMT audio keeps the original generic media path. Only the
+        // explicit multi-ASR mode uses the isolated legacy service.
+        if (has_mmproj || (has_smt_media && !use_multi_asr)) {
             std::string worker_backend = "mtmd";
 #if defined(LLAMA_SERVER_SMT_MTMD)
             if (params_base.media_backend == "smt" || (params_base.media_backend == "auto" && !has_mmproj && has_smt_media)) {
@@ -1248,7 +1281,7 @@ private:
             load_progress_callback(1.0f, &load_progress_spec);
         }
 
-        if (has_mmproj || has_smt_media) {
+        if (has_mmproj || (has_smt_media && !use_multi_asr)) {
             if (callback_state) {
                 callback_state(SERVER_STATE_LOADING, {{"stage", has_mmproj ? "mmproj_model" : "media_model"}});
             }
@@ -1534,7 +1567,7 @@ private:
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
                 /* allow_image           */ media ? media->supports_vision() : false,
-                /* allow_audio           */ media ? media->supports_audio()  : false,
+                /* allow_audio           */ (media ? media->supports_audio() : false) || smt_asr_service != nullptr,
                 /* allow_video           */ media ? media->supports_video()  : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
@@ -4030,7 +4063,8 @@ server_context_meta server_context::get_meta() const {
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* has_mtmd               */ impl->media != nullptr && impl->media->supports_prompt_embeddings(),
+        /* has_mtmd               */ (impl->media != nullptr && impl->media->supports_prompt_embeddings()) ||
+                                      impl->smt_asr_service != nullptr,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
@@ -4116,6 +4150,55 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     int32_t sse_ping_interval = params.sse_ping_interval;
 
     try {
+        // Audio-only SMT requests use the isolated legacy ASR orchestrator.
+        // This synchronous facade is intentionally ahead of task creation:
+        // no server slot, PEG parser, prompt cache, or shared KV sequence is
+        // touched by these requests.
+#if defined(LLAMA_SERVER_SMT_MTMD)
+        const std::string raw_prompt = data.contains("prompt") && data.at("prompt").is_string()
+                ? data.at("prompt").get<std::string>() : std::string();
+        // oaicompat_chat_params_parse() has already decoded input_audio into
+        // `files`; chat-template rendering may remove the media marker from
+        // the resulting prompt, so do not use the rendered text to decide
+        // whether this is an audio request.
+        const bool has_audio_media = !files.empty();
+        if (ctx_server.smt_asr_service && has_audio_media) {
+            multi_asr_request asr_result;
+            const int32_t n_predict = json_value(data, "max_tokens", 256);
+            const std::string user_prompt = raw_prompt;
+            const bool ok = ctx_server.smt_asr_service->submit(files.front(), user_prompt, n_predict, asr_result);
+            if (!ok) {
+                res->error(format_error_response(asr_result.error.empty() ? "ASR request failed" : asr_result.error,
+                                                 ERROR_TYPE_SERVER));
+                return res;
+            }
+            const json choice = {
+                {"index", 0},
+                {"message", {{"role", "assistant"}, {"content", asr_result.text}}},
+                {"finish_reason", "stop"},
+            };
+            res->ok({
+                {"id", completion_id},
+                {"object", "chat.completion"},
+                {"created", std::time(nullptr)},
+                {"model", meta->model_name},
+                {"choices", json::array({choice})},
+                {"usage", {{"prompt_tokens", asr_result.timings.n_audio_tokens},
+                            {"completion_tokens", asr_result.timings.n_out_tokens},
+                            {"total_tokens", asr_result.timings.n_audio_tokens + asr_result.timings.n_out_tokens}}},
+                {"multi_asr_timings", {
+                    {"queue_ms", asr_result.timings.queue_ms},
+                    {"encode_ms", asr_result.timings.encode_ms},
+                    {"prefill_ms", asr_result.timings.prefill_ms},
+                    {"decode_ms", asr_result.timings.decode_ms},
+                    {"total_ms", asr_result.timings.total_ms},
+                    {"n_audio_tokens", asr_result.timings.n_audio_tokens},
+                    {"n_out_tokens", asr_result.timings.n_out_tokens},
+                }},
+            });
+            return res;
+        }
+#endif
         std::vector<server_task> tasks;
 
         const auto & prompt = data.at("prompt");
