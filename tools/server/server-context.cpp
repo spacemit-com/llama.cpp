@@ -1560,6 +1560,11 @@ private:
             // IMPORTANT: chat_params is reused across sleeping / resuming states,
             //            never store llama_context/llama_model pointers in chat_params,
             //            as they may be invalidated after sleeping
+            bool allow_audio = media ? media->supports_audio() : false;
+#if defined(LLAMA_SERVER_SMT_MTMD)
+            allow_audio = allow_audio || smt_asr_service != nullptr;
+#endif
+
             chat_params = {
                 /* use_jinja             */ params_base.use_jinja,
                 /* prefill_assistant     */ params_base.prefill_assistant,
@@ -1567,7 +1572,7 @@ private:
                 /* chat_template_kwargs  */ params_base.default_template_kwargs,
                 /* tmpls                 */ std::move(chat_templates),
                 /* allow_image           */ media ? media->supports_vision() : false,
-                /* allow_audio           */ (media ? media->supports_audio() : false) || smt_asr_service != nullptr,
+                /* allow_audio           */ allow_audio,
                 /* allow_video           */ media ? media->supports_video()  : false,
                 /* enable_thinking       */ enable_thinking,
                 /* reasoning_budget      */ params_base.sampling.reasoning_budget_tokens,
@@ -4057,14 +4062,18 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
+    bool has_mtmd = impl->media != nullptr && impl->media->supports_prompt_embeddings();
+#if defined(LLAMA_SERVER_SMT_MTMD)
+    has_mtmd = has_mtmd || impl->smt_asr_service != nullptr;
+#endif
+
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
         /* model_aliases          */ impl->model_aliases,
         /* model_tags             */ impl->model_tags,
         /* model_path             */ impl->params_base.model.path,
-        /* has_mtmd               */ (impl->media != nullptr && impl->media->supports_prompt_embeddings()) ||
-                                      impl->smt_asr_service != nullptr,
+        /* has_mtmd               */ has_mtmd,
         /* has_inp_image          */ impl->chat_params.allow_image,
         /* has_inp_audio          */ impl->chat_params.allow_audio,
         /* has_inp_video          */ impl->chat_params.allow_video,
