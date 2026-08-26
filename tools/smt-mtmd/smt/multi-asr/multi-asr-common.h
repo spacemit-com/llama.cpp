@@ -48,8 +48,6 @@ struct multi_asr_params {
     int32_t n_ctx     = 0;    // 0 = from model / config.json context_size
     int32_t n_batch   = 2048;
 
-    // pipeline
-    bool enable_pipeline = true;  // false = strict serial baseline (variable ②)
 };
 
 // ---------------------------------------------------------------------------
@@ -81,6 +79,7 @@ struct multi_asr_request {
     std::vector<uint8_t> audio;   // raw wav bytes (decoded input)
     std::string          prompt;  // text prompt, e.g. "language Chinese<asr_text>"
     int32_t              n_predict = 256;
+    float                temperature = 0.0f;
 
     // filled by encoder stage: audio embedding (n_audio_tokens * hidden_size floats)
     std::vector<float> embd;

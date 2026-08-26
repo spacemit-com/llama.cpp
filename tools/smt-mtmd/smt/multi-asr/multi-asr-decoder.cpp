@@ -1,185 +1,119 @@
 #include "multi-asr-decoder.h"
 
 #include "ggml.h"
-#include "sampling.h"
+#include "llama-model.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
-#include <vector>
 
-// Build the Qwen3-ASR prompt around the audio, mirroring
-// format_qwen3asr_audio_prompt() in tools/mtmd/mtmd-cli-smt.cpp:
-//   <|im_start|>system\n<|im_end|>\n<|im_start|>user\n <AUDIO> <|im_end|>\n<|im_start|>assistant\n<user text>
-// The audio embedding (+ <|audio_start|>/<|audio_end|>) is spliced where <AUDIO> is.
-// We return the text BEFORE the audio and the text AFTER the audio separately.
+namespace {
 struct qwen3asr_prompt_split {
-    std::string before;  // up to and including "<|im_start|>user\n"
-    std::string after;   // "<|im_end|>\n<|im_start|>assistant\n" + user text
+    std::string before;
+    std::string after;
 };
 
-static qwen3asr_prompt_split build_qwen3asr_prompt(const std::string & user_text) {
-    qwen3asr_prompt_split s;
-    s.before = "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n";
-    s.after  = "<|im_end|>\n<|im_start|>assistant\n" + user_text;
-    return s;
+qwen3asr_prompt_split build_qwen3asr_prompt(const std::string & instruction) {
+    return {
+        "<|im_start|>system\n<|im_end|>\n<|im_start|>user\n",
+        "<|im_end|>\n<|im_start|>assistant\n" + instruction,
+    };
+}
 }
 
 multi_asr_decoder::~multi_asr_decoder() {
-    if (owns_context_ && lctx_ && !init_) {
+    for (auto & state : slots_) {
+        state.sampler.reset();
+    }
+    if (lctx_ != nullptr) {
         llama_free(lctx_);
     }
-    lctx_  = nullptr;
+    lctx_ = nullptr;
     model_ = nullptr;
-}
-
-void multi_asr_decoder::init(const multi_asr_params & params, int64_t hidden_size) {
-    hidden_size_ = hidden_size;
-    n_batch_     = params.n_batch;
-
-    // Build common_params for model load + threading/affinity + sampling.
-    params_.model.path = params.model_path;
-    params_.n_ctx      = params.n_ctx;  // 0 -> from model
-    params_.n_batch    = params.n_batch;
-    params_.warmup     = params.warmup;
-
-    // Decoder thread count. Core binding for the ggml IME backend is set via the
-    // SPACEMIT_PERFER_CORE_ID environment variable (see run_server.sh), not here.
-    if (params.decoder_n_threads > 0) {
-        params_.cpuparams.n_threads = params.decoder_n_threads;
-    }
-
-    init_ = common_init_from_params(params_);
-    if (!init_) {
-        throw std::runtime_error("multi_asr_decoder: common_init_from_params returned null");
-    }
-    model_ = init_->model();
-    lctx_  = init_->context();
-    if (!model_ || !lctx_) {
-        throw std::runtime_error("multi_asr_decoder: failed to load model / create context");
-    }
-    vocab_ = llama_model_get_vocab(model_);
-
-    // Validate embedding dim.
-    const int model_n_embd = llama_model_n_embd(model_);
-    if ((int64_t) model_n_embd != hidden_size_) {
-        throw std::runtime_error("multi_asr_decoder: model n_embd (" + std::to_string(model_n_embd) +
-                                 ") != encoder hidden_size (" + std::to_string(hidden_size_) + ")");
-    }
-
-    // Qwen3-ASR audio boundary special tokens.
-    tok_audio_beg_ = common_tokenize(vocab_, "<|audio_start|>", /*add_special*/ false, /*parse_special*/ true);
-    tok_audio_end_ = common_tokenize(vocab_, "<|audio_end|>", /*add_special*/ false, /*parse_special*/ true);
-    owns_context_ = true;
 }
 
 void multi_asr_decoder::init_shared(llama_model * model, const multi_asr_params & params, int64_t hidden_size) {
     if (model == nullptr) {
-        throw std::runtime_error("multi_asr_decoder: null shared model");
+        throw std::runtime_error("multi_asr_decoder: null model");
     }
+    model_ = model;
     hidden_size_ = hidden_size;
-    n_batch_ = params.n_batch;
+    n_batch_ = std::max(1, params.n_batch);
+    n_parallel_ = std::max(1, params.n_parallel);
+
+    params_ = {};
     params_.model.path = params.model_path;
     params_.n_ctx = params.n_ctx;
-    params_.n_batch = params.n_batch;
-    params_.n_ubatch = std::min(params.n_batch, 512);
+    params_.n_batch = n_batch_;
+    params_.n_ubatch = std::min(n_batch_, 512);
     params_.warmup = false;
+    params_.n_parallel = n_parallel_;
+    params_.n_outputs_max = n_parallel_;
+    params_.sampling.temp = 0.0f;
     if (params.decoder_n_threads > 0) {
         params_.cpuparams.n_threads = params.decoder_n_threads;
         params_.cpuparams_batch.n_threads = params.decoder_n_threads;
     }
+
     auto cparams = common_context_params_to_llama(params_);
-    cparams.n_seq_max = 1;
-    cparams.n_outputs_max = 1;
-    lctx_ = llama_init_from_model(model, cparams);
-    if (!lctx_) {
-        throw std::runtime_error("multi_asr_decoder: failed to create private context from shared model");
+    cparams.n_seq_max = n_parallel_;
+    cparams.n_outputs_max = n_parallel_;
+    cparams.n_batch = n_batch_;
+    cparams.n_ubatch = std::min(n_batch_, 512);
+    lctx_ = llama_init_from_model(model_, cparams);
+    if (lctx_ == nullptr) {
+        throw std::runtime_error("multi_asr_decoder: failed to create context");
     }
-    model_ = model;
+
     vocab_ = llama_model_get_vocab(model_);
     if (llama_model_n_embd(model_) != hidden_size_) {
-        llama_free(lctx_);
-        lctx_ = nullptr;
-        throw std::runtime_error("multi_asr_decoder: shared model embedding size mismatch");
+        throw std::runtime_error("multi_asr_decoder: model/encoder embedding size mismatch");
     }
+
     tok_audio_beg_ = common_tokenize(vocab_, "<|audio_start|>", false, true);
     tok_audio_end_ = common_tokenize(vocab_, "<|audio_end|>", false, true);
-    owns_context_ = true;
+    load_token_embeddings();
+    slots_.resize(n_parallel_);
+    llama_memory_clear(llama_get_memory(lctx_), true);
 }
 
-int multi_asr_decoder::decode_tokens(const std::vector<llama_token> & tokens, llama_pos & n_past, bool logits_last) {
-    if (tokens.empty()) {
-        return 0;
+void multi_asr_decoder::load_token_embeddings() {
+    const ggml_tensor * tok_embd = model_->tok_embd;
+    if (tok_embd == nullptr || tok_embd->ne[0] != hidden_size_ || tok_embd->ne[1] != llama_vocab_n_tokens(vocab_)) {
+        throw std::runtime_error("multi_asr_decoder: invalid token embedding tensor");
     }
-    llama_batch batch = llama_batch_init(n_batch_, 0, 1);
-    size_t      i     = 0;
-    while (i < tokens.size()) {
-        batch.n_tokens = 0;
-        for (; i < tokens.size() && batch.n_tokens < n_batch_; ++i) {
-            const int32_t j    = batch.n_tokens;
-            batch.token[j]     = tokens[i];
-            batch.pos[j]       = n_past + j;
-            batch.n_seq_id[j]  = 1;
-            batch.seq_id[j][0] = 0;
-            batch.logits[j]    = false;
-            batch.n_tokens++;
+
+    const size_t nbytes = ggml_nbytes(tok_embd);
+    std::vector<uint8_t> raw(nbytes);
+    ggml_backend_tensor_get(tok_embd, raw.data(), 0, nbytes);
+
+    token_embd_.resize((size_t) tok_embd->ne[0] * (size_t) tok_embd->ne[1]);
+    const ggml_type_traits * traits = ggml_get_type_traits(tok_embd->type);
+    if (tok_embd->type == GGML_TYPE_F32) {
+        std::memcpy(token_embd_.data(), raw.data(), token_embd_.size() * sizeof(float));
+    } else if (traits->to_float != nullptr) {
+        for (int64_t i = 0; i < tok_embd->ne[1]; ++i) {
+            traits->to_float(raw.data() + (size_t) i * tok_embd->nb[1],
+                             token_embd_.data() + (size_t) i * (size_t) hidden_size_, hidden_size_);
         }
-        if (logits_last && i == tokens.size()) {
-            batch.logits[batch.n_tokens - 1] = true;
-        }
-        if (llama_decode(lctx_, batch) != 0) {
-            llama_batch_free(batch);
-            return 1;
-        }
-        n_past += batch.n_tokens;
+    } else {
+        throw std::runtime_error(std::string("multi_asr_decoder: cannot dequantize token embedding type ") +
+                                 ggml_type_name(tok_embd->type));
     }
-    llama_batch_free(batch);
-    return 0;
 }
 
-int multi_asr_decoder::decode_embd(const float * embd, int n_tokens, llama_pos & n_past, bool logits_last) {
-    const int                   n_embd = (int) hidden_size_;
-    std::vector<llama_pos>      pos((size_t) n_tokens);
-    std::vector<int32_t>        n_seq_id((size_t) n_tokens);
-    std::vector<llama_seq_id>   seq_id_store((size_t) n_tokens);
-    std::vector<llama_seq_id *> seq_ids((size_t) n_tokens + 1);
-    std::vector<int8_t>         logits((size_t) n_tokens);
-    for (int i = 0; i < n_tokens; ++i) {
-        seq_id_store[i] = 0;
-        seq_ids[i]      = &seq_id_store[i];
+const float * multi_asr_decoder::token_embedding(llama_token token) const {
+    if (token < 0 || token >= llama_vocab_n_tokens(vocab_)) {
+        throw std::runtime_error("multi_asr_decoder: invalid token embedding id");
     }
-    seq_ids[n_tokens] = nullptr;
-
-    int processed = 0;
-    while (processed < n_tokens) {
-        const int  batch_size    = std::min(n_batch_, n_tokens - processed);
-        const bool is_last_batch = (processed + batch_size >= n_tokens);
-        for (int i = 0; i < batch_size; ++i) {
-            pos[processed + i]      = n_past + processed + i;
-            n_seq_id[processed + i] = 1;
-            logits[processed + i]   = (logits_last && is_last_batch && i == batch_size - 1) ? 1 : 0;
-        }
-        llama_batch batch = {
-            /*n_tokens =*/batch_size,
-            /*token    =*/nullptr,
-            /*embd     =*/const_cast<float *>(embd) + (size_t) processed * n_embd,
-            /*pos      =*/pos.data() + processed,
-            /*n_seq_id =*/n_seq_id.data() + processed,
-            /*seq_id   =*/seq_ids.data() + processed,
-            /*logits   =*/logits.data() + processed,
-        };
-        if (llama_decode(lctx_, batch) != 0) {
-            return 1;
-        }
-        processed += batch_size;
-    }
-    n_past += n_tokens;
-    return 0;
+    return token_embd_.data() + (size_t) token * (size_t) hidden_size_;
 }
 
-bool multi_asr_decoder::decode(multi_asr_request & req) {
-    if (!lctx_) {
-        req.error = "decoder not initialized";
+bool multi_asr_decoder::start(multi_asr_request & req, int slot_id) {
+    if (lctx_ == nullptr || slot_id < 0 || slot_id >= (int) slots_.size() || slots_[slot_id].active) {
+        req.error = "decoder slot unavailable";
         req.stage = multi_asr_stage::failed;
         return false;
     }
@@ -189,100 +123,223 @@ bool multi_asr_decoder::decode(multi_asr_request & req) {
         return false;
     }
 
-    // Fresh KV for this request (single slot, one request at a time).
-    llama_memory_clear(llama_get_memory(lctx_), true);
+    auto & state = slots_[slot_id];
+    llama_memory_seq_rm(llama_get_memory(lctx_), slot_id, -1, -1);
+    state = {};
+    state.req = &req;
+    state.n_predict = req.n_predict > 0 ? req.n_predict : 256;
+    state.occupied = true;
+    state.t_prefill_start = ggml_time_ms();
+    state.admission_order = next_admission_order_++;
 
-    llama_pos                   n_past = 0;
-    const qwen3asr_prompt_split split  = build_qwen3asr_prompt(req.prompt);
-
-    const int64_t t_prefill0 = ggml_time_ms();
-
-    // 1) text before audio (with BOS/special parsing)
-    const std::vector<llama_token> toks_before =
-        common_tokenize(vocab_, split.before, /*add_special*/ true, /*parse_special*/ true);
-    if (decode_tokens(toks_before, n_past, /*logits_last*/ false) != 0) {
-        req.error = "decoder: failed to decode prompt prefix";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    // 2) <|audio_start|>
-    if (decode_tokens(tok_audio_beg_, n_past, /*logits_last*/ false) != 0) {
-        req.error = "decoder: failed to decode audio-begin";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    // 3) audio embedding
-    if (decode_embd(req.embd.data(), req.n_audio_tokens, n_past, /*logits_last*/ false) != 0) {
-        req.error = "decoder: failed to decode audio embedding";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    // 4) <|audio_end|>
-    if (decode_tokens(tok_audio_end_, n_past, /*logits_last*/ false) != 0) {
-        req.error = "decoder: failed to decode audio-end";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    // 5) assistant prefix + user text (logits on last -> ready to sample)
-    const std::vector<llama_token> toks_after =
-        common_tokenize(vocab_, split.after, /*add_special*/ false, /*parse_special*/ true);
-    if (decode_tokens(toks_after, n_past, /*logits_last*/ true) != 0) {
-        req.error = "decoder: failed to decode assistant prefix";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    req.timings.prefill_ms = (double) (ggml_time_ms() - t_prefill0);
-
-    // 6) generation loop
-    const int64_t    t_decode0 = ggml_time_ms();
-    common_sampler * smpl      = common_sampler_init(model_, params_.sampling);
-    if (!smpl) {
-        req.error = "decoder: failed to init sampler";
-        req.stage = multi_asr_stage::failed;
-        return false;
-    }
-
-    std::vector<llama_token> generated;
-    const int                n_predict = req.n_predict > 0 ? req.n_predict : 256;
-    llama_batch              gen_batch = llama_batch_init(1, 0, 1);
-    bool                     ok        = true;
-    for (int i = 0; i < n_predict; ++i) {
-        const llama_token tok = common_sampler_sample(smpl, lctx_, -1);
-        common_sampler_accept(smpl, tok, true);
-        if (llama_vocab_is_eog(vocab_, tok)) {
-            break;
+    const auto split = build_qwen3asr_prompt(req.prompt);
+    auto append_tokens = [&](const std::vector<llama_token> & tokens) {
+        for (const llama_token token : tokens) {
+            state.prefill.push_back({ token_embedding(token) });
         }
-        generated.push_back(tok);
-
-        gen_batch.n_tokens     = 1;
-        gen_batch.token[0]     = tok;
-        gen_batch.pos[0]       = n_past++;
-        gen_batch.n_seq_id[0]  = 1;
-        gen_batch.seq_id[0][0] = 0;
-        gen_batch.logits[0]    = true;
-        if (llama_decode(lctx_, gen_batch) != 0) {
-            req.error = "decoder: llama_decode failed during generation";
-            ok        = false;
-            break;
-        }
+    };
+    append_tokens(common_tokenize(vocab_, split.before, true, true));
+    append_tokens(tok_audio_beg_);
+    for (int32_t i = 0; i < req.n_audio_tokens; ++i) {
+        state.prefill.push_back({ req.embd.data() + (size_t) i * (size_t) hidden_size_ });
     }
-    llama_batch_free(gen_batch);
+    append_tokens(tok_audio_end_);
+    append_tokens(common_tokenize(vocab_, split.after, false, true));
+    auto sampling = params_.sampling;
+    sampling.temp = req.temperature;
+    state.sampler.reset(common_sampler_init(model_, sampling));
+    if (!state.sampler) {
+        req.error = "decoder: sampler initialization failed";
+        req.stage = multi_asr_stage::failed;
+        llama_memory_seq_rm(llama_get_memory(lctx_), slot_id, -1, -1);
+        state = {};
+        return false;
+    }
+    req.stage = multi_asr_stage::decoding;
+    return true;
+}
 
-    req.timings.decode_ms    = (double) (ggml_time_ms() - t_decode0);
-    req.timings.n_out_tokens = (int32_t) generated.size();
-
+void multi_asr_decoder::finish_slot(slot & state, bool ok, const std::string & error) {
+    if (state.req == nullptr) {
+        return;
+    }
+    auto & req = *state.req;
+    if (state.active) {
+        req.timings.decode_ms = (double) (ggml_time_ms() - state.t_decode_start);
+    }
+    req.timings.n_out_tokens = (int32_t) state.generated.size();
     if (ok) {
-        req.text  = common_detokenize(lctx_, generated, /*special*/ false);
+        req.text = common_detokenize(lctx_, state.generated, false);
         req.stage = multi_asr_stage::done;
     } else {
+        req.error = error.empty() ? "decoder: generation failed" : error;
         req.stage = multi_asr_stage::failed;
     }
+    const int slot_id = (int) (&state - slots_.data());
+    llama_memory_seq_rm(llama_get_memory(lctx_), slot_id, -1, -1);
+    state = {};
+}
 
-    common_sampler_free(smpl);
-    return ok;
+void multi_asr_decoder::step() {
+    if (!has_active()) {
+        return;
+    }
+
+    // Sample one token for every sequence that already has a decoder state.
+    // New requests remain in prefill until their final prompt row produces the
+    // first logits; they join generation on the following scheduler tick.
+    for (auto & state : slots_) {
+        if (!state.active || state.req == nullptr) {
+            continue;
+        }
+        const llama_token tok = common_sampler_sample(state.sampler.get(), lctx_, state.i_batch);
+        common_sampler_accept(state.sampler.get(), tok, true);
+        if (llama_vocab_is_eog(vocab_, tok)) {
+            finish_slot(state, true);
+            continue;
+        }
+        state.generated.push_back(tok);
+        if ((int) state.generated.size() >= state.n_predict) {
+            finish_slot(state, true);
+        }
+    }
+
+    const int n_active = active_count();
+    int n_pending = 0;
+    for (const auto & state : slots_) {
+        if (state.occupied && !state.active && state.prefill_offset < state.prefill.size()) {
+            ++n_pending;
+        }
+    }
+    if (n_active == 0 && n_pending == 0) {
+        return;
+    }
+
+    // All rows are F32 embeddings. Generated token ids are looked up in the
+    // model's token embedding table before admission, so the transformer sees
+    // one homogeneous input representation even when prefill and decode rows
+    // coexist in this batch.
+    llama_batch batch = llama_batch_init(n_batch_, (int32_t) hidden_size_, n_parallel_);
+
+    int n_batch = 0;
+    std::vector<int> prefill_added(slots_.size(), 0);
+    std::vector<bool> decode_added(slots_.size(), false);
+
+    auto append_active = [&](slot & state) {
+        const int i = n_batch++;
+        const int slot_id = (int) (&state - slots_.data());
+        std::memcpy(batch.embd + (size_t) i * (size_t) hidden_size_,
+                    token_embedding(state.generated.back()), sizeof(float) * (size_t) hidden_size_);
+        batch.pos[i] = state.n_past;
+        batch.n_seq_id[i] = 1;
+        batch.seq_id[i][0] = slot_id;
+        batch.logits[i] = true;
+        state.i_batch = i;
+        decode_added[(size_t) slot_id] = true;
+    };
+
+    // Existing decode work gets first claim on the batch. New prefills use the
+    // remaining budget in FIFO slot order, so a stream of arrivals cannot
+    // starve older generation requests.
+    for (auto & state : slots_) {
+        if (!state.active || state.req == nullptr) {
+            continue;
+        }
+        append_active(state);
+    }
+
+    int prefill_budget = n_batch_ - n_batch;
+    // Admit one pending prefill request per scheduler tick. Existing decode
+    // rows have already claimed their budget; the oldest prompt can use all
+    // remaining rows and is split across ticks only when it exceeds n_batch.
+    slot * pending = nullptr;
+    for (auto & state : slots_) {
+        if (state.occupied && !state.active && state.req != nullptr &&
+            state.prefill_offset < state.prefill.size() &&
+            (pending == nullptr || state.admission_order < pending->admission_order)) {
+            pending = &state;
+        }
+    }
+    if (pending != nullptr && prefill_budget > 0) {
+        auto & state = *pending;
+        const size_t remaining = state.prefill.size() - state.prefill_offset;
+        const int count = std::min<int>(prefill_budget, (int) remaining);
+        const int slot_id = (int) (&state - slots_.data());
+        for (int j = 0; j < count; ++j) {
+            const size_t row = state.prefill_offset + (size_t) j;
+            const auto & item = state.prefill[row];
+            const int i = n_batch++;
+            std::memcpy(batch.embd + (size_t) i * (size_t) hidden_size_, item.data,
+                        sizeof(float) * (size_t) hidden_size_);
+            batch.pos[i] = state.n_past + j;
+            batch.n_seq_id[i] = 1;
+            batch.seq_id[i][0] = slot_id;
+            const bool final_row = row + 1 == state.prefill.size();
+            batch.logits[i] = final_row;
+            if (final_row) {
+                state.i_batch = i;
+            }
+        }
+        prefill_added[(size_t) slot_id] = count;
+    }
+    batch.n_tokens = n_batch;
+    if (n_batch == 0) {
+        llama_batch_free(batch);
+        return;
+    }
+
+    if (active_count() > 0 && n_pending > 0) {
+        LOG_DBG("[multi-asr] mixed batch: decode_rows=%d prefill_rows=%d total_rows=%d\n",
+                (int) std::count(decode_added.begin(), decode_added.end(), true),
+                std::accumulate(prefill_added.begin(), prefill_added.end(), 0), n_batch);
+    }
+
+    if (llama_decode(lctx_, batch) != 0) {
+        for (auto & state : slots_) {
+            if (state.occupied) {
+                finish_slot(state, false, "decoder: llama_decode failed during continuous batching");
+            }
+        }
+    } else {
+        for (auto & state : slots_) {
+            if (!state.occupied) {
+                continue;
+            }
+            const int slot_id = (int) (&state - slots_.data());
+            if (decode_added[(size_t) slot_id]) {
+                state.n_past += 1;
+            }
+            state.n_past += prefill_added[(size_t) slot_id];
+            if (prefill_added[(size_t) slot_id] > 0) {
+                state.prefill_offset += prefill_added[(size_t) slot_id];
+                if (state.prefill_offset == state.prefill.size()) {
+                    state.active = true;
+                    state.t_decode_start = ggml_time_ms();
+                    state.req->timings.prefill_ms = (double) (state.t_decode_start - state.t_prefill_start);
+                }
+            }
+        }
+
+    }
+    llama_batch_free(batch);
+}
+
+bool multi_asr_decoder::has_active() const {
+    return occupied_count() > 0;
+}
+
+int multi_asr_decoder::active_count() const {
+    int count = 0;
+    for (const auto & state : slots_) {
+        count += state.active ? 1 : 0;
+    }
+    return count;
+}
+
+int multi_asr_decoder::occupied_count() const {
+    int count = 0;
+    for (const auto & state : slots_) {
+        count += state.occupied ? 1 : 0;
+    }
+    return count;
 }

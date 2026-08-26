@@ -78,6 +78,7 @@ if(LLAMA_SERVER_SMT_MTMD)
     )
     target_include_directories(${TARGET} PRIVATE
         ${CMAKE_SOURCE_DIR}/common
+        ${CMAKE_SOURCE_DIR}/src
         ${CMAKE_SOURCE_DIR}/tools/mtmd
         ${CMAKE_SOURCE_DIR}/vendor
         ${CMAKE_SOURCE_DIR}/ggml/src

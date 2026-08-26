@@ -2383,7 +2383,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_MTMD}).set_env("LLAMA_ARG_SMT_CONFIG_DIR"));
     add_opt(common_arg(
         {"--smt-multi-asr"},
-        "enable the isolated legacy multi-ASR FIFO service (default: disabled)",
+        "enable Qwen3-ASR prompt compatibility on the native SMT media path (default: disabled)",
         [](common_params & params) {
             params.smt_multi_asr = true;
         }

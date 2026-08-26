@@ -979,8 +979,6 @@ private:
 
     void destroy() {
 #if defined(LLAMA_SERVER_SMT_MTMD)
-        // The isolated ASR context borrows model_tgt; tear it down before the
-        // owning common_init_result releases the model.
         smt_asr_service.reset();
 #endif
         spec.reset();
@@ -1072,24 +1070,6 @@ private:
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
-#if defined(LLAMA_SERVER_SMT_MTMD)
-        // Initialize the legacy ASR stack before loading the server's own
-        // llama model.  SpacemiT's backend keeps process-wide state, and the
-        // proven standalone implementation is sensitive to a second model
-        // being loaded ahead of it.
-        if (use_multi_asr && !smt_asr_service) {
-            try {
-                smt_asr_service = std::make_unique<smt_multi_asr_service>();
-                smt_asr_service->init(nullptr, params_base);
-                SRV_INF("%s", "initialized isolated SMT multi-ASR service\n");
-            } catch (const std::exception & e) {
-                SRV_ERR("failed to initialize isolated SMT multi-ASR service: %s\n", e.what());
-                smt_asr_service.reset();
-                return false;
-            }
-        }
-#endif
-
         if (callback_state) {
             std::vector<std::string> stages = {"text_model"};
             if (has_spec) {
@@ -1109,8 +1089,8 @@ private:
         }
 
         std::unique_ptr<media_worker> media_worker_init;
-        // Default SMT audio keeps the original generic media path. Only the
-        // explicit multi-ASR mode uses the isolated legacy service.
+        // SMT multi-ASR uses the normal server media path. The media worker
+        // serializes encoder calls; server slots continuous-batch decoding.
         if (has_mmproj || (has_smt_media && !use_multi_asr)) {
             std::string worker_backend = "mtmd";
 #if defined(LLAMA_SERVER_SMT_MTMD)
@@ -1232,7 +1212,9 @@ private:
             params_base.load_progress_callback_user_data = &load_progress_text;
         }
 
-        llama_init = common_init_from_params(params_base);
+        // In dedicated multi-ASR mode llama-server owns only the model. The
+        // sole llama_context is created and scheduled by multi-ASR below.
+        llama_init = common_init_from_params(params_base, use_multi_asr);
 
         model_tgt = llama_init->model();
         ctx_tgt   = llama_init->context();
@@ -1244,9 +1226,31 @@ private:
 
         vocab = llama_model_get_vocab(model_tgt);
 
-        n_ctx = llama_n_ctx(ctx_tgt);
-
         add_bos_token = llama_vocab_get_add_bos(vocab);
+
+#if defined(LLAMA_SERVER_SMT_MTMD)
+        if (use_multi_asr) {
+            try {
+                smt_asr_service = std::make_unique<smt_multi_asr_service>();
+                smt_asr_service->init(model_tgt, params_base);
+                ctx_tgt = smt_asr_service->context();
+                if (ctx_tgt == nullptr) {
+                    throw std::runtime_error("multi-ASR scheduler did not create a decoder context");
+                }
+                SRV_INF("%s", "initialized internal SMT multi-ASR scheduler (serial encoder + continuous-batch decoder)\n");
+            } catch (const std::exception & e) {
+                SRV_ERR("failed to initialize SMT multi-ASR scheduler: %s\n", e.what());
+                smt_asr_service.reset();
+                return false;
+            }
+        }
+#endif
+
+        if (ctx_tgt == nullptr) {
+            SRV_ERR("%s", "failed to create llama context\n");
+            return false;
+        }
+        n_ctx = llama_n_ctx(ctx_tgt);
 
         if (has_spec) {
             // spec_mtp doesn't use load a model internally, so we report 0.0 and 1.0 manually
@@ -4066,7 +4070,6 @@ server_context_meta server_context::get_meta() const {
 #if defined(LLAMA_SERVER_SMT_MTMD)
     has_mtmd = has_mtmd || impl->smt_asr_service != nullptr;
 #endif
-
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
@@ -4159,31 +4162,25 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
     int32_t sse_ping_interval = params.sse_ping_interval;
 
     try {
-        // Audio-only SMT requests use the isolated legacy ASR orchestrator.
-        // This synchronous facade is intentionally ahead of task creation:
-        // no server slot, PEG parser, prompt cache, or shared KV sequence is
-        // touched by these requests.
 #if defined(LLAMA_SERVER_SMT_MTMD)
-        const std::string raw_prompt = data.contains("prompt") && data.at("prompt").is_string()
-                ? data.at("prompt").get<std::string>() : std::string();
-        // oaicompat_chat_params_parse() has already decoded input_audio into
-        // `files`; chat-template rendering may remove the media marker from
-        // the resulting prompt, so do not use the rendered text to decide
-        // whether this is an audio request.
-        const bool has_audio_media = !files.empty();
-        if (ctx_server.smt_asr_service && has_audio_media) {
-            multi_asr_request asr_result;
-            const int32_t n_predict = json_value(data, "max_tokens", 256);
-            const std::string user_prompt = raw_prompt;
-            const bool ok = ctx_server.smt_asr_service->submit(files.front(), user_prompt, n_predict, asr_result);
-            if (!ok) {
-                res->error(format_error_response(asr_result.error.empty() ? "ASR request failed" : asr_result.error,
+        // Audio-only Qwen3-ASR requests are owned by the ASR scheduler. The
+        // generic server slot path is intentionally bypassed: it knows how to
+        // batch text tokens, but must not interleave audio embedding prefill
+        // with another request's decoder batch.
+        if (ctx_server.smt_asr_service != nullptr && !files.empty()) {
+            const std::string prompt_text = data.contains("prompt") && data.at("prompt").is_string()
+                    ? data.at("prompt").get<std::string>() : std::string();
+            multi_asr_request result;
+            const int32_t n_predict = json_value(data, "max_tokens", params.n_predict > 0 ? params.n_predict : 256);
+            result.temperature = json_value(data, "temperature", 0.0f);
+            if (!ctx_server.smt_asr_service->submit(files.front(), prompt_text, n_predict, result)) {
+                res->error(format_error_response(result.error.empty() ? "ASR request failed" : result.error,
                                                  ERROR_TYPE_SERVER));
                 return res;
             }
             const json choice = {
                 {"index", 0},
-                {"message", {{"role", "assistant"}, {"content", asr_result.text}}},
+                {"message", {{"role", "assistant"}, {"content", result.text}}},
                 {"finish_reason", "stop"},
             };
             res->ok({
@@ -4192,17 +4189,17 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
                 {"created", std::time(nullptr)},
                 {"model", meta->model_name},
                 {"choices", json::array({choice})},
-                {"usage", {{"prompt_tokens", asr_result.timings.n_audio_tokens},
-                            {"completion_tokens", asr_result.timings.n_out_tokens},
-                            {"total_tokens", asr_result.timings.n_audio_tokens + asr_result.timings.n_out_tokens}}},
+                {"usage", {{"prompt_tokens", result.timings.n_audio_tokens},
+                            {"completion_tokens", result.timings.n_out_tokens},
+                            {"total_tokens", result.timings.n_audio_tokens + result.timings.n_out_tokens}}},
                 {"multi_asr_timings", {
-                    {"queue_ms", asr_result.timings.queue_ms},
-                    {"encode_ms", asr_result.timings.encode_ms},
-                    {"prefill_ms", asr_result.timings.prefill_ms},
-                    {"decode_ms", asr_result.timings.decode_ms},
-                    {"total_ms", asr_result.timings.total_ms},
-                    {"n_audio_tokens", asr_result.timings.n_audio_tokens},
-                    {"n_out_tokens", asr_result.timings.n_out_tokens},
+                    {"queue_ms", result.timings.queue_ms},
+                    {"encode_ms", result.timings.encode_ms},
+                    {"prefill_ms", result.timings.prefill_ms},
+                    {"decode_ms", result.timings.decode_ms},
+                    {"total_ms", result.timings.total_ms},
+                    {"n_audio_tokens", result.timings.n_audio_tokens},
+                    {"n_out_tokens", result.timings.n_out_tokens},
                 }},
             });
             return res;

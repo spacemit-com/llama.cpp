@@ -5,9 +5,7 @@
 
 #include <memory>
 
-// Server-facing facade for the legacy, correctness-proven ASR pipeline.
-// The facade deliberately does not expose llama-server slots or media chunks:
-// requests are admitted FIFO and decoded by the private legacy context.
+// Thin HTTP-facing facade over the ASR-owned encoder/decoder scheduler.
 class smt_multi_asr_service {
   public:
     smt_multi_asr_service() = default;
@@ -19,6 +17,7 @@ class smt_multi_asr_service {
     void init(llama_model * model, const common_params & server_params);
     bool submit(const std::vector<uint8_t> & audio, const std::string & prompt,
                 int32_t n_predict, multi_asr_request & result);
+    llama_context * context() const;
 
   private:
     std::unique_ptr<multi_asr_orchestrator> orchestrator_;
