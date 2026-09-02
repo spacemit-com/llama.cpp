@@ -4,6 +4,7 @@
 #include "spacemit_spert_adapter.h"
 
 #include "ggml-cpu-impl.h"
+#include "ime_env.h"
 
 // spine-runtime public headers (release package: SPERT_DIR/include).
 // spert_abi.h  : the stable C ABI (spine_require_stream / spine_parallel_dispatch_1d /
@@ -15,6 +16,7 @@
 #include "spert_engine.hpp"
 
 #include <cstdio>
+#include <vector>
 
 // Thread-local tile handle for the AI core currently running the graph kernel.
 // Set before calling the graph callback, cleared after. The C ABI passes the
@@ -67,7 +69,23 @@ int spacemit_spert_launch_graph_kernel(void (*graph_kernel_fn)(int ith, int nth,
     // compute and release it on return. Keeping a stream alive across calls would pin those
     // cores forever and starve other backends (e.g. the ONNX runtime used for multimodal
     // inference); scoping it to this call releases the cores between graph computes.
-    int64_t stream = spine_require_stream_with_config(n_tiles, nullptr);
+    const auto & preferred_core_ids =
+        ggml::cpu::riscv64_spacemit::global_spine_env_info.perfer_core_ids;
+    if (n_tiles <= 0 || static_cast<size_t>(n_tiles) > preferred_core_ids.size()) {
+        fprintf(stderr,
+                "[spert_adapter] invalid tile count %d for %zu preferred cores\n",
+                n_tiles,
+                preferred_core_ids.size());
+        return -1;
+    }
+
+    std::vector<int64_t> core_ids;
+    core_ids.reserve(static_cast<size_t>(n_tiles));
+    for (int i = 0; i < n_tiles; ++i) {
+        core_ids.push_back(preferred_core_ids[static_cast<size_t>(i)]);
+    }
+
+    int64_t stream = spine_require_stream_with_config(n_tiles, core_ids.data());
     if (!stream) {
         fprintf(stderr, "[spert_adapter] spine_require_stream_with_config failed\n");
         return -1;
