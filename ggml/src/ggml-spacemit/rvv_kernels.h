@@ -65,11 +65,24 @@ void forward_cpy_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op);
 template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 template <ggml_op op_type, typename T> void forward_binary(ggml::spacemit::context & ctx, ggml_tensor * op);
 
+void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_tanh_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_exp_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_sigmoid_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_neg_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_unary_softplus_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
+template <typename T> void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 void forward_glu_swiglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op);

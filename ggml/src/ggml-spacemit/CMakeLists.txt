@@ -1,15 +1,17 @@
 set(TARGET_NAME ggml-spacemit)
 
-# spine-runtime is a hard dependency (submodule at thirdparty/spine-runtime)
-get_filename_component(SPINE_RUNTIME_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../../../thirdparty/spine-runtime" ABSOLUTE)
-if(NOT EXISTS "${SPINE_RUNTIME_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "spine-runtime submodule not found at ${SPINE_RUNTIME_DIR}. Run: git submodule update --init --recursive")
+# spine-runtime is consumed as a prebuilt release package.
+if(NOT DEFINED SPERT_DIR AND DEFINED ENV{SPERT_DIR})
+    set(SPERT_DIR "$ENV{SPERT_DIR}")
 endif()
-
-# Build spine-runtime as a static library and link it in
-set(SPINE_RUNTIME_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(SPINE_RUNTIME_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-add_subdirectory(${SPINE_RUNTIME_DIR} ${CMAKE_BINARY_DIR}/spine-runtime-build)
+if(NOT SPERT_DIR)
+    message(FATAL_ERROR "SPERT_DIR is not set. Point it at the extracted spine-runtime release (with include/ and lib/).")
+endif()
+if(NOT IS_DIRECTORY "${SPERT_DIR}/include" OR NOT IS_DIRECTORY "${SPERT_DIR}/lib")
+    message(FATAL_ERROR "Invalid SPERT_DIR at ${SPERT_DIR}: expected include/ and lib/")
+endif()
+find_library(SPERT_LIB NAMES spert PATHS "${SPERT_DIR}/lib" NO_CMAKE_FIND_ROOT_PATH REQUIRED)
+message(STATUS "SpacemiT backend using spine-runtime at ${SPERT_DIR} (${SPERT_LIB})")
 
 # The standalone backend owns the SpacemiT kernels and dispatch path.
 if(GGML_SPACEMIT AND GGML_CPU_RISCV64_SPACEMIT)
@@ -52,24 +54,31 @@ ggml_add_backend_library(${TARGET_NAME}
     ime1_kernels.cpp
     ime2_kernels.cpp
     rvv_kernels.cpp
+    scalar_kernels.cpp
     repack.cpp
     spacemit-context.h
     spacemit-env.h
     spine_mem_pool.cpp
     ../../include/ggml-spacemit.h)
 
-target_link_libraries(${TARGET_NAME} PRIVATE spert)
+target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB})
+target_link_directories(${TARGET_NAME} PUBLIC "${SPERT_DIR}/lib")
+target_link_options(${TARGET_NAME} PUBLIC "-Wl,-rpath-link,${SPERT_DIR}/lib")
 
 target_include_directories(${TARGET_NAME} PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/../ggml-cpu
-    ${SPINE_RUNTIME_DIR}/include)
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+    ${SPERT_DIR}/include)
 
 target_compile_definitions(${TARGET_NAME} PRIVATE
     ${RISCV64_SPACEMIT_IME_SPEC}
 )
+if (GGML_BUILD_PROFILE)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_BUILD_PROFILE)
+endif()
 
-# Pass the full march string to both targets
+# Pass the full march string to the backend target.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb")
     if(RISCV64_SPACEMIT_IME_SPEC MATCHES "IME" AND
@@ -77,6 +86,5 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
         CMAKE_CXX_COMPILER_ID MATCHES "Clang"))
         set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii")
     endif()
-    target_compile_options(spert PRIVATE -march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb)
     target_compile_options(${TARGET_NAME} PRIVATE ${SPACEMIT_MARCH})
 endif()

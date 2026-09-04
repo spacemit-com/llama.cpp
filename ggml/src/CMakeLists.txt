@@ -206,6 +206,8 @@ add_library(ggml-base
             ggml-threading.h
             ggml-quants.c
             ggml-quants.h
+            ggml-profile.c
+            ../include/ggml-profile.h
             gguf.cpp)
 
 set_target_properties(ggml-base PROPERTIES
@@ -214,6 +216,9 @@ set_target_properties(ggml-base PROPERTIES
 )
 
 target_include_directories(ggml-base PRIVATE .)
+if (GGML_BUILD_PROFILE)
+    target_compile_definitions(ggml-base PUBLIC GGML_BUILD_PROFILE)
+endif()
 if (GGML_BACKEND_DL)
     target_compile_definitions(ggml-base PUBLIC GGML_BACKEND_DL)
 endif()

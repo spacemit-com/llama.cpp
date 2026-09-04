@@ -29,6 +29,7 @@
 #include "rvv_kernels.h"
 
 #include "ggml-cpu.h"
+#include "ggml-profile.h"
 
 // spine-runtime C++ API (hard dependency)
 #include <spert.hpp>
@@ -374,7 +375,7 @@ static size_t ggml_backend_spacemit_buffer_type_get_alloc_size(ggml_backend_buff
 }
 
 static bool ggml_backend_spacemit_buffer_type_is_host(ggml_backend_buffer_type_t buft) {
-    return true;
+    return false;
     GGML_UNUSED(buft);
 }
 
@@ -466,9 +467,14 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         spert::Grid{(uint32_t)n_threads},
         [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
-            auto shared = shared_mem_size > 0 ? runtime->alloc_shared(shared_mem_size) : spert::SharedBufferView{};
-            if (shared_mem_size > 0 && !shared) {
-                throw std::runtime_error("ggml-spacemit: failed to allocate shared memory");
+            // Match the old ggml-cpu/spacemit path: use the complete
+            // worker-local TCM buffer directly.  alloc_shared() is a
+            // dynamic sub-allocation API and is not equivalent here; it
+            // adds allocator bookkeeping and can select a different shared
+            // pool block layout than the original RVV kernels expect.
+            auto shared = shared_mem_size > 0 ? runtime->shared_buffer() : spert::SharedBufferView{};
+            if (shared_mem_size > 0 && (!shared || shared.size < shared_mem_size)) {
+                throw std::runtime_error("ggml-spacemit: worker shared buffer unavailable");
             }
 
             const uint32_t ith = runtime->program_id(0);
@@ -482,10 +488,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                     continue;
                 }
 
+                ggml_profile_log_spacemit_op_begin(node, (int) ith, (int) runtime->grid_dim(0));
+
                 if (!ggml_spacemit_compute_forward(ctx, node)) {
                     throw std::runtime_error(std::string("ggml-spacemit: failed to dispatch op ") +
                                              ggml_op_desc(node) + " (" + ggml_type_name(node->type) + ")");
                 }
+                ggml_profile_log_spacemit_op_end(node, (int) ith, (int) runtime->grid_dim(0));
 
                 // Every core must finish the current node before any core starts
                 // the next one. A bounded pointer look-ahead is not sufficient:
@@ -493,9 +502,6 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 ctx.sync();
             }
 
-            if (shared) {
-                runtime->free_shared(shared);
-            }
             ctx.clear();
         }
     );
@@ -629,6 +635,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             supp = true;
             break;
 
+        case GGML_OP_SCALE:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_RMS_NORM:
@@ -647,7 +654,18 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
         case GGML_OP_CONT:
         case GGML_OP_REPEAT:
         case GGML_OP_SUM_ROWS:
+        case GGML_OP_SOFT_MAX:
         case GGML_OP_FLASH_ATTN_EXT:
+        case GGML_OP_L2_NORM:
+        case GGML_OP_FILL:
+        case GGML_OP_CUMSUM:
+        case GGML_OP_PAD:
+        case GGML_OP_TRI:
+        case GGML_OP_DIAG:
+        case GGML_OP_SET:
+        case GGML_OP_SOLVE_TRI:
+        case GGML_OP_GATED_DELTA_NET:
+        case GGML_OP_SSM_CONV:
             supp = ggml_spacemit_get_tensor_traits(op) != nullptr;
             break;
 

@@ -55,7 +55,10 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         )
 
     target_compile_features(${GGML_CPU_NAME} PRIVATE c_std_11 cxx_std_17)
-    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu)
+    target_include_directories(${GGML_CPU_NAME} PRIVATE . ggml-cpu ../../include)
+    if (GGML_BUILD_PROFILE)
+        target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_BUILD_PROFILE)
+    endif()
 
     if (APPLE AND GGML_ACCELERATE)
         find_library(ACCELERATE_FRAMEWORK Accelerate)

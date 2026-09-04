@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
 #    error "riscv v extension or v_intrinsic not enabled"
@@ -582,13 +583,14 @@ static inline void rvv_qk_dot_tile(float *       dst,
                                    const float * q_row,
                                    const float * k_pack,
                                    int64_t       dk,
+                                   int64_t       kv_stride,
                                    int64_t       kv_tile,
                                    float         scale) {
     const size_t vl  = __riscv_vsetvl_e32m4(kv_tile);
     vfloat32m4_t acc = __riscv_vfmv_v_f_f32m4(0.0f, vl);
 
     for (int64_t d = 0; d < dk; ++d) {
-        const vfloat32m4_t k_vec = __riscv_vle32_v_f32m4(k_pack + d * kv_tile, vl);
+        const vfloat32m4_t k_vec = __riscv_vle32_v_f32m4(k_pack + d * kv_stride, vl);
         acc                      = __riscv_vfmacc_vf_f32m4(acc, q_row[d] * scale, k_vec, vl);
     }
 
@@ -1452,53 +1454,61 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
         for (int64_t ic = 0; ic < nek1; ic += KV_TILE_SZ) {
             const int kv_tile = (int) std::min((int64_t) KV_TILE_SZ, nek1 - ic);
+            int       active_kv[Q_TILE_SZ];
+            int       max_active_kv = kv_tile;
 
             rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
             rvv_zero_f32(V32, KV_TILE_SZ * DV);
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
-                bool                can_skip = true;
                 const ggml_fp16_t * mp_row =
                     (const ggml_fp16_t *) ((const char *) mask->data + iq1 * mask->nb[1] +
                                            (iq2 % mask->ne[2]) * mask->nb[2] + (iq3 % mask->ne[3]) * mask->nb[3]);
                 rvv_pack_scaled_f16_as_f32(mask32, KV_TILE_SZ * sizeof(float), mp_row + ic, mask->nb[1], tile_rows,
                                            kv_tile, slope);
 
+                max_active_kv = 0;
                 for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = 0; tk < kv_tile; tk++) {
-                        if (mask32[tq * KV_TILE_SZ + tk] != -INFINITY) {
-                            can_skip = false;
-                        }
+                    int tk = kv_tile;
+                    while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
+                        --tk;
                     }
-                    // Pad remaining mask entries with -inf
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        mask32[tq * KV_TILE_SZ + tk] = -INFINITY;
-                    }
+                    active_kv[tq] = tk;
+                    max_active_kv = std::max(max_active_kv, tk);
                 }
 
-                if (can_skip) {
+                if (max_active_kv == 0) {
                     continue;
                 }
+            } else {
+                std::fill_n(active_kv, tile_rows, kv_tile);
             }
 
             if (kv_type == GGML_TYPE_F16) {
                 rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
-                                            (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1, kv_tile,
+                                            (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1,
+                                            max_active_kv,
                                             DK);
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
-                    rvv_qk_dot_tile_f16_x4(KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
-                                           KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
-                                           Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK, Q_f16 + (tq + 2) * DK,
-                                           Q_f16 + (tq + 3) * DK, K_f16, DK, kv_tile);
+                    const int group_active = std::max(std::max(active_kv[tq + 0], active_kv[tq + 1]),
+                                                      std::max(active_kv[tq + 2], active_kv[tq + 3]));
+                    if (group_active > 0) {
+                        rvv_qk_dot_tile_f16_x4(KQ + (tq + 0) * KV_TILE_SZ, KQ + (tq + 1) * KV_TILE_SZ,
+                                               KQ + (tq + 2) * KV_TILE_SZ, KQ + (tq + 3) * KV_TILE_SZ,
+                                               Q_f16 + (tq + 0) * DK, Q_f16 + (tq + 1) * DK, Q_f16 + (tq + 2) * DK,
+                                               Q_f16 + (tq + 3) * DK, K_f16, DK, group_active);
+                    }
                 }
                 for (; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, kv_tile);
+                    if (active_kv[tq] > 0) {
+                        rvv_qk_dot_tile_f16_x1(KQ + tq * KV_TILE_SZ, Q_f16 + tq * DK, K_f16, DK, active_kv[tq]);
+                    }
                 }
             } else {
-                for (int tk = 0; tk < kv_tile; tk++) {
+                for (int tk = 0; tk < max_active_kv; tk++) {
                     const char *  k_data = (const char *) k->data + (ic + tk) * nbk1 + ik2 * nbk2 + ik3 * nbk3;
                     float *       k_col  = K_f32 + tk;
                     const float * k_src  = (const float *) k_data;
@@ -1508,33 +1518,32 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
 
                 for (int tq = 0; tq < tile_rows; ++tq) {
-                    rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, scale);
-                }
-            }
-
-            // Set padded KQ entries to -inf so softmax gives them zero weight
-            if (kv_tile < KV_TILE_SZ) {
-                for (int tq = 0; tq < tile_rows; tq++) {
-                    for (int tk = kv_tile; tk < KV_TILE_SZ; tk++) {
-                        KQ[tq * KV_TILE_SZ + tk] = -INFINITY;
+                    if (active_kv[tq] > 0) {
+                        rvv_qk_dot_tile(KQ + tq * KV_TILE_SZ, Q_f32 + tq * DK, K_f32, DK, KV_TILE_SZ, active_kv[tq],
+                                       scale);
                     }
                 }
-            }
-
-            if (logit_softcap != 0.0f) {
-                rvv_softcap_tanh_inplace_f32(KQ, KV_TILE_SZ, tile_rows, KV_TILE_SZ, logit_softcap);
-            }
-
-            if (mask) {
-                rvv_add_inplace_f32(KQ, KV_TILE_SZ, mask32, KV_TILE_SZ, tile_rows, KV_TILE_SZ);
             }
 
             bool skip[Q_TILE_SZ] = {};
 
             for (int tq = 0; tq < tile_rows; tq++) {
                 float * kq_row = KQ + tq * KV_TILE_SZ;
+                const int row_active = active_kv[tq];
 
-                const float tile_max = rvv_max_f32(kq_row, KV_TILE_SZ);
+                if (row_active == 0) {
+                    skip[tq] = true;
+                    continue;
+                }
+
+                if (logit_softcap != 0.0f) {
+                    rvv_softcap_tanh_inplace_f32(kq_row, KV_TILE_SZ, 1, row_active, logit_softcap);
+                }
+                if (mask) {
+                    rvv_add_inplace_f32(kq_row, KV_TILE_SZ, mask32 + tq * KV_TILE_SZ, KV_TILE_SZ, 1, row_active);
+                }
+
+                const float tile_max = rvv_max_f32(kq_row, row_active);
 
                 if (tile_max == -INFINITY) {
                     skip[tq] = true;
@@ -1551,13 +1560,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 }
                 M[tq] = Mnew;
 
-                S[tq] += rvv_softmax_exp_inplace_f32(kq_row, KV_TILE_SZ, Mnew);
+                S[tq] += rvv_softmax_exp_inplace_f32(kq_row, row_active, Mnew);
             }
 
             // Pack V as contiguous [KV_TILE_SZ][DV].
             if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, kv_tile, DV * sizeof(_Float16));
+                memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 
                 int tq = 0;
                 for (; tq + 3 < tile_rows; tq += 4) {
@@ -1565,29 +1574,35 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                         for (int i = 0; i < 4; ++i) {
                             if (!skip[tq + i]) {
                                 rvv_pv_accumulate_f16_x1(VKQ32 + (tq + i) * DV, KQ + (tq + i) * KV_TILE_SZ, V_f16,
-                                                         KV_TILE_SZ, DV);
+                                                         active_kv[tq + i], DV);
                             }
                         }
                         continue;
                     }
 
+                    const int group_active = std::max(std::max(active_kv[tq + 0], active_kv[tq + 1]),
+                                                      std::max(active_kv[tq + 2], active_kv[tq + 3]));
+                    for (int i = 0; i < 4; ++i) {
+                        std::fill(KQ + (tq + i) * KV_TILE_SZ + active_kv[tq + i],
+                                  KQ + (tq + i) * KV_TILE_SZ + group_active, 0.0f);
+                    }
                     rvv_pv_accumulate_f16_x4(VKQ32 + (tq + 0) * DV, VKQ32 + (tq + 1) * DV, VKQ32 + (tq + 2) * DV,
                                              VKQ32 + (tq + 3) * DV, KQ + (tq + 0) * KV_TILE_SZ,
                                              KQ + (tq + 1) * KV_TILE_SZ, KQ + (tq + 2) * KV_TILE_SZ,
-                                             KQ + (tq + 3) * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
+                                             KQ + (tq + 3) * KV_TILE_SZ, V_f16, group_active, DV);
                 }
                 for (; tq < tile_rows; ++tq) {
                     if (!skip[tq]) {
-                        rvv_pv_accumulate_f16_x1(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V_f16, KV_TILE_SZ, DV);
+                        rvv_pv_accumulate_f16_x1(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V_f16, active_kv[tq], DV);
                     }
                 }
             } else {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
-                memcpy2d(V32, DV * sizeof(float), v_data, nbv1, kv_tile, DV * sizeof(float));
+                memcpy2d(V32, DV * sizeof(float), v_data, nbv1, max_active_kv, DV * sizeof(float));
 
                 for (int tq = 0; tq < tile_rows; ++tq) {
                     if (!skip[tq]) {
-                        rvv_pv_accumulate(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, KV_TILE_SZ, DV);
+                        rvv_pv_accumulate(VKQ32 + tq * DV, KQ + tq * KV_TILE_SZ, V32, active_kv[tq], DV);
                     }
                 }
             }
@@ -3051,7 +3066,7 @@ template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_
 
     assert(ne0 == nc);
     assert(ne02 == ne11);
-    assert(nb00 == sizeof(float));
+    assert(nb00 == sizeof(T));
     assert(ggml_nrows(op) == nr);
 
     const int ith = ctx.ith;
@@ -3098,13 +3113,13 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
     const ggml_tensor * src1 = op->src[1];
     ggml_tensor *       dst  = op;
 
-    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(float));
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T));
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int32_t dim = ggml_get_op_params_i32(dst, 0);
 
-    GGML_ASSERT(dim == 0 && nb0 == sizeof(float) && nb1 == sizeof(float) * (ne00 + ne10));
+    GGML_ASSERT(dim == 0 && nb0 == sizeof(T) && nb1 == sizeof(T) * (ne00 + ne10));
 
     const int64_t nr = ggml_nrows(dst);
     const int64_t nc = ne0;
@@ -3135,7 +3150,7 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
 
     int64_t o[4] = { 0, 0, 0, 0 };
     o[dim]       = src0->ne[dim];
-    const float * x;
+    const T * x;
 
     for (int64_t i = ir0; i < ir1; ++i) {
         const int64_t i3 = i / (ne02 * ne01);
@@ -3144,16 +3159,315 @@ template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_te
 
         for (int i0 = cr0; i0 < cr1; i0++) {
             if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
-                x = (const float *) ((const char *) src0->data + (i0) *nb00 + (i1) *nb01 + (i2) *nb02 + (i3) *nb03);
+                x = (const T *) ((const char *) src0->data + (i0) *nb00 + (i1) *nb01 + (i2) *nb02 + (i3) *nb03);
             } else {
-                x = (const float *) ((const char *) src1->data + (i0 - o[0]) * nb10 + (i1 - o[1]) * nb11 +
+                x = (const T *) ((const char *) src1->data + (i0 - o[0]) * nb10 + (i1 - o[1]) * nb11 +
                                      (i2 - o[2]) * nb12 + (i3 - o[3]) * nb13);
             }
 
-            float * y = (float *) ((char *) dst->data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
+            T * y = (T *) ((char *) dst->data + i0 * nb0 + i1 * nb1 + i2 * nb2 + i3 * nb3);
 
             *y = *x;
         }
+    }
+}
+
+struct rvv_gdn_decay_dots_f32 {
+    float state_k;
+    float state_q;
+};
+
+static inline float rvv_gdn_dot_f32(const float * x, const float * y, int64_t n) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    const vfloat32m8_t xv = __riscv_vle32_v_f32m8(x, vl);
+    const vfloat32m8_t yv = __riscv_vle32_v_f32m8(y, vl);
+    const vfloat32m8_t prod = __riscv_vfmul_vv_f32m8(xv, yv, vl);
+    vfloat32m1_t sum = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    sum = __riscv_vfredusum_vs_f32m8_f32m1(prod, sum, vl);
+    return __riscv_vfmv_f_s_f32m1_f32(sum);
+}
+
+static inline rvv_gdn_decay_dots_f32 rvv_gdn_decay_dots_f32_impl(float *       state,
+                                                                   const float * decay,
+                                                                   float         decay_scalar,
+                                                                   const float * k,
+                                                                   const float * q,
+                                                                   int64_t       n,
+                                                                   bool          kda) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    vfloat32m8_t s  = __riscv_vle32_v_f32m8(state, vl);
+    if (kda) {
+        const vfloat32m8_t d = __riscv_vle32_v_f32m8(decay, vl);
+        s = __riscv_vfmul_vv_f32m8(s, d, vl);
+    } else {
+        s = __riscv_vfmul_vf_f32m8(s, decay_scalar, vl);
+    }
+    __riscv_vse32_v_f32m8(state, s, vl);
+
+    const vfloat32m8_t kv = __riscv_vle32_v_f32m8(k, vl);
+    const vfloat32m8_t qv = __riscv_vle32_v_f32m8(q, vl);
+    vfloat32m1_t sum_k = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    vfloat32m1_t sum_q = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+    sum_k = __riscv_vfredusum_vs_f32m8_f32m1(__riscv_vfmul_vv_f32m8(s, kv, vl), sum_k, vl);
+    sum_q = __riscv_vfredusum_vs_f32m8_f32m1(__riscv_vfmul_vv_f32m8(s, qv, vl), sum_q, vl);
+    return { __riscv_vfmv_f_s_f32m1_f32(sum_k), __riscv_vfmv_f_s_f32m1_f32(sum_q) };
+}
+
+static inline void rvv_gdn_update_f32(float * state, const float * k, float delta, int64_t n) {
+    const size_t vl = __riscv_vsetvl_e32m8(n);
+    vfloat32m8_t s  = __riscv_vle32_v_f32m8(state, vl);
+    const vfloat32m8_t kv = __riscv_vle32_v_f32m8(k, vl);
+    s = __riscv_vfmacc_vf_f32m8(s, delta, kv, vl);
+    __riscv_vse32_v_f32m8(state, s, vl);
+}
+
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src_q     = op->src[0];
+    const ggml_tensor * src_k     = op->src[1];
+    const ggml_tensor * src_v     = op->src[2];
+    const ggml_tensor * src_g     = op->src[3];
+    const ggml_tensor * src_beta  = op->src[4];
+    const ggml_tensor * src_state = op->src[5];
+
+    const int64_t S_v      = src_v->ne[0];
+    const int64_t H        = src_v->ne[1];
+    const int64_t n_tokens = src_v->ne[2];
+    const int64_t n_seqs   = src_v->ne[3];
+    const int64_t K        = ggml_get_op_params_i32(op, 0);
+    GGML_ASSERT(K >= 1 && S_v <= (int64_t) __riscv_vsetvlmax_e32m8());
+
+    const int64_t nr  = H * n_seqs;
+    const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
+    const int64_t ir0 = dr * ctx.ith;
+    const int64_t ir1 = std::min(nr, ir0 + dr);
+
+    const int64_t state_seq_stride = src_state->nb[3] / sizeof(float);
+    const int64_t attn_score_elems = S_v * H * n_tokens * n_seqs;
+    const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
+    float *       attn_out_base  = (float *) op->data;
+    float *       state_out_base = attn_out_base + attn_score_elems;
+    const float * state_in_base  = (const float *) src_state->data;
+
+    const float scale = 1.0f / sqrtf((float) S_v);
+    const bool  kda   = src_g->ne[0] == S_v;
+    // KDA needs the per-column decay vector for every state row, so keep it
+    // separate from the row-wise delta values that are produced in-place.
+    std::vector<float> scratch((size_t) (3 * S_v + (K > 1 ? S_v * S_v : 0)));
+    float * delta      = scratch.data();
+    float * decay      = delta + S_v;
+    float * state_q     = decay + S_v;
+    float * state_work  = K > 1 ? state_q + S_v : nullptr;
+
+    const int64_t rq3 = src_v->ne[3] / src_q->ne[3];
+    const int64_t rk3 = src_v->ne[3] / src_k->ne[3];
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t iv1 = ir % H;
+        const int64_t iv3 = ir / H;
+        const int64_t iq1 = iv1 % src_q->ne[1];
+        const int64_t ik1 = iv1 % src_k->ne[1];
+        const int64_t iq3 = iv3 / rq3;
+        const int64_t ik3 = iv3 / rk3;
+
+        float * s_out = K > 1 ? state_work : state_out_base + (iv3 * H + iv1) * S_v * S_v;
+        const float * s_in = state_in_base + iv3 * state_seq_stride + iv1 * S_v * S_v;
+        memcpy(s_out, s_in, (size_t) (S_v * S_v) * sizeof(float));
+
+        float * attn_data = attn_out_base + (iv3 * n_tokens * H + iv1) * S_v;
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            const float * q = (const float *) ((const char *) src_q->data + iq3 * src_q->nb[3] +
+                                                t * src_q->nb[2] + iq1 * src_q->nb[1]);
+            const float * k = (const float *) ((const char *) src_k->data + ik3 * src_k->nb[3] +
+                                                t * src_k->nb[2] + ik1 * src_k->nb[1]);
+            const float * v = (const float *) ((const char *) src_v->data + iv3 * src_v->nb[3] +
+                                                t * src_v->nb[2] + iv1 * src_v->nb[1]);
+            const float beta = *(const float *) ((const char *) src_beta->data + iv3 * src_beta->nb[3] +
+                                                  t * src_beta->nb[2] + iv1 * src_beta->nb[1]);
+            const float * g = (const float *) ((const char *) src_g->data + iv3 * src_g->nb[3] +
+                                                t * src_g->nb[2] + iv1 * src_g->nb[1]);
+
+            const float kq = rvv_gdn_dot_f32(k, q, S_v);
+
+            float decay_scalar = 0.0f;
+            if (kda) {
+                for (int64_t i = 0; i < S_v; ++i) decay[i] = expf(g[i]);
+            } else {
+                decay_scalar = expf(g[0]);
+            }
+
+            for (int64_t j = 0; j < S_v; ++j) {
+                const auto dots = rvv_gdn_decay_dots_f32_impl(s_out + j * S_v, decay, decay_scalar, k, q, S_v, kda);
+                delta[j] = (v[j] - dots.state_k) * beta;
+                state_q[j] = dots.state_q;
+            }
+            for (int64_t j = 0; j < S_v; ++j) {
+                rvv_gdn_update_f32(s_out + j * S_v, k, delta[j], S_v);
+                attn_data[j] = (state_q[j] + delta[j] * kq) * scale;
+            }
+            attn_data += S_v * H;
+
+            if (K > 1) {
+                const int64_t target_slot = n_tokens - 1 - t;
+                if (target_slot >= 0 && target_slot < K) {
+                    float * state_snapshot = state_out_base + target_slot * state_size_per_snap +
+                                             (iv3 * H + iv1) * S_v * S_v;
+                    memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                }
+            }
+        }
+    }
+}
+
+void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    float scale;
+    memcpy(&scale, op->op_params, sizeof(float));
+
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t ne0 = src0->ne[0], ne1 = src0->ne[1],
+                  ne2 = src0->ne[2], ne3 = src0->ne[3];
+    const int64_t nrows = ne1 * ne2 * ne3;
+    const int64_t dr    = (nrows + nth - 1) / nth;
+    const int64_t ir0   = dr * ith;
+    const int64_t ir1   = MIN(ir0 + dr, nrows);
+
+    for (int64_t ir = ir0; ir < ir1; ir++) {
+        const int64_t i3 = ir / (ne1 * ne2);
+        const int64_t i2 = (ir - i3 * ne1 * ne2) / ne1;
+        const int64_t i1 = ir % ne1;
+
+        const float * src_row = (const float *)((const char *)src0->data
+            + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+        float * dst_row = (float *)((char *)dst->data
+            + i1 * dst->nb[1] + i2 * dst->nb[2] + i3 * dst->nb[3]);
+
+        int64_t remaining = ne0;
+        while (remaining > 0) {
+            const size_t vl = __riscv_vsetvl_e32m4(remaining);
+            vfloat32m4_t v  = __riscv_vle32_v_f32m4(src_row, vl);
+            v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+            __riscv_vse32_v_f32m4(dst_row, v, vl);
+            src_row   += vl;
+            dst_row   += vl;
+            remaining -= vl;
+        }
+    }
+}
+
+void forward_cpy_strided_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne    = ggml_nelements(src0);
+    const int64_t ith   = ctx.ith;
+    const int64_t nth   = ctx.nth;
+    const int64_t dr    = (ne + nth - 1) / nth;
+    const int64_t i0    = dr * ith;
+    const int64_t i1    = MIN(i0 + dr, ne);
+
+    // A contiguous source can be copied with the RVV memcpy primitive, but
+    // CPY is also used for state/view updates where source and destination
+    // may alias.  Only take the flat-copy path when the complete byte ranges
+    // are disjoint; otherwise retain the coordinate-aware implementation
+    // below (which is safe for exact/self-overlapping views).
+    if (ggml_is_contiguous(src0)) {
+        const uintptr_t src_begin = reinterpret_cast<uintptr_t>(src0->data);
+        const uintptr_t dst_begin = reinterpret_cast<uintptr_t>(dst->data);
+        const uintptr_t bytes     = (uintptr_t) ne * sizeof(float);
+        const bool disjoint = dst_begin >= src_begin + bytes || src_begin >= dst_begin + bytes;
+        if (disjoint) {
+            memcpy1d((char *) dst->data + i0 * sizeof(float),
+                     (const char *) src0->data + i0 * sizeof(float),
+                     (i1 - i0) * sizeof(float));
+            return;
+        }
+    }
+
+    float *       dst_ptr = (float *) dst->data + i0;
+
+    for (int64_t i = i0; i < i1; i++) {
+        int64_t rem = i;
+        const int64_t i3_  = rem / (src0->ne[0] * src0->ne[1] * src0->ne[2]); rem -= i3_ * src0->ne[0] * src0->ne[1] * src0->ne[2];
+        const int64_t i2_  = rem / (src0->ne[0] * src0->ne[1]);                rem -= i2_ * src0->ne[0] * src0->ne[1];
+        const int64_t i1_  = rem / src0->ne[0];
+        const int64_t i0_  = rem % src0->ne[0];
+        const float * src_elem = (const float *)((const char *)src0->data
+            + i0_ * src0->nb[0] + i1_ * src0->nb[1]
+            + i2_ * src0->nb[2] + i3_ * src0->nb[3]);
+        dst_ptr[i - i0] = *src_elem;
+    }
+}
+
+void forward_cpy_f32_to_f16(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F16);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float *    sp = (const float *)    src0->data + i0;
+    _Float16 *       dp = (_Float16 *)       dst->data  + i0;
+
+    int64_t remaining = i1 - i0;
+    while (remaining > 0) {
+        const size_t     vl  = __riscv_vsetvl_e32m4(remaining);
+        vfloat32m4_t     v32 = __riscv_vle32_v_f32m4(sp, vl);
+        vfloat16m2_t     v16 = __riscv_vfncvt_f_f_w_f16m2(v32, vl);
+        __riscv_vse16_v_f16m2(dp, v16, vl);
+        sp        += vl;
+        dp        += vl;
+        remaining -= vl;
+    }
+}
+
+void forward_cpy_f16_to_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const _Float16 * sp = (const _Float16 *) src0->data + i0;
+    float *          dp = (float *)          dst->data  + i0;
+
+    int64_t remaining = i1 - i0;
+    while (remaining > 0) {
+        const size_t     vl  = __riscv_vsetvl_e16m2(remaining);
+        vfloat16m2_t     v16 = __riscv_vle16_v_f16m2(sp, vl);
+        vfloat32m4_t     v32 = __riscv_vfwcvt_f_f_v_f32m4(v16, vl);
+        __riscv_vse32_v_f32m4(dp, v32, vl);
+        sp        += vl;
+        dp        += vl;
+        remaining -= vl;
     }
 }
 
@@ -3225,6 +3539,261 @@ void forward_unary_gelu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+void forward_unary_silu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(dst) && ggml_are_same_shape(src0, dst));
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int64_t ne  = ggml_nelements(src0);
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (ne + nth - 1) / nth;
+    const int64_t i0 = dr * ith;
+    const int64_t i1 = MIN(i0 + dr, ne);
+
+    const float * src_ptr = (const float *) src0->data;
+    float *       dst_ptr = (float *) dst->data;
+
+    int64_t i = i0;
+    while (i < i1) {
+        const size_t     vl      = __riscv_vsetvl_e32m2(i1 - i);
+        vfloat32m2_t     x       = __riscv_vle32_v_f32m2(src_ptr + i, vl);
+        vfloat32m2_t     neg_x   = __riscv_vfneg_v_f32m2(x, vl);
+        vfloat32m2_t     exp_neg = rvv_expf_approx_f32m2(neg_x, vl);
+        vfloat32m2_t     denom   = __riscv_vfadd_vf_f32m2(exp_neg, 1.0f, vl);
+        vfloat32m2_t     out     = __riscv_vfdiv_vv_f32m2(x, denom, vl);
+        __riscv_vse32_v_f32m2(dst_ptr + i, out, vl);
+        i += vl;
+    }
+}
+
+// Helper macro: simple elementwise F32 unary kernel with RVV
+#define DEFINE_UNARY_F32_RVV(name, rvv_expr) \
+void name(ggml::spacemit::context & ctx, ggml_tensor * op) { \
+    const ggml_tensor * src0 = op->src[0]; \
+    ggml_tensor *       dst  = op; \
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32); \
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_are_same_shape(src0, dst)); \
+    const int64_t ne  = ggml_nelements(src0); \
+    const int64_t ith = ctx.ith, nth = ctx.nth; \
+    const int64_t dr  = (ne + nth - 1) / nth; \
+    const int64_t i0  = dr * ith, i1 = MIN(i0 + dr, ne); \
+    const float * sp  = (const float *) src0->data; \
+    float *       dp  = (float *)       dst->data; \
+    int64_t i = i0; \
+    while (i < i1) { \
+        const size_t vl = __riscv_vsetvl_e32m2(i1 - i); \
+        vfloat32m2_t v  = __riscv_vle32_v_f32m2(sp + i, vl); \
+        vfloat32m2_t r  = (rvv_expr); \
+        __riscv_vse32_v_f32m2(dp + i, r, vl); \
+        i += vl; \
+    } \
+}
+
+DEFINE_UNARY_F32_RVV(forward_unary_exp_f32,
+    rvv_expf_approx_f32m2(v, vl))
+DEFINE_UNARY_F32_RVV(forward_unary_sigmoid_f32,
+    __riscv_vfdiv_vv_f32m2(
+        __riscv_vfmv_v_f_f32m2(1.0f, vl),
+        __riscv_vfadd_vf_f32m2(rvv_expf_approx_f32m2(__riscv_vfneg_v_f32m2(v, vl), vl), 1.0f, vl),
+        vl))
+DEFINE_UNARY_F32_RVV(forward_unary_neg_f32,
+    __riscv_vfneg_v_f32m2(v, vl))
+DEFINE_UNARY_F32_RVV(forward_unary_softplus_f32,
+    /* softplus(x) = log(1 + exp(x)) */
+    __riscv_vfadd_vv_f32m2(
+        __riscv_vfmax_vf_f32m2(v, 0.0f, vl),
+        rvv_expf_approx_f32m2(
+            __riscv_vfneg_v_f32m2(__riscv_vfabs_v_f32m2(v, vl), vl), vl),
+        vl))
+
+void forward_soft_max_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    const int64_t ncols      = ne00;
+    const int64_t task_count = ne01 * ne02 * ne03;
+    const int64_t ith        = ctx.ith;
+    const int64_t nth        = ctx.nth;
+
+    const float scale = ggml_get_op_params_f32(op, 0);
+
+    const int64_t dr    = (task_count + nth - 1) / nth;
+    const int64_t row0  = dr * ith;
+    const int64_t row1  = MIN(row0 + dr, task_count);
+
+    for (int64_t row = row0; row < row1; row++) {
+        const int64_t i03 = row / (ne02 * ne01);
+        const int64_t i02 = (row - i03 * ne02 * ne01) / ne01;
+        const int64_t i01 = row - i03 * ne02 * ne01 - i02 * ne01;
+
+        const float * src_row = (const float *) ((const char *) src0->data
+            + i01 * nb01 + i02 * nb02 + i03 * nb03);
+        float * dst_row = (float *) ((const char *) dst->data
+            + i01 * nb1  + i02 * nb2  + i03 * nb3);
+
+        // find max
+        float max_val = -INFINITY;
+        {
+            int64_t n = ncols;
+            const float * p = src_row;
+            while (n > 0) {
+                const size_t     vl  = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t     v   = __riscv_vle32_v_f32m4(p, vl);
+                vfloat32m1_t     red = __riscv_vfredmax_vs_f32m4_f32m1(
+                    v, __riscv_vfmv_v_f_f32m1(-INFINITY, 1), vl);
+                float cur_max = __riscv_vfmv_f_s_f32m1_f32(red);
+                if (cur_max > max_val) max_val = cur_max;
+                p += vl;
+                n -= vl;
+            }
+        }
+        max_val *= scale;
+
+        // copy src*scale into dst, then compute exp(dst[i] - max_val) in-place and sum
+        {
+            int64_t       n  = ncols;
+            const float * sp = src_row;
+            float *       dp = dst_row;
+            while (n > 0) {
+                const size_t vl = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t v  = __riscv_vle32_v_f32m4(sp, vl);
+                v               = __riscv_vfmul_vf_f32m4(v, scale, vl);
+                __riscv_vse32_v_f32m4(dp, v, vl);
+                sp += vl;
+                dp += vl;
+                n  -= vl;
+            }
+        }
+        const float sum = rvv_softmax_exp_inplace_f32(dst_row, ncols, max_val);
+
+        // normalize
+        const float inv_sum = (sum > 0.0f) ? (1.0f / sum) : 0.0f;
+        {
+            int64_t n  = ncols;
+            float * dp = dst_row;
+            while (n > 0) {
+                const size_t vl = __riscv_vsetvl_e32m4(n);
+                vfloat32m4_t v  = __riscv_vle32_v_f32m4(dp, vl);
+                v               = __riscv_vfmul_vf_f32m4(v, inv_sum, vl);
+                __riscv_vse32_v_f32m4(dp, v, vl);
+                dp += vl;
+                n  -= vl;
+            }
+        }
+    }
+}
+
+// F16 weight (src0[K,M]) x F32 activation (src1[K,N]) -> F32 output (dst[M,N])
+// Parallel over output rows m across ctx.nth cores.
+void forward_mul_mat_f16_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F16 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(src0->nb[0] == sizeof(_Float16) && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+
+    const int64_t M   = src0->ne[1];
+    const int64_t K   = src0->ne[0];
+    const int64_t N   = src1->ne[1];
+    const int64_t ith = ctx.ith;
+    const int64_t nth = ctx.nth;
+
+    const int64_t dr = (M + nth - 1) / nth;
+    const int64_t m0 = ith * dr;
+    const int64_t m1 = MIN(m0 + dr, M);
+
+    for (int64_t m = m0; m < m1; ++m) {
+        const _Float16 * w_row = (const _Float16 *)((const char *)src0->data + m * src0->nb[1]);
+        float *          d_row = (float *)((char *)dst->data + m * dst->nb[1]);
+
+        for (int64_t n = 0; n < N; ++n) {
+            const float * x_row = (const float *)((const char *)src1->data + n * src1->nb[1]);
+
+            vfloat32m4_t     acc    = __riscv_vfmv_v_f_f32m4(0.0f, __riscv_vsetvlmax_e32m4());
+            int64_t          k_left = K;
+            const _Float16 * wp     = w_row;
+            const float *    xp     = x_row;
+
+            while (k_left > 0) {
+                const size_t vl  = __riscv_vsetvl_e16m2(k_left);
+                vfloat16m2_t w16 = __riscv_vle16_v_f16m2(wp, vl);
+                vfloat32m4_t w32 = __riscv_vfwcvt_f_f_v_f32m4(w16, vl);
+                vfloat32m4_t x32 = __riscv_vle32_v_f32m4(xp, vl);
+                acc              = __riscv_vfmacc_vv_f32m4(acc, w32, x32, vl);
+                wp     += vl;
+                xp     += vl;
+                k_left -= vl;
+            }
+
+            vfloat32m1_t zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+            vfloat32m1_t sum  = __riscv_vfredusum_vs_f32m4_f32m1(acc, zero, __riscv_vsetvlmax_e32m4());
+            d_row[n]          = __riscv_vfmv_f_s_f32m1_f32(sum);
+        }
+    }
+}
+
+// General stride-aware contiguous copy for F32/F16.
+// src0 may be non-contiguous; dst is always contiguous.
+// Parallel over elements across ctx.nth cores.
+template <typename T>
+void forward_cont_general(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const ggml_tensor * src0 = op->src[0];
+    ggml_tensor *       dst  = op;
+
+    GGML_ASSERT(src0->type == dst->type);
+    GGML_ASSERT(ggml_type_size(src0->type) == sizeof(T));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(ggml_nelements(src0) == ggml_nelements(dst));
+
+    const int64_t ith   = ctx.ith;
+    const int64_t nth   = ctx.nth;
+    const int64_t nr    = src0->ne[1] * src0->ne[2] * src0->ne[3];
+    const int64_t dr    = (nr + nth - 1) / nth;
+    const int64_t r0    = dr * ith;
+    const int64_t r1    = MIN(r0 + dr, nr);
+    const size_t row_size = (size_t) src0->ne[0] * sizeof(T);
+
+    // Match ggml-cpu's fast duplicate path: when the source row itself is
+    // contiguous, copy complete rows instead of doing per-element index math.
+    if (src0->nb[0] == sizeof(T)) {
+        for (int64_t r = r0; r < r1; ++r) {
+            const int64_t i3 = r / (src0->ne[2] * src0->ne[1]);
+            const int64_t rem = r - i3 * src0->ne[2] * src0->ne[1];
+            const int64_t i2 = rem / src0->ne[1];
+            const int64_t i1 = rem - i2 * src0->ne[1];
+            const char * src_row = (const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
+            char * dst_row = (char *) dst->data + r * row_size;
+            memcpy(dst_row, src_row, row_size);
+        }
+        return;
+    }
+
+    // Fully general strided fallback (rare for model graphs).
+    for (int64_t r = r0; r < r1; ++r) {
+        const int64_t i3 = r / (src0->ne[2] * src0->ne[1]);
+        const int64_t rem = r - i3 * src0->ne[2] * src0->ne[1];
+        const int64_t i2 = rem / src0->ne[1];
+        const int64_t i1 = rem - i2 * src0->ne[1];
+        for (int64_t i0 = 0; i0 < src0->ne[0]; ++i0) {
+            const T * src_elem = (const T *)((const char *)src0->data + i0 * src0->nb[0] + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3]);
+            ((T *) dst->data)[r * src0->ne[0] + i0] = *src_elem;
+        }
+    }
+}
+
+template void forward_cont_general<float>(ggml::spacemit::context & ctx, ggml_tensor * op);
+template void forward_cont_general<_Float16>(ggml::spacemit::context & ctx, ggml_tensor * op);
+
 void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     const ggml_tensor * src1 = op->src[1];
@@ -3294,18 +3863,38 @@ void forward_glu_geglu_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
 template <typename T>
 static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
-    const ggml_tensor * src0 = op->src[0];
-    const ggml_tensor * src1 = op->src[1];
+    const ggml_tensor * src0         = op->src[0];
+    const ggml_tensor * src1         = op->src[1];
+    const ggml_tensor * src2         = op->src[2];
+    const float *       freq_factors = src2 ? (const float *) src2->data : nullptr;
 
-    const int n_dims = ggml_get_op_params_i32(op, 1);
-    const int mode   = ggml_get_op_params_i32(op, 2);
-    float freq_base;
-    float freq_scale;
-    float attn_factor;
-    memcpy(&freq_base,   op->op_params + 5, sizeof(float));
-    memcpy(&freq_scale,  op->op_params + 6, sizeof(float));
-    memcpy(&attn_factor, op->op_params + 8, sizeof(float));
+    const int n_dims     = ggml_get_op_params_i32(op, 1);
+    const int mode       = ggml_get_op_params_i32(op, 2);
+    const int n_ctx_orig = ggml_get_op_params_i32(op, 4);
 
+    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
+    memcpy(&freq_base,   op->op_params + 5,  sizeof(float));
+    memcpy(&freq_scale,  op->op_params + 6,  sizeof(float));
+    memcpy(&ext_factor,  op->op_params + 7,  sizeof(float));
+    memcpy(&attn_factor, op->op_params + 8,  sizeof(float));
+    memcpy(&beta_fast,   op->op_params + 9,  sizeof(float));
+    memcpy(&beta_slow,   op->op_params + 10, sizeof(float));
+
+    int sections[4] = {0, 0, 0, 0};
+    memcpy(sections, op->op_params + 11, sizeof(int) * 4);
+
+    const bool mrope_used = (mode & GGML_ROPE_TYPE_MROPE) != 0;
+    const bool is_imrope  = (mode == GGML_ROPE_TYPE_IMROPE);
+
+    // YaRN correction dims
+    float corr_dims[2] = { 0.0f, 0.0f };
+    float mscale = attn_factor;
+    if (ext_factor != 0.0f) {
+        ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+        mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
+    }
+
+    const int64_t ne2 = op->ne[2];  // seq-len dimension
     const int64_t nr  = ggml_nrows(op);
     const int64_t dr  = (nr + ctx.nth - 1) / ctx.nth;
     const int64_t ir0 = dr * ctx.ith;
@@ -3313,43 +3902,166 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int32_t * pos = (const int32_t *) src1->data;
     const float theta_scale = powf(freq_base, -2.0f / n_dims);
 
-    float cache[512];
+    const int sect_dims = sections[0] + sections[1] + sections[2] + sections[3];
+    const int sec_w     = sections[0] + sections[1];
+    const int sec_e     = sec_w + sections[2];
+
+    // The small F32 NEOX shape used by Qwen3-0.6B is latency-sensitive and
+    // was faster on the original scalar path.  Keep that path shape-based
+    // (never model-name based), while larger rotary dimensions use the RVV
+    // implementation below.
+    const bool legacy_small_f32 = std::is_same_v<T, float> &&
+        mode == GGML_ROPE_TYPE_NEOX && op->ne[0] <= 128 &&
+        src0->nb[0] == sizeof(float);
+    float legacy_cache[512];
+    float * cache = legacy_small_f32 ? legacy_cache : nullptr;
+    if (!legacy_small_f32) {
+        GGML_ASSERT(ctx.workspace_size >= (size_t) ctx.nth * (size_t) (op->ne[0] + ggml::spacemit::cache_line_size_f32) * sizeof(float));
+        cache = (float *) ctx.workspace +
+                ctx.ith * (op->ne[0] + ggml::spacemit::cache_line_size_f32);
+    }
     int64_t last_i2 = -1;
+
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t i3 = ir / (op->ne[2] * op->ne[1]);
         const int64_t i2 = (ir / op->ne[1]) % op->ne[2];
         const int64_t i1 = ir % op->ne[1];
+
         if (i2 != last_i2) {
-            float theta = pos[i2] * freq_scale;
-            for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                cache[i0 + 0] = cosf(theta) * attn_factor;
-                cache[i0 + 1] = sinf(theta) * attn_factor;
-                theta *= theta_scale;
+            if (!mrope_used) {
+                // Standard / YaRN rope
+                float theta = (float) pos[i2];
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float ff           = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                    const float theta_extrap = theta / ff;
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float t;
+                    if (ext_factor != 0.0f) {
+                        const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                        t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                    } else {
+                        t = theta_interp;
+                    }
+                    float s, c;
+                    s = sinf(t);
+                    c = cosf(t);
+                    cache[i0 + 0] = c * mscale;
+                    cache[i0 + 1] = s * mscale;
+                    theta *= theta_scale;
+                }
+            } else {
+                // M-RoPE / IMROPE: multiple position sequences in src1
+                const float p_t = (float) pos[i2];
+                const float p_h = (float) pos[i2 + ne2];
+                const float p_w = (float) pos[i2 + ne2 * 2];
+                const float p_e = (float) pos[i2 + ne2 * 3];
+
+                float theta_t = p_t;
+                float theta_h = p_h;
+                float theta_w = p_w;
+                float theta_e = p_e;
+
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float ff = freq_factors ? freq_factors[i0 / 2] : 1.0f;
+                    int sector = (sect_dims > 0) ? (i0 / 2) % sect_dims : 0;
+
+                    float theta;
+                    if (is_imrope) {
+                        if      (sector % 3 == 0 && sector < 3 * sections[0]) theta = theta_t;
+                        else if (sector % 3 == 1 && sector < 3 * sections[1]) theta = theta_h;
+                        else if (sector % 3 == 2 && sector < 3 * sections[2]) theta = theta_w;
+                        else                                                    theta = theta_e;
+                    } else {
+                        if      (sector < sections[0])  theta = theta_t;
+                        else if (sector < sec_w)         theta = theta_h;
+                        else if (sector < sec_e)         theta = theta_w;
+                        else                             theta = theta_e;
+                    }
+
+                    const float theta_extrap = theta / ff;
+                    const float theta_interp = freq_scale * theta_extrap;
+                    float t;
+                    if (ext_factor != 0.0f) {
+                        const float y        = (i0 / 2 - corr_dims[0]) / fmaxf(0.001f, corr_dims[1] - corr_dims[0]);
+                        const float ramp_mix = (1.0f - fminf(1.0f, fmaxf(0.0f, y))) * ext_factor;
+                        t = theta_interp * (1.0f - ramp_mix) + theta_extrap * ramp_mix;
+                    } else {
+                        t = theta_interp;
+                    }
+                    float s, c;
+                    s = sinf(t);
+                    c = cosf(t);
+                    cache[i0 + 0] = c * mscale;
+                    cache[i0 + 1] = s * mscale;
+
+                    theta_t *= theta_scale;
+                    theta_h *= theta_scale;
+                    theta_w *= theta_scale;
+                    theta_e *= theta_scale;
+                }
             }
             last_i2 = i2;
         }
 
         const T * src = (const T *) ((const char *) src0->data + i3 * src0->nb[3] + i2 * src0->nb[2] + i1 * src0->nb[1]);
-        T * dst = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
-        if (mode == GGML_ROPE_TYPE_NEOX) {
+        T * dst_row   = (T *) ((char *) op->data + i3 * op->nb[3] + i2 * op->nb[2] + i1 * op->nb[1]);
+
+        if (legacy_small_f32) {
+            // Preserve the original low-dimensional F32 NEOX implementation.
             const int offset = n_dims / 2;
             for (int i0 = 0; i0 < n_dims; i0 += 2) {
                 const int ic = i0 / 2;
                 const float x0 = src[ic];
                 const float x1 = src[ic + offset];
-                dst[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
-                dst[ic + offset] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+                dst_row[ic]          = x0 * cache[i0] - x1 * cache[i0 + 1];
+                dst_row[ic + offset] = x0 * cache[i0 + 1] + x1 * cache[i0];
             }
         } else {
+        // NEOX / MROPE / IMROPE use half-offset rotation.  Qwen3.5 uses
+        // contiguous F32 rows here; process all pairs with RVV loads instead
+        // of the old scalar element loop.  Keep NORMAL and non-F32 layouts on
+        // the reference path because their pair mapping differs.
+        if constexpr (std::is_same_v<T, float>) {
+            if (mode == GGML_ROPE_TYPE_NEOX || mode == GGML_ROPE_TYPE_MROPE || mode == GGML_ROPE_TYPE_IMROPE) {
+                const int64_t pairs = n_dims / 2;
+                int64_t j = 0;
+                while (j < pairs) {
+                    const size_t vl = __riscv_vsetvl_e32m4((size_t) (pairs - j));
+                    const vfloat32m4_t x0 = __riscv_vle32_v_f32m4(src + j, vl);
+                    const vfloat32m4_t x1 = __riscv_vle32_v_f32m4(src + j + pairs, vl);
+                    const vfloat32m4_t c = __riscv_vlse32_v_f32m4(cache + 2*j, (ptrdiff_t) (2*sizeof(float)), vl);
+                    const vfloat32m4_t s = __riscv_vlse32_v_f32m4(cache + 2*j + 1, (ptrdiff_t) (2*sizeof(float)), vl);
+                    const vfloat32m4_t y0 = __riscv_vfsub_vv_f32m4(__riscv_vfmul_vv_f32m4(x0, c, vl),
+                                                                    __riscv_vfmul_vv_f32m4(x1, s, vl), vl);
+                    const vfloat32m4_t y1 = __riscv_vfadd_vv_f32m4(__riscv_vfmul_vv_f32m4(x0, s, vl),
+                                                                    __riscv_vfmul_vv_f32m4(x1, c, vl), vl);
+                    __riscv_vse32_v_f32m4(dst_row + j, y0, vl);
+                    __riscv_vse32_v_f32m4(dst_row + j + pairs, y1, vl);
+                    j += vl;
+                }
+            } else {
+                for (int i0 = 0; i0 < n_dims; i0 += 2) {
+                    const float x0 = src[i0];
+                    const float x1 = src[i0 + 1];
+                    dst_row[i0] = x0 * cache[i0] - x1 * cache[i0 + 1];
+                    dst_row[i0 + 1] = x0 * cache[i0 + 1] + x1 * cache[i0];
+                }
+            }
+        } else {
+            const int offset = n_dims / 2;
             for (int i0 = 0; i0 < n_dims; i0 += 2) {
-                const float x0 = src[i0];
-                const float x1 = src[i0 + 1];
-                dst[i0]     = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
-                dst[i0 + 1] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
+                const int ic = (mode == GGML_ROPE_TYPE_NORMAL) ? i0 : i0 / 2;
+                const int no = (mode == GGML_ROPE_TYPE_NORMAL) ? 1 : offset;
+                const float x0 = (float) src[ic];
+                const float x1 = (float) src[ic + no];
+                dst_row[ic]          = (T) (x0 * cache[i0] - x1 * cache[i0 + 1]);
+                dst_row[ic + no] = (T) (x0 * cache[i0 + 1] + x1 * cache[i0]);
             }
         }
+        }
         for (int64_t i0 = n_dims; i0 < op->ne[0]; ++i0) {
-            dst[i0] = src[i0];
+            dst_row[i0] = src[i0];
         }
     }
 }

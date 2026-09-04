@@ -10,6 +10,7 @@
 #include "ime_kernels.h"
 #include "repack.h"
 #include "rvv_kernels.h"
+#include "scalar_kernels.h"
 #include "spacemit-context.h"
 #include "spacemit-env.h"
 #include "spine_mem_pool.h"
@@ -710,17 +711,17 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             valid_act_count[0] = valid_act_count_t;
         }
 
-        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
-
-        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
-        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
-
         ctx.sync();
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
         const size_t per_nb_cols_wsize = NB_COLS * row_stride_b;
+
+        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
+
+        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
+        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
@@ -789,7 +790,6 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
-
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
 
                     if (has_pair && ith % 2 == 0) {
@@ -957,6 +957,19 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
+                    const auto * traits = ggml_get_type_traits_cpu(op->src[0]->type);
+                    if (traits && traits->vec_dot) {
+                    const size_t row_size = ggml_row_size(traits->vec_dot_type, op->src[1]->ne[0]);
+                    const size_t bytes = row_size * op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
+                        if (op->src[1]->type != traits->vec_dot_type) {
+                            size = bytes;
+                            return true;
+                        }
+                    }
+                }
+                break;
             case GGML_OP_FLASH_ATTN_EXT:
                 {
                     const int     n_tasks = n_threads;
@@ -975,7 +988,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
                     size_t n_chunks = n_tasks;
-                    size_t decode   = sizeof(float) * (neq2 * n_chunks * (2 + DV) + n_tasks * (DK + 2 * DV));
+                    size_t decode   = sizeof(float) * n_tasks * (DK + 2 * DV + 64);
 
                     size = MAX(prefill, decode);
                 }
@@ -988,10 +1001,27 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         switch (op->op) {
+            case GGML_OP_MUL_MAT:
+                if (op->src[0]->type == GGML_TYPE_F16 &&
+                    op->src[1]->type == GGML_TYPE_F32 &&
+                    op->src[0]->nb[0] == sizeof(_Float16) &&
+                    op->src[1]->nb[0] == sizeof(float)) {
+                    spacemit_kernels::rvv::forward_mul_mat_f16_f32(ctx, op);
+                    return true;
+                }
+                if (op->src[1]->type == GGML_TYPE_F32 &&
+                    ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
+                    spacemit_kernels::scalar::forward_mul_mat(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_NORM:
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_norm_f32(ctx, op);
+                        return true;
+                    case GGML_TYPE_F16:
+                        spacemit_kernels::scalar::forward_norm_f16(ctx, op);
                         return true;
                     default:
                         GGML_ABORT("fatal error");
@@ -1000,6 +1030,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 switch (op->src[0]->type) {
                     case GGML_TYPE_F32:
                         spacemit_kernels::rvv::forward_rms_norm_f32(ctx, op);
+                        return true;
+                    case GGML_TYPE_F16:
+                        spacemit_kernels::scalar::forward_rms_norm_f16(ctx, op);
                         return true;
                     default:
                         GGML_ABORT("fatal error");
@@ -1048,6 +1081,12 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     default:
                         return false;
                 }
+            case GGML_OP_SCALE:
+                if (op->src[0]->type == GGML_TYPE_F32) {
+                    spacemit_kernels::rvv::forward_scale_f32(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_UNARY:
                 switch (ggml_get_unary_op(op)) {
                     case GGML_UNARY_OP_TANH:
@@ -1056,9 +1095,30 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     case GGML_UNARY_OP_GELU:
                         spacemit_kernels::rvv::forward_unary_gelu_f32(ctx, op);
                         return true;
+                    case GGML_UNARY_OP_SILU:
+                        spacemit_kernels::rvv::forward_unary_silu_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_EXP:
+                        spacemit_kernels::rvv::forward_unary_exp_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_SIGMOID:
+                        spacemit_kernels::rvv::forward_unary_sigmoid_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_NEG:
+                        spacemit_kernels::rvv::forward_unary_neg_f32(ctx, op);
+                        return true;
+                    case GGML_UNARY_OP_SOFTPLUS:
+                        spacemit_kernels::rvv::forward_unary_softplus_f32(ctx, op);
+                        return true;
                     default:
                         return false;
                 }
+            case GGML_OP_SOFT_MAX:
+                if (op->src[0]->type == GGML_TYPE_F32) {
+                    spacemit_kernels::rvv::forward_soft_max_f32(ctx, op);
+                    return true;
+                }
+                return false;
             case GGML_OP_GLU:
                 if (op->src[0]->type == GGML_TYPE_F32) {
                     switch (ggml_get_glu_op(op)) {
@@ -1074,7 +1134,14 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                 }
                 return false;
             case GGML_OP_FLASH_ATTN_EXT:
-                return forward_flash_attn_ext_f16(ctx, op);
+                // Use the RVV implementation for its supported F32-Q/F16-KV
+                // shapes; retain the CPU-equivalent implementation for all
+                // other layouts and dtypes.
+                if (forward_flash_attn_ext_f16(ctx, op)) {
+                    return true;
+                }
+                spacemit_kernels::scalar::forward_flash_attn_ext(ctx, op);
+                return true;
             case GGML_OP_ROPE:
                 spacemit_kernels::rvv::forward_rope(ctx, op);
                 return true;
@@ -1085,20 +1152,47 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                         op->ne[3] * op->ne[2] * op->nb[2] == src0->ne[3] * src0->ne[2] * src0->nb[2]) {
                         spacemit_kernels::rvv::forward_cont_with_permute(ctx, op);
                         return true;
-                    } else {
-                        return false;
                     }
+                    if (op->type == src0->type && ggml_is_contiguous(op) &&
+                        ggml_nelements(op) == ggml_nelements(src0) &&
+                        (op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16)) {
+                        if (op->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_cont_general<float>(ctx, op);
+                        } else {
+                            spacemit_kernels::rvv::forward_cont_general<_Float16>(ctx, op);
+                        }
+                        return true;
+                    }
+                    return false;
                 }
             case GGML_OP_CPY:
                 {
                     const ggml_tensor * src0 = op->src[0];
+                    if (ggml_nelements(op) == 0) {
+                        return true;
+                    }
                     if (op->type == src0->type && op->nb[0] == src0->nb[1] && src0->nb[0] != src0->nb[1] &&
                         ggml_nelements(src0) == ggml_nelements(op)) {
                         spacemit_kernels::rvv::forward_cpy_with_permute(ctx, op);
                         return true;
-                    } else {
-                        return false;
                     }
+                    if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F32 &&
+                        ggml_is_contiguous(op) && ggml_nelements(src0) == ggml_nelements(op)) {
+                        spacemit_kernels::rvv::forward_cpy_strided_f32(ctx, op);
+                        return true;
+                    }
+                    if (ggml_is_contiguous(op) && ggml_is_contiguous(src0) &&
+                        ggml_nelements(src0) == ggml_nelements(op)) {
+                        if (op->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_cpy_f32_to_f16(ctx, op);
+                            return true;
+                        }
+                        if (op->type == GGML_TYPE_F32 && src0->type == GGML_TYPE_F16) {
+                            spacemit_kernels::rvv::forward_cpy_f16_to_f32(ctx, op);
+                            return true;
+                        }
+                    }
+                    return false;
                 }
             case GGML_OP_SET_ROWS:
                 spacemit_kernels::rvv::forward_set_rows(ctx, op);
@@ -1183,9 +1277,37 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     return false;
                 }
                 return true;
-            // TODO For GGML_OP_GATED_DELTA_NET
-            // case GGML_OP_GATED_DELTA_NET:
-            //     return true;
+            // Scalar ops dispatched to scalar_kernels
+            case GGML_OP_L2_NORM:
+                spacemit_kernels::scalar::forward_l2_norm_f32(ctx, op);
+                return true;
+            case GGML_OP_FILL:
+                spacemit_kernels::scalar::forward_fill_f32(ctx, op);
+                return true;
+            case GGML_OP_CUMSUM:
+                spacemit_kernels::scalar::forward_cumsum_f32(ctx, op);
+                return true;
+            case GGML_OP_PAD:
+                spacemit_kernels::scalar::forward_pad_f32(ctx, op);
+                return true;
+            case GGML_OP_TRI:
+                spacemit_kernels::scalar::forward_tri_f32(ctx, op);
+                return true;
+            case GGML_OP_DIAG:
+                spacemit_kernels::scalar::forward_diag_f32(ctx, op);
+                return true;
+            case GGML_OP_SET:
+                spacemit_kernels::scalar::forward_set_f32(ctx, op);
+                return true;
+            case GGML_OP_SOLVE_TRI:
+                spacemit_kernels::scalar::forward_solve_tri_f32(ctx, op);
+                return true;
+            case GGML_OP_GATED_DELTA_NET:
+                spacemit_kernels::rvv::forward_gated_delta_net(ctx, op);
+                return true;
+            case GGML_OP_SSM_CONV:
+                spacemit_kernels::scalar::forward_ssm_conv_f32(ctx, op);
+                return true;
             default:
                 break;
         }
@@ -1522,7 +1644,15 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             if (op->src[0] && op->src[1] && ggml_n_dims(op->src[0]) == 2 &&
                 op->src[1]->type == GGML_TYPE_F32) {
                 const auto * traits = static_cast<const ggml::spacemit::tensor_traits_base *>(op->src[0]->extra);
-                return traits ? traits : ggml_spacemit_get_optimal_repack_type(op->src[0]);
+                if (traits) return traits;
+                const auto * repack = ggml_spacemit_get_optimal_repack_type(op->src[0]);
+                if (repack) return repack;
+                // F16 dense weight: same condition as compute_forward
+                if (op->src[0]->type == GGML_TYPE_F16 &&
+                    op->src[0]->nb[0] == sizeof(_Float16) &&
+                    op->src[1]->nb[0] == sizeof(float)) {
+                    return common;
+                }
             }
             break;
         case GGML_OP_MUL_MAT_ID:
@@ -1534,6 +1664,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
+            if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)) {
+                return common;
+            }
+            break;
+        case GGML_OP_SCALE:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32) {
                 return common;
             }
@@ -1555,42 +1690,71 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_FLASH_ATTN_EXT:
             if (op->src[0] && op->src[1] && op->src[2] &&
                 (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
-                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F16 &&
-                op->src[2]->type == GGML_TYPE_F16 && op->src[1]->ne[0] > 0 && op->src[1]->ne[0] <= 128 &&
-                op->src[2]->ne[0] > 0 && op->src[2]->ne[0] <= 128 &&
-                ggml::cpu::riscv64_spacemit::global_spine_env_info.vlen == 128) {
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                op->src[1]->ne[0] > 0 && op->src[2]->ne[0] > 0) {
                 return common;
             }
             break;
         case GGML_OP_ROPE:
             if (op->src[0] && op->src[1]) {
                 float freq_base;
-                float ext_factor;
                 memcpy(&freq_base,  op->op_params + 5, sizeof(float));
-                memcpy(&ext_factor, op->op_params + 7, sizeof(float));
                 const int n_dims = ggml_get_op_params_i32(op, 1);
                 const int mode   = ggml_get_op_params_i32(op, 2);
-                if ((op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
-                    op->type == op->src[0]->type && op->src[1]->type == GGML_TYPE_I32 && op->src[2] == nullptr &&
-                    op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) && op->nb[0] == ggml_type_size(op->type) &&
-                    op->src[1]->nb[0] == sizeof(int32_t) && ggml_are_same_shape(op, op->src[0]) &&
-                    ggml_nelements(op->src[1]) >= op->ne[2] && freq_base > 0.0f &&
-                    n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0 && ext_factor == 0.0f &&
-                    (mode == GGML_ROPE_TYPE_NORMAL || mode == GGML_ROPE_TYPE_NEOX)) {
+                const bool src2_ok = op->src[2] == nullptr ||
+                    (op->src[2]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[2]));
+                const bool mode_ok = (mode == GGML_ROPE_TYPE_NORMAL ||
+                                      mode == GGML_ROPE_TYPE_NEOX   ||
+                                      mode == GGML_ROPE_TYPE_MROPE  ||
+                                      mode == GGML_ROPE_TYPE_IMROPE);
+                const bool c1 = (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16);
+                const bool c2 = op->type == op->src[0]->type;
+                const bool c3 = op->src[1]->type == GGML_TYPE_I32;
+                const bool c4 = src2_ok;
+                const bool c5 = op->src[0]->nb[0] == ggml_type_size(op->src[0]->type);
+                const bool c6 = op->nb[0] == ggml_type_size(op->type);
+                const bool c7 = freq_base > 0.0f;
+                const bool c8 = n_dims > 0 && n_dims <= op->ne[0] && n_dims <= 512 && n_dims % 2 == 0;
+                const bool c9 = mode_ok;
+                if (c1 && c2 && c3 && c4 && c5 && c6 && c7 && c8 && c9) {
                     return common;
                 }
             }
             break;
         case GGML_OP_CONT:
-            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] != op->src[0]->nb[0] &&
-                op->nb[0] == op->src[0]->nb[1] &&
-                op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
-                return common;
+            if (op->src[0] && op->type == op->src[0]->type) {
+                // permute case
+                if (op->nb[0] != op->src[0]->nb[0] && op->nb[0] == op->src[0]->nb[1] &&
+                    op->ne[3] * op->ne[2] * op->nb[2] == op->src[0]->ne[3] * op->src[0]->ne[2] * op->src[0]->nb[2]) {
+                    return common;
+                }
+                // general stride-aware copy for F32/F16
+                if ((op->type == GGML_TYPE_F32 || op->type == GGML_TYPE_F16) &&
+                    ggml_is_contiguous(op) &&
+                    ggml_nelements(op) == ggml_nelements(op->src[0])) {
+                    return common;
+                }
             }
             break;
         case GGML_OP_CPY:
+            if (op->src[0] && ggml_nelements(op) == 0) {
+                return common;
+            }
             if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
                 op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op) && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+                return common;
+            }
+            if (op->src[0] &&
+                ((op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32) ||
+                 (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F16)) &&
+                ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
+                ggml_nelements(op->src[0]) == ggml_nelements(op)) {
                 return common;
             }
             break;
@@ -1624,25 +1788,40 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_GET_ROWS:
-            if (op->src[0] && op->src[1] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+            if (op->src[0] && op->src[1] &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->type == op->src[0]->type &&
                 op->src[1]->type == GGML_TYPE_I32 && op->ne[0] == op->src[0]->ne[0] &&
-                op->src[0]->ne[2] == op->src[1]->ne[1] && op->src[0]->nb[0] == sizeof(float) &&
+                op->src[0]->ne[2] == op->src[1]->ne[1] &&
+                op->src[0]->nb[0] == ggml_type_size(op->src[0]->type) &&
                 ggml_nrows(op) == ggml_nelements(op->src[1])) {
                 return common;
             }
             break;
         case GGML_OP_CONCAT:
             if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 0) == 0 &&
-                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
-                op->type == GGML_TYPE_F32 && op->nb[0] == sizeof(float) &&
-                op->nb[1] == sizeof(float) * (op->src[0]->ne[0] + op->src[1]->ne[0])) {
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                op->src[1]->type == op->src[0]->type && op->type == op->src[0]->type &&
+                op->nb[0] == ggml_type_size(op->type) &&
+                op->nb[1] == ggml_type_size(op->type) * (op->src[0]->ne[0] + op->src[1]->ne[0])) {
                 return common;
             }
             break;
         case GGML_OP_UNARY:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && ggml_is_contiguous(op->src[0]) &&
-                (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH ||
-                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU)) {
+                (ggml_get_unary_op(op) == GGML_UNARY_OP_TANH    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_GELU    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SILU    ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_EXP     ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SIGMOID ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_NEG     ||
+                 ggml_get_unary_op(op) == GGML_UNARY_OP_SOFTPLUS)) {
+                return common;
+            }
+            break;
+        case GGML_OP_SOFT_MAX:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) && op->nb[0] == sizeof(float)) {
                 return common;
             }
             break;
@@ -1663,6 +1842,73 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                         return common;
                     }
                 }
+            }
+            break;
+        default:
+            break;
+    }
+
+    // Scalar ops: route to common so compute_forward dispatches to scalar_kernels
+    switch (op->op) {
+        case GGML_OP_L2_NORM:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_FILL:
+            if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16))
+                return common;
+            break;
+        case GGML_OP_CUMSUM:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_PAD:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_TRI:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                ggml_is_contiguous(op->src[0]))
+                return common;
+            break;
+        case GGML_OP_DIAG:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_SET:
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_SOLVE_TRI:
+            if (op->src[0] && op->src[1] &&
+                op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_GATED_DELTA_NET:
+            return common;
+        case GGML_OP_SSM_CONV:
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_F32)
+                return common;
+            break;
+        case GGML_OP_MUL_MAT:
+            // Generic CPU dot fallback for dense or unsupported quantized
+            // layouts which do not have a repacked Spacemit trait.
+            if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
+                ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
+                return common;
+            }
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
+            if (op->src[0] && op->src[1] && op->src[2] &&
+                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
+                (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
+                op->src[1]->ne[0] > 0 && op->src[2]->ne[0] > 0) {
+                return common;
             }
             break;
         default:
