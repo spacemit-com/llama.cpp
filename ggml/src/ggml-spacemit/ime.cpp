@@ -418,18 +418,12 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
-            if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) ||
-                          (std::is_same_v<BLOC_TYPE, block_q8_0> && INTER_SIZE == 32  && NB_COLS == 32)) {
-                // Wide Q8 output heads amortize the staged copy and stream more efficiently through TCM.
-                constexpr int64_t max_direct_q8_tiles = 64;
-                const bool direct_q8_supported = !std::is_same_v<BLOC_TYPE, block_q8_0> ||
-                                                 gemm_n <= 2 * NB_COLS * max_direct_q8_tiles;
-                if (gemm_m == 1 && a_row != quant_a_buffer && direct_q8_supported) {
+            // Direct IME-from-DRAM GEMV path, decode only (gemm_m == 1), q4_0 only:
+            // q8_0 always loses to the staged TCM path here.
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) {
+                if (gemm_m == 1 && a_row != quant_a_buffer) {
                     spacemit_kernels::rvv::memcpy1d(a_row, quant_a_buffer, gemm_workspace_size);
-                    int64_t tile_cols = 2 * NB_COLS;
-                    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
-                        tile_cols = 4 * NB_COLS;
-                    }
+                    constexpr int64_t tile_cols = 4 * NB_COLS;
                     for (int64_t ni = (int64_t) ith * tile_cols; ni < gemm_n; ni += tile_cols * nth) {
                         const int64_t nb_real  = std::min(gemm_n - ni, tile_cols);
                         uint8_t *     b_row    = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
