@@ -1726,7 +1726,7 @@ void quantize_a_nrow_i8_ref(size_t blk_len, const float * a_ptr, size_t count_k,
         float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
         int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * MB_ROWS);
         int8_t *  quant_a_blk =
-            reinterpret_cast<int8_t *>(quant_a_ptr + sizeof(float) * MB_ROWS + sizeof(int16_t) * MB_ROWS);
+            reinterpret_cast<int8_t *>(quant_a_ptr + q8_data_offset(MB_ROWS, true));
 
         for (size_t row = 0; row < MB_ROWS; row++) {
             float max_abs_a = 0.0f;
@@ -1809,9 +1809,9 @@ void quantize_a_nrow_i8_hp_ref(size_t blk_len, const float * a_ptr, size_t count
 
 template <size_t MB_ROWS>
 void quantize_a_nrow_i8k_ref(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
-    int64_t a_blk_stride        = q8k_blk_size(256);
+    int64_t a_blk_stride        = q8k_blk_size(blk_len);
     int64_t a_nrow_block_stride = a_blk_stride * MB_ROWS;
-    int64_t a_sum_size          = 256 / 16;
+    int64_t a_sum_size          = blk_len / 16;
 
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_nrow_block_stride) {
         float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
@@ -1858,6 +1858,16 @@ void quantize_a_nrow_i8k_ref(size_t blk_len, const float * a_ptr, size_t count_k
     }
 }
 
+void quantize_a_row_i8q6(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+    GGML_ASSERT(blk_len == 32);
+    quantize_a_nrow_i8k_ref<1>(blk_len, a_ptr, count_k, quant_a_ptr);
+}
+
+void quantize_a_4row_i8q6(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+    GGML_ASSERT(blk_len == 32);
+    quantize_a_nrow_i8k_ref<4>(blk_len, a_ptr, count_k, quant_a_ptr);
+}
+
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 32);
     int64_t a_blk_stride = q8_blk_size(blk_len, true);
@@ -1867,7 +1877,7 @@ void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_blk_stride) {
             float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
             int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float));
-            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + sizeof(float) + sizeof(int16_t));
+            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_data_offset(1, true));
 
             size_t       vl      = __riscv_vsetvl_e32m1(blk_len);
             vfloat32m1_t v_a     = __riscv_vle32_v_f32m1(a_ptr + k, vl);
@@ -1896,7 +1906,7 @@ void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_blk_stride) {
             float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
             int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float));
-            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + sizeof(float) + sizeof(int16_t));
+            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_data_offset(1, true));
 
             size_t       vl      = __riscv_vsetvl_e32m4(blk_len);
             vfloat32m4_t v_a     = __riscv_vle32_v_f32m4(a_ptr + k, vl);
@@ -1936,7 +1946,7 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_nrow_block_stride) {
             float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
             int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * 4);
-            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + sizeof(float) * 4 + sizeof(int16_t) * 4);
+            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_data_offset(4, true));
 
             for (size_t mi = 0; mi < 4; mi++) {
                 size_t       vl      = __riscv_vsetvl_e32m1(blk_len);
@@ -1967,7 +1977,7 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
         for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += a_nrow_block_stride) {
             float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
             int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * 4);
-            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + sizeof(float) * 4 + sizeof(int16_t) * 4);
+            int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_data_offset(4, true));
 
             for (size_t mi = 0; mi < 4; mi++) {
                 size_t       vl      = __riscv_vsetvl_e32m4(blk_len);

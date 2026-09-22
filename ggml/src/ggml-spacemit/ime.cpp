@@ -89,6 +89,14 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
     }
 }
 
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
+inline int64_t spine_row_stride_b(int64_t b_k_blks) {
+    if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+        return (b_k_blks / 8) * static_cast<int64_t>(sizeof(spacemit_kernels::nrow_super_q6_k<1>));
+    }
+    return b_k_blks * static_cast<int64_t>(get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>());
+}
+
 template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
                   std::is_same_v<BLOC_TYPE, block_q3_K> || std::is_same_v<BLOC_TYPE, block_q4_0> ||
@@ -115,6 +123,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if constexpr (std::is_same_v<BLOC_TYPE, block_q2_K> || std::is_same_v<BLOC_TYPE, block_q3_K>) {
                         size =
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
+                    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                        size = spacemit_kernels::div_round_up(src1_nelements, size_t(32)) *
+                               spacemit_kernels::q8k_blk_size(32);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
                                spacemit_kernels::q8_blk_size(QK4_0, true);
@@ -136,6 +147,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if constexpr (std::is_same_v<BLOC_TYPE, block_q2_K> || std::is_same_v<BLOC_TYPE, block_q3_K>) {
                         size =
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
+                    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                        size = spacemit_kernels::div_round_up(src1_nelements, size_t(32)) *
+                               spacemit_kernels::q8k_blk_size(32);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
                                spacemit_kernels::q8_blk_size(QK4_0, true);
@@ -246,7 +260,13 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
             block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8q6;
+                quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8q6;
+                block_stride_a     = spacemit_kernels::q8k_blk_size(32);
+                gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i6k;
+                set_kernel_impl    = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -325,7 +345,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         constexpr int64_t row_align = 4;
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
-        const int64_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
+        const int64_t row_stride_b      = spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks);
         const int64_t per_mb_rows_wsize = row_align * row_stride_a;
         const int64_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
@@ -418,6 +438,26 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
             uint8_t * b_col_zp = block_type_has_zp<BLOC_TYPE>() ? b_col : nullptr;
 
+            // Disabled: 2x-wide Q6 M1 tiles reduce thread parallelism and regress TG.
+            // if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+            //     if (gemm_m == 1) {
+            //         uint8_t * a_dir = quant_a_buffer;
+            //         if (gemm_workspace_size <= tcm_buffer_size) {
+            //             a_dir = reinterpret_cast<uint8_t *>(tcm_buffer);
+            //             spacemit_kernels::rvv::memcpy1d(a_dir, quant_a_buffer, gemm_workspace_size);
+            //         }
+
+            //         constexpr int64_t q6_tile_cols = 2 * NB_COLS;
+            //         for (int64_t ni = static_cast<int64_t>(ith) * q6_tile_cols; ni < gemm_n;
+            //              ni += q6_tile_cols * nth) {
+            //             const int64_t nb_real = std::min(gemm_n - ni, q6_tile_cols);
+            //             uint8_t * b_dir = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
+            //             gemm_kernel(b_blk_len, a_dir, b_dir, nullptr, output + ni, 1, nb_real, b_k_blks, gemm_n);
+            //         }
+            //         return true;
+            //     }
+            // }
+
             if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) ||
                           (std::is_same_v<BLOC_TYPE, block_q8_0> && INTER_SIZE == 32  && NB_COLS == 32)) {
                 // Wide Q8 output heads amortize the staged copy and stream more efficiently through TCM.
@@ -438,6 +478,22 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     }
                     return true;
                 }
+            }
+
+            // Generic M1/M4: single direct tile.
+            if (gemm_m == 1 || gemm_m == 4) {
+                uint8_t * a_dir = quant_a_buffer;
+                if (gemm_workspace_size <= tcm_buffer_size) {
+                    a_dir = reinterpret_cast<uint8_t *>(tcm_buffer);
+                    spacemit_kernels::rvv::memcpy1d(a_dir, quant_a_buffer, gemm_workspace_size);
+                }
+                for (int64_t ni = static_cast<int64_t>(ith) * NB_COLS; ni < gemm_n; ni += NB_COLS * nth) {
+                    const int64_t nb_real = std::min(gemm_n - ni, static_cast<int64_t>(NB_COLS));
+                    uint8_t * b_dir       = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
+                    uint8_t * b_dir_zp    = block_type_has_zp<BLOC_TYPE>() ? b_dir : nullptr;
+                    gemm_kernel(b_blk_len, a_dir, b_dir, b_dir_zp, output + ni, gemm_m, nb_real, b_k_blks, gemm_n);
+                }
+                return true;
             }
 
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
@@ -589,7 +645,12 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8;
             block_stride_a    = spacemit_kernels::q8_blk_size(QK4_0, true);
 
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8q6;
+                block_stride_a    = spacemit_kernels::q8k_blk_size(32);
+                gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i6k;
+                set_kernel_impl   = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
@@ -713,7 +774,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
         ctx.sync();
 
-        const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
+        const size_t row_stride_b      = static_cast<size_t>(spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks));
         const size_t expert_b_stride   = ne01 * row_stride_b;
         const size_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
@@ -1602,7 +1663,7 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             break;
         case GGML_TYPE_Q6_K:
-            nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
+            nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(spacemit_kernels::nrow_super_q6_k<1>), 32);
             break;
         case GGML_TYPE_Q8_0:
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);

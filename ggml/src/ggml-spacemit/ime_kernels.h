@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 
 namespace spacemit_kernels {
@@ -32,6 +33,22 @@ template <int N> struct nrow_block_q3_k {
     uint8_t  qs[N * BLOCK_QNK_LEN / 4];
     uint16_t scales16[N];
 };
+
+template <int N> struct nrow_block_q6_k_body {
+    int8_t  scales[2 * N];
+    uint8_t qh[8 * N];
+    uint8_t ql[16 * N];
+};
+
+template <int N> struct nrow_super_q6_k {
+    uint16_t                scales16[N];
+    nrow_block_q6_k_body<N> sub[8];
+};
+
+static_assert(sizeof(nrow_block_q6_k_body<1>) == 26, "wrong q6_k dedup body size");
+static_assert(sizeof(nrow_super_q6_k<1>) == 210, "wrong q6_k dedup super-tile size");
+static_assert(sizeof(nrow_block_q6_k_body<32>) == 832, "wrong q6_k dedup N32 body size");
+static_assert(sizeof(nrow_super_q6_k<32>) == 6720, "wrong q6_k dedup N32 super-tile size");
 
 template <int N> struct nrow_block_mxfp4 {
     uint8_t e[N];
@@ -86,6 +103,16 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 }  // namespace ime1
 
 namespace ime2 {
+size_t gemm_kernel_i8i6k(size_t          blk_len,
+                         const uint8_t * quant_a_ptr,
+                         const uint8_t * quant_b_data,
+                         const uint8_t * quant_b_zp,
+                         float *         c_ptr,
+                         size_t          count_m,
+                         size_t          count_n,
+                         size_t          k_blks,
+                         size_t          ldc);
+
 size_t gemm_kernel_i8i2k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,

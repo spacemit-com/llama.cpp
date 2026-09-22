@@ -13,11 +13,15 @@ template <typename T, typename U> constexpr auto div_round_up(T up, U down) {
     return (up + down - 1) / down;
 }
 
-// Q8 Blk [f32] [s16] [int8 * blk_len]
-// Q8 Blk N [f32 * N] [s16 * N] [int8 * blk_len * N]
+// Q8 Blk [f32] [s16] [padding to 8B] [int8 * blk_len]
+// Q8 Blk N [f32 * N] [s16 * N] [padding to 8B] [int8 * blk_len * N]
+constexpr size_t q8_data_offset(size_t nrows = 1, bool with_blk_sum = false) {
+    const size_t header_size = sizeof(float) * nrows + (with_blk_sum ? sizeof(int16_t) * nrows : 0);
+    return with_blk_sum ? (header_size + 7) & ~size_t(7) : header_size;
+}
+
 constexpr size_t q8_blk_size(size_t blk_len, bool with_blk_sum = false) {
-    const size_t blk_size = sizeof(float) + blk_len * sizeof(int8_t) + (with_blk_sum ? sizeof(int16_t) : 0);
-    return blk_size;
+    return q8_data_offset(1, with_blk_sum) + blk_len * sizeof(int8_t);
 }
 
 // Q8 HP row block: K is split into K32 subblocks.
@@ -99,6 +103,10 @@ template <typename T> void forward_repeat_dim1(ggml::spacemit::context & ctx, gg
 void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
+void quantize_a_row_i8q6(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
+void quantize_a_4row_i8q6(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 

@@ -982,6 +982,74 @@ static int repack_q4_k_to_q4_1_32_bl(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
+static int repack_q6_k_to_q6_k_32_bl_dedup(ggml_tensor *              t,
+                                           int                        interleave_block,
+                                           const void * GGML_RESTRICT data,
+                                           size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q6_K);
+    GGML_ASSERT(interleave_block == 32);
+    GGML_ASSERT(QK_K == 256);
+
+    constexpr int nrows_interleaved = 32;
+    using dst_body  = spacemit_kernels::nrow_block_q6_k_body<nrows_interleaved>;
+    using dst_super = spacemit_kernels::nrow_super_q6_k<nrows_interleaved>;
+
+    const auto * src = static_cast<const block_q6_K *>(data);
+    auto * dst = static_cast<dst_super *>(t->data);
+    const int nrow = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
+
+    GGML_ASSERT(t->ne[0] % QK_K == 0);
+    GGML_ASSERT(data_size == static_cast<size_t>(nrow) * nblocks * sizeof(block_q6_K));
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        const int nrow_real = std::min(nrow - b, nrows_interleaved);
+        for (int x = 0; x < nblocks; ++x) {
+            std::memset(dst, 0, sizeof(*dst));
+            for (int i = 0; i < nrow_real; ++i) {
+                dst->scales16[i] = src[(b + i) * nblocks + x].d;
+            }
+            for (int sub = 0; sub < QK_K / 32; ++sub) {
+                dst_body * dsub = &dst->sub[sub];
+                for (int i = 0; i < nrow_real; ++i) {
+                    const block_q6_K & src_block = src[(b + i) * nblocks + x];
+                    dsub->scales[i] = src_block.scales[2 * sub];
+                    dsub->scales[nrows_interleaved + i] = src_block.scales[2 * sub + 1];
+
+                    for (int k = 0; k < 32; ++k) {
+                        const int src_k = 32 * sub + k;
+                        const int group = src_k / 128;
+                        const int within = src_k % 128;
+                        const int quarter = within / 32;
+                        const int l = within % 32;
+                        const uint8_t * ql = src_block.ql + 64 * group;
+                        const uint8_t * qh = src_block.qh + 32 * group;
+
+                        uint8_t lo;
+                        if (quarter == 0) {
+                            lo = ql[l] & 0x0f;
+                        } else if (quarter == 1) {
+                            lo = ql[l + 32] & 0x0f;
+                        } else if (quarter == 2) {
+                            lo = ql[l] >> 4;
+                        } else {
+                            lo = ql[l + 32] >> 4;
+                        }
+                        const uint8_t hi = (qh[l] >> (2 * quarter)) & 0x03;
+
+                        dsub->ql[i * 16 + k / 2] |= lo << (4 * (k & 1));
+                        dsub->qh[i * 4 + k / 8] |= (hi & 1) << (k & 7);
+                        dsub->qh[4 * nrows_interleaved + i * 4 + k / 8] |= ((hi >> 1) & 1) << (k & 7);
+                    }
+                }
+            }
+
+            ++dst;
+        }
+    }
+
+    return 0;
+}
 static int repack_q6_k_to_q8_0_32_bl_ref(ggml_tensor *              t,
                                          int                        interleave_block,
                                          const void * GGML_RESTRICT data,
@@ -1761,11 +1829,7 @@ template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, s
 }
 
 template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-#if 1
-    return repack_q6_k_to_q8_0_32_bl_ref(t, 32, data, data_size);
-#else
-    return repack_q6_k_to_q8_0_32_bl(t, 32, data, data_size);
-#endif
+    return repack_q6_k_to_q6_k_32_bl_dedup(t, 32, data, data_size);
 }
 
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
