@@ -982,6 +982,93 @@ static int repack_q4_k_to_q4_1_32_bl(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
+static int repack_q4_k_to_q4_1_32_bl_ds(ggml_tensor *              t,
+                                        int                        interleave_block,
+                                        const void * GGML_RESTRICT data,
+                                        size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(interleave_block == 32);
+    GGML_ASSERT(QK_K / QK4_1 == 8);
+
+    constexpr int nrows_interleaved = 32;
+    using dst_super = spacemit_kernels::nrow_super_q4_k_ds<nrows_interleaved>;
+
+    const block_q4_K * src = (const block_q4_K *) data;
+    auto * dst = static_cast<dst_super *>(t->data);
+    int     nrow    = ggml_nrows(t);
+    int     nblocks = t->ne[0] / QK_K;
+    block_q4_1 dst_tmp[nrows_interleaved];
+
+    const bool verify = false;
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_K != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int i = 0; i < nrows_interleaved; i++) {
+                dst->d[i] = src[x + i * nblocks].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d;
+            }
+            for (int j = 0; j < 8; j++) {
+                uint8_t scv[nrows_interleaved];
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    uint8_t     sc, m;
+                    const float d = GGML_FP16_TO_FP32(src[x + i * nblocks].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+                    const float min =
+                        GGML_FP16_TO_FP32(src[x + i * nblocks].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
+                    get_scale_min_k4(j, src[x + i * nblocks].scales, &sc, &m);
+                    const float d1 = d * sc;
+                    const float m1 = min * m;
+
+                    scv[i] = sc;
+                    dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = GGML_FP32_TO_FP16(d1);
+                    dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m = GGML_FP32_TO_FP16(-m1);
+                    const uint8_t * q = src[x + i * nblocks].qs + (j / 2) * QK4_1;
+                    if (j % 2 == 0) {
+                        for (int ii = 0; ii < 16; ii++) {
+                            dst_tmp[i].qs[ii] = (q[ii] & 0x0F) | ((q[ii + 16] & 0x0F) << 4);
+                        }
+                    } else {
+                        for (int ii = 0; ii < 16; ii++) {
+                            dst_tmp[i].qs[ii] = ((q[ii] & 0xF0) >> 4) | (q[ii + 16] & 0xF0);
+                        }
+                    }
+                }
+                const block_q4_1x32 packed = make_block_q4_1x32(dst_tmp, interleave_block);
+                auto & sub = dst->sub[j];
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    sub.sc[i] = scv[i];
+                }
+                for (int i = 0; i < nrows_interleaved / 2; i++) {
+                    GGML_ASSERT(packed.zp[i] <= 15 && packed.zp[i + nrows_interleaved / 2] <= 15);
+                    sub.zp4[i] =
+                        static_cast<uint8_t>(packed.zp[i] | (packed.zp[i + nrows_interleaved / 2] << 4));
+                }
+                std::memcpy(sub.qs, packed.qs, sizeof(sub.qs));
+
+                if (verify) {
+                    for (int i = 0; i < nrows_interleaved; i++) {
+                        const float df = GGML_FP16_TO_FP32(dst->d[i]);
+                        const uint16_t rec =
+                            static_cast<uint16_t>(GGML_FP32_TO_FP16(df * static_cast<float>(scv[i])));
+                        if (rec != static_cast<uint16_t>(packed.d[i])) {
+                            GGML_ABORT("Q4_K d-share rebuild mismatch row %d blk %d sub %d col %d\n",
+                                       b + i, (int) x, j, i);
+                        }
+                    }
+                }
+            }
+            ++dst;
+        }
+        src += nrows_interleaved * nblocks;
+    }
+
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 static int repack_q6_k_to_q6_k_32_bl_dedup(ggml_tensor *              t,
                                            int                        interleave_block,
                                            const void * GGML_RESTRICT data,
@@ -1825,6 +1912,23 @@ template <> int repack<block_q4_1, 256, 32>(ggml_tensor * t, const void * data, 
 }
 
 template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
+    if (t->ne[0] % QK_K == 0 && t->ne[1] % 32 == 0) {
+        const size_t nrows   = static_cast<size_t>(ggml_nrows(t));
+        const size_t nblocks = static_cast<size_t>(t->ne[0] / QK_K);
+        const size_t compressed_size = nrows * nblocks * size_t{ 142 };
+        const size_t legacy_offset   = GGML_PAD(compressed_size, size_t{ 64 });
+
+        ggml_tensor compressed_t = *t;
+        compressed_t.data = t->data;
+        int rc = repack_q4_k_to_q4_1_32_bl_ds(&compressed_t, 32, data, data_size);
+        if (rc != 0) {
+            return rc;
+        }
+
+        ggml_tensor legacy_t = *t;
+        legacy_t.data = static_cast<uint8_t *>(t->data) + legacy_offset;
+        return repack_q4_k_to_q4_1_32_bl(&legacy_t, 32, data, data_size);
+    }
     return repack_q4_k_to_q4_1_32_bl(t, 32, data, data_size);
 }
 

@@ -89,8 +89,41 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
     }
 }
 
+inline bool spine_q4_d_shared_enabled() {
+    return true;
+}
+
+inline bool spine_q4_zp_nibble_enabled() {
+    return false;
+}
+
+inline bool spine_q4_m_split_enabled(const ggml_tensor * tensor = nullptr) {
+    if (!global_spine_env_info.use_ime2) {
+        return false;
+    }
+    return tensor == nullptr || (tensor->ne[0] % QK_K == 0 && tensor->ne[1] % 32 == 0);
+}
+
+inline size_t spine_q4_k_layout_nbytes(const ggml_tensor * tensor, bool compressed) {
+    GGML_ASSERT(tensor != nullptr && tensor->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(tensor->ne[0] % QK_K == 0 && tensor->ne[1] % 32 == 0);
+    const size_t nrows   = static_cast<size_t>(ggml_nrows(tensor));
+    const size_t nblocks = static_cast<size_t>(tensor->ne[0] / QK_K);
+    const size_t per_k256_per_row = compressed ? size_t{ 142 } : size_t{ 152 };
+    return nrows * nblocks * per_k256_per_row;
+}
+
+inline size_t spine_q4_k_legacy_offset(const ggml_tensor * tensor) {
+    return GGML_PAD(spine_q4_k_layout_nbytes(tensor, true), size_t{ 64 });
+}
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
-inline int64_t spine_row_stride_b(int64_t b_k_blks) {
+inline int64_t spine_row_stride_b(int64_t b_k_blks, bool compressed = true) {
+    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
+        if (compressed && spine_q4_d_shared_enabled()) {
+            return (b_k_blks / 8) * 142;
+        }
+    }
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
         return (b_k_blks / 8) * static_cast<int64_t>(sizeof(spacemit_kernels::nrow_super_q6_k<1>));
     }
@@ -246,6 +279,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t gemm_m = ne11 * ne12 * ne13;
         const int64_t gemm_k = ne10;
         const int64_t gemm_n = ne01;
+        bool q4_m_split       = false;
+        bool q4_legacy_layout = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
+            q4_m_split       = spine_q4_m_split_enabled(src0);
+            q4_legacy_layout = q4_m_split && gemm_m > 1;
+            if (q4_legacy_layout) {
+                w_data = static_cast<uint8_t *>(w_data) + spine_q4_k_legacy_offset(src0);
+            }
+        }
 
         spacemit_kernels::quantize_a_row_def       quantize_a_row_i8;
         spacemit_kernels::quantize_a_row_def       quantize_a_4row_i8;
@@ -309,6 +351,13 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         }
 #endif
 
+#if defined(RISCV64_SPACEMIT_IME2)
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
+            if (q4_legacy_layout && global_spine_env_info.use_ime2) {
+                gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_legacy;
+            }
+        }
+#endif
 #if defined(RISCV64_SPACEMIT_IME1)
         if (!set_kernel_impl && (global_spine_env_info.use_ime1)) {
             quantize_a_row_i8  = spacemit_kernels::ime1::quantize_a_row_i8;
@@ -345,7 +394,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         constexpr int64_t row_align = 4;
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
-        const int64_t row_stride_b      = spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks);
+        const int64_t row_stride_b      = spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks, !q4_legacy_layout);
         const int64_t per_mb_rows_wsize = row_align * row_stride_a;
         const int64_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
@@ -1660,7 +1709,13 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     size_t nbytes = row_nbytes;
     switch (tensor->type) {
         case GGML_TYPE_Q4_K:
-            nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
+            if (ggml::cpu::riscv64_spacemit::spine_q4_m_split_enabled(tensor)) {
+                nbytes = GGML_PAD(
+                    ggml::cpu::riscv64_spacemit::spine_q4_k_layout_nbytes(tensor, true), size_t{ 64 }) +
+                         ggml::cpu::riscv64_spacemit::spine_q4_k_layout_nbytes(tensor, false);
+            } else {
+                nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
+            }
             break;
         case GGML_TYPE_Q6_K:
             nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(spacemit_kernels::nrow_super_q6_k<1>), 32);

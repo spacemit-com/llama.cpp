@@ -31,6 +31,14 @@
 
 namespace spacemit_kernels {
 namespace ime2 {
+inline bool spine_q4_d_shared() {
+    return true;
+}
+
+static thread_local bool spine_q4_legacy_override = false;
+
+static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks);
+static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks, size_t ldc);
 
 template <size_t MB_ROWS, size_t NB_COLS>
 void gemm_kernel_i8i2k_mrow_ref(size_t          blk_len,
@@ -2436,6 +2444,11 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
                          size_t          count_n,
                          size_t          k_blks,
                          size_t          ldc) {
+    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+        GGML_ASSERT(k_blks % 8 == 0);
+        gemm_kernel_i8i4_m1_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
+        return;
+    }
     if (quant_b_zp == NULL) {
         for (size_t n = 0; n < count_n; n += 32) {
             size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
@@ -2878,8 +2891,12 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 #endif
         }
     }
-}
+    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+        GGML_ASSERT(k_blks % 8 == 0);
+        gemm_kernel_i8i4_m1_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
+    }
 
+}
 void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                             const uint8_t * quant_a_ptr,
                             const uint8_t * quant_b_data,
@@ -3013,6 +3030,11 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                          size_t          count_n,
                          size_t          k_blks,
                          size_t          ldc) {
+    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+        GGML_ASSERT(k_blks % 8 == 0);
+        gemm_kernel_i8i4_m4_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+        return;
+    }
     int64_t b_data_stride =
         k_blks * (sizeof(ggml_fp16_t) + 16 * sizeof(int8_t) + (quant_b_zp != NULL ? sizeof(int8_t) : 0));
     if (quant_b_zp == NULL) {
@@ -3355,8 +3377,12 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                   "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4");
         }
     }
-}
+    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+        GGML_ASSERT(k_blks % 8 == 0);
+        gemm_kernel_i8i4_m4_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+    }
 
+}
 void gemm_kernel_i8i4_hp_m4(size_t          blk_len,
                             const uint8_t * quant_a_ptr,
                             const uint8_t * quant_b_data,
@@ -6336,5 +6362,316 @@ size_t gemm_kernel_i8i6k(size_t          blk_len,
     return 1;
 }
 
+static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
+                                     const uint8_t * quant_b_data,
+                                     float *         c_ptr,
+                                     size_t          count_n,
+                                     size_t          k_blks) {
+    const size_t supers = k_blks / 8;
+    for (size_t n = 0; n < count_n; n += 32) {
+        const size_t nblks = (count_n - n) > 32 ? 32 : count_n - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + (n / 32) * supers * 4544;
+        float * CPtr = c_ptr + n;
+        size_t  cnt  = supers;
+
+        __asm__ volatile(
+            "mv           t3, %[BCK]              \n\t"
+            "mv           t4, %[NBLKS]            \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.i      v0, 1                   \n\t"
+            "mv           s2, %[pA]               \n\t"
+            "addi         s3, %[pA], 4+2          \n\t"
+            "mv           s6, %[pC]               \n\t"
+            "mv           s7, %[pB]               \n\t"
+            "addi         s4, %[pB], 64           \n\t"
+            "addi         s5, %[pB], 112          \n\t"
+
+            "vsll.vi      v1, v0, 4               \n\t"
+            "vxor.vv      v2, v0, v0              \n\t"
+            "vfcvt.f.x.v  v0, v0                  \n\t"
+            "vfcvt.f.x.v  v1, v1                  \n\t"
+            "li           t1, 4544                \n\t"
+
+            ".align 4                             \n\t"
+            "_K_LPOD%=:                           \n\t"
+
+            // Hoist d_orig once per K256 super-tile: 32 x fp16 -> 32 x fp32.
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vle16.v      v12, (s7)               \n\t"
+            "li           t5, 8                   \n\t"
+
+            ".align 4                             \n\t"
+            "_K_LPID%=:                           \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vl4r.v       v4, (s5)                \n\t"
+            "addi         s5, s5, 560             \n\t"
+
+            // Rebuild the fp16 scale in place of the zpn kernel's 64 B load
+            // of eight materialised d1 values.  d_orig is fp16 and sc<=63, so
+            // their exact product needs <=17 significand bits and one IEEE
+            // rounding in fp16 reproduces fl16(fl32(d_orig)*fl32(sc)) bit for
+            // bit: verified exhaustively on the A100 (4,194,304 cases, 0
+            // mismatches, ill_probe2).  v12 stays live across all 8 k_blks.
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vle8.v       v29, (s4)               \n\t"
+            "vwaddu.vx    v13, v29, x0            \n\t"
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vfcvt.f.x.v  v13, v13                \n\t"
+            "vfmul.vv     v30, v12, v13           \n\t"
+
+            // zp4 expansion, verbatim from gemm_kernel_i8i4_m1_zpn.
+            "vsetvli      t0, x0, e8, mf8         \n\t"
+            "addi         t6, s4, 32              \n\t"
+            "vle8.v       v29, (t6)               \n\t"
+            "vand.vi      v31, v29, 0xF           \n\t"
+            "vsrl.vi      v29, v29, 4             \n\t"
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vslideup.vi  v31, v29, 16            \n\t"
+            "addi         s4, s4, 560             \n\t"
+
+            "vle8.v       v3, (s3)                \n\t"
+            "addi         s3, s3, 32+6            \n\t"
+
+            "flw          f0, (s2)                \n\t"
+            "lh           t2, 4(s2)               \n\t"
+            "addi         s2, s2, 6+32            \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vsrl.vi      v24, v3, 4              \n\t"
+
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vnpack4.vv   v8, v3, v3, 3           \n\t"
+            "vnpack4.vv   v10, v24, v24, 3        \n\t"
+
+            "vxor.vv      v16, v16, v16           \n\t"
+            "vxor.vv      v18, v16, v16           \n\t"
+            "vxor.vv      v20, v16, v16           \n\t"
+            "vxor.vv      v22, v16, v16           \n\t"
+
+            "vmadotsu.hp  v16, v10, v4, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v18, v10, v5, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v20, v10, v6, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v22, v10, v7, v1, 0, i4 \n\t"
+            "vmadotu.hp   v16, v8, v4, v0, 0, i4  \n\t"
+            "vmadotu.hp   v18, v8, v5, v0, 0, i4  \n\t"
+            "vmadotu.hp   v20, v8, v6, v0, 0, i4  \n\t"
+            "vmadotu.hp   v22, v8, v7, v0, 0, i4  \n\t"
+
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vwaddu.vx    v28, v31, x0            \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vpack.vv     v24, v16, v18, 1        \n\t"
+            "vpack.vv     v26, v20, v22, 1        \n\t"
+            "vpack.vv     v16, v24, v26, 2        \n\t"
+
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            "vmul.vx      v26, v28, t2            \n\t"
+            "vfwcvt.f.f.v v22, v30                \n\t"
+            "vfcvt.f.x.v  v18, v26                \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vfwadd.vv    v20, v18, v16           \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vfmul.vv     v31, v22, v20           \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            "vfmacc.vf    v2, f0, v31             \n\t"
+
+            "addi         t5, t5, -1              \n\t"
+            "bgtz         t5, _K_LPID%=           \n\t"
+
+            // Cross the super-tile boundary.  s4/s5 have consumed 8*560 = 4480 B
+            // of the 4544 B super-tile; the extra 64 B skip lands them on the
+            // next super-tile's sc (4544+64) and qs (4544+112).
+            "addi         s5, s5, 64              \n\t"
+            "addi         s4, s4, 64              \n\t"
+            "add          s7, s7, t1              \n\t"
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, _K_LPOD%=           \n\t"
+
+            "vsetvli      t0, t4, e32, m1         \n\t"
+            "vse32.v      v2, (s6)                \n\t"
+            :
+            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
+            : "cc", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "f0", "s2", "s3", "s4", "s5", "s6", "s7");
+    }
+}
+
+static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
+                                     const uint8_t * quant_b_data,
+                                     float *         c_ptr,
+                                     size_t          count_n,
+                                     size_t          k_blks,
+                                     size_t          ldc) {
+    const size_t supers = k_blks / 8;
+    for (size_t ni = 0; ni < count_n; ni += 32) {
+        uint8_t * b_data = (uint8_t *) quant_b_data + (ni / 32) * supers * 4544;
+        int8_t *  a_data = (int8_t *) quant_a_ptr;
+        float *   dst_c  = c_ptr + ni;
+
+        asm volatile(
+            "li             t1,  4544       \n\t"
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "vxor.vv        v28, v28, v28   \n\t"
+            "vxor.vv        v29, v29, v29   \n\t"
+            "vxor.vv        v30, v30, v30   \n\t"
+            "vxor.vv        v31, v31, v31   \n\t"
+            "mv             t4, %[BK]       \n\t"
+            "mv             s5, %[B]        \n\t"
+            "addi           %[B], %[B], 64  \n\t"
+
+            ".align 4                        \n\t"
+            "BLK_LOOPDSO%=:                  \n\t"
+
+            // Hoist d_orig once per K256 super-tile: 32 x fp16 -> 32 x fp32.
+            "vsetvli        t0, x0, e16, mf2\n\t"
+            "vle16.v        v15, (s5)       \n\t"
+            "li             t5, 8           \n\t"
+
+            ".align 4                        \n\t"
+            "BLK_LOOPDSZ%=:                  \n\t"
+            "flw            fa0, (%[A])     \n\t"
+            "flw            fa1, 4(%[A])    \n\t"
+            "flw            fa2, 8(%[A])    \n\t"
+            "flw            fa3, 12(%[A])   \n\t"
+            "addi           %[A], %[A], 16  \n\t"
+
+            // Rebuild the fp16 scale into v12 with a single fp16 multiply
+            // (bit-exact vs fl16(fl32(d_orig)*sc): A100 exhaustive probe,
+            // 4,194,304 cases, 0 mismatches), then keep the zpn kernel's
+            // own widening step into v14 verbatim.  v15 holds d_orig as fp16
+            // and stays live across all 8 k_blks.
+            "vsetvli        t0, x0, e8, mf4 \n\t"
+            "vle8.v         v24, (%[B])     \n\t"
+            "addi           %[B], %[B], 32  \n\t"
+            "vwaddu.vx      v12, v24, x0    \n\t"
+            "vsetvli        t0, x0, e16, mf2\n\t"
+            "vfcvt.f.x.v    v12, v12        \n\t"
+            "vfmul.vv       v12, v15, v12   \n\t"
+            "vsetvli        t0, x0, e16, mf2\n\t"
+            "vfwcvt.f.f.v   v14, v12        \n\t"
+
+            // zp4 expansion, verbatim from gemm_kernel_i8i4_m4_zpn.
+            "vsetvli        t0, x0, e8, mf8 \n\t"
+            "vle8.v         v24, (%[B])     \n\t"
+            "vand.vi        v8, v24, 0xF    \n\t"
+            "vsrl.vi        v24, v24, 4     \n\t"
+            "vsetvli        t0, x0, e8, mf4 \n\t"
+            "vslideup.vi    v8, v24, 16     \n\t"
+            "addi           %[B], %[B], 16  \n\t"
+            "vwaddu.vx      v10, v8, x0     \n\t"
+
+            "lh             s1, (%[A])      \n\t"
+            "lh             s2, 2(%[A])     \n\t"
+            "lh             s3, 4(%[A])     \n\t"
+            "lh             s4, 6(%[A])     \n\t"
+            "addi           %[A], %[A], 8   \n\t"
+
+            "vsetvli        t0, x0, e8, m1  \n\t"
+            "vl1r.v         v0, (%[A])      \n\t"
+            "addi           %[A], %[A], 128 \n\t"
+            "vl4r.v         v4, (%[B])      \n\t"
+            "addi           %[B], %[B], 512 \n\t"
+            "vsrl.vi        v1, v0, 4       \n\t"
+            "vnpack4.vv     v12, v0, v1, 3  \n\t"
+            "vupack.vv      v2, v12, v12, 2 \n\t"
+
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "vxor.vv        v16, v16, v16   \n\t"
+            "vxor.vv        v18, v16, v16   \n\t"
+            "vxor.vv        v20, v16, v16   \n\t"
+            "vxor.vv        v22, v16, v16   \n\t"
+
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "vmadotsu       v16, v3, v4, i4 \n\t"
+            "vmadotsu       v18, v3, v5, i4 \n\t"
+            "vmadotsu       v20, v3, v6, i4 \n\t"
+            "vmadotsu       v22, v3, v7, i4 \n\t"
+            "vsll.vi        v16, v16, 4     \n\t"
+            "vsll.vi        v18, v18, 4     \n\t"
+            "vsll.vi        v20, v20, 4     \n\t"
+            "vsll.vi        v22, v22, 4     \n\t"
+            "vmadotu        v16, v2, v4, i4 \n\t"
+            "vmadotu        v18, v2, v5, i4 \n\t"
+            "vmadotu        v20, v2, v6, i4 \n\t"
+            "vmadotu        v22, v2, v7, i4 \n\t"
+
+            "vpack.vv       v0, v16, v18, 2 \n\t"
+            "vpack.vv       v2, v20, v22, 2 \n\t"
+            "vpack.vv       v16, v0, v2, 3  \n\t"
+            "vpack.vv       v18, v1, v3, 3  \n\t"
+
+            "vsetvli        t0, x0, e16, m1 \n\t"
+            "vwmul.vx       v0, v10, s1     \n\t"
+            "vwmul.vx       v2, v10, s2     \n\t"
+            "vwmul.vx       v4, v10, s3     \n\t"
+            "vwmul.vx       v6, v10, s4     \n\t"
+
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "vadd.vv        v16, v16, v0    \n\t"
+            "vadd.vv        v17, v17, v2    \n\t"
+            "vadd.vv        v18, v18, v4    \n\t"
+            "vadd.vv        v19, v19, v6    \n\t"
+
+            "vfcvt.f.x.v    v16, v16        \n\t"
+            "vfcvt.f.x.v    v17, v17        \n\t"
+            "vfcvt.f.x.v    v18, v18        \n\t"
+            "vfcvt.f.x.v    v19, v19        \n\t"
+
+            "vfmul.vv       v16, v16, v14   \n\t"
+            "vfmul.vv       v17, v17, v14   \n\t"
+            "vfmul.vv       v18, v18, v14   \n\t"
+            "vfmul.vv       v19, v19, v14   \n\t"
+
+            "addi           t5, t5, -1      \n\t"
+            "vfmacc.vf      v28, fa0, v16   \n\t"
+            "vfmacc.vf      v29, fa1, v17   \n\t"
+            "vfmacc.vf      v30, fa2, v18   \n\t"
+            "vfmacc.vf      v31, fa3, v19   \n\t"
+
+            "bgtz           t5, BLK_LOOPDSZ%= \n\t"
+            // Cross the super-tile boundary: 8*560 = 4480 B consumed, skip the
+            // next 64 B d_orig so %[B] lands on the next sub[0].sc.
+            "addi           %[B], %[B], 64  \n\t"
+            "add            s5, s5, t1      \n\t"
+            "addi           t4, t4, -1      \n\t"
+            "bgtz           t4, BLK_LOOPDSO%= \n\t"
+
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "add            t2, %[LDC], %[DST]\n\t"
+            "vse32.v        v28, (%[DST])   \n\t"
+            "add            t3, %[LDC], t2  \n\t"
+            "vse32.v        v29, (t2)       \n\t"
+            "add            t2, %[LDC], t3  \n\t"
+            "vse32.v        v30, (t3)       \n\t"
+            "vse32.v        v31, (t2)       \n\t"
+            : [A] "+r"(a_data), [B] "+r"(b_data)
+            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(supers)
+            : "t0", "t1", "t2", "t3", "t4", "t5", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
+              "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
+              "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4",
+              "s5");
+    }
+}
+
+// ---------------------------------------------------------------------------
+size_t gemm_kernel_i8i4_legacy(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc) {
+    const bool previous = spine_q4_legacy_override;
+    spine_q4_legacy_override = true;
+    const size_t handled = gemm_kernel_i8i4(
+        blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
+    spine_q4_legacy_override = previous;
+    return handled;
+}
 }  // namespace ime2
 }  // namespace spacemit_kernels
