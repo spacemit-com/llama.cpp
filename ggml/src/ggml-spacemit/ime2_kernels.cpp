@@ -6529,9 +6529,21 @@ static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
             "vsetvli        t0, x0, e16, mf2\n\t"
             "vle16.v        v15, (s5)       \n\t"
             "li             t5, 8           \n\t"
+            "li             t6, 0           \n\t"
 
             ".align 4                        \n\t"
             "BLK_LOOPDSZ%=:                  \n\t"
+            // Hand off payloads fetched during the previous iteration.
+            "beqz           t6, M4_NO_BUFFER%=\n\t"
+            "vsetvli        t0, x0, e32, m1 \n\t"
+            "vmv.v.v        v0, v13         \n\t"
+            "vmv.v.v        v4, v24         \n\t"
+            "vmv.v.v        v5, v25         \n\t"
+            "vmv.v.v        v6, v26         \n\t"
+            "vmv.v.v        v7, v27         \n\t"
+            "j              M4_BUFFER_READY%=\n\t"
+            "M4_NO_BUFFER%=:                 \n\t"
+            "M4_BUFFER_READY%=:              \n\t"
             "flw            fa0, (%[A])     \n\t"
             "flw            fa1, 4(%[A])    \n\t"
             "flw            fa2, 8(%[A])    \n\t"
@@ -6570,13 +6582,29 @@ static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
             "addi           %[A], %[A], 8   \n\t"
 
             "vsetvli        t0, x0, e8, m1  \n\t"
+            "beqz           t6, M4_DIRECT_PAYLOAD%=\n\t"
+            "li             t6, 0           \n\t"
+            "addi           %[A], %[A], 128 \n\t"
+            "addi           %[B], %[B], 512 \n\t"
+            "j              M4_PAYLOAD_READY%=\n\t"
+            "M4_DIRECT_PAYLOAD%=:            \n\t"
             "vl1r.v         v0, (%[A])      \n\t"
             "addi           %[A], %[A], 128 \n\t"
             "vl4r.v         v4, (%[B])      \n\t"
             "addi           %[B], %[B], 512 \n\t"
+            "M4_PAYLOAD_READY%=:            \n\t"
             "vsrl.vi        v1, v0, 4       \n\t"
             "vnpack4.vv     v12, v0, v1, 3  \n\t"
             "vupack.vv      v2, v12, v12, 2 \n\t"
+            // Fetch next K32 payload while the current dot/scale work runs.
+            "addi           t2, t5, -1      \n\t"
+            "beqz           t2, M4_NO_PREFETCH%=\n\t"
+            "addi           t2, %[A], 24    \n\t"
+            "vl1r.v         v13, (t2)       \n\t"
+            "addi           t2, %[B], 48    \n\t"
+            "vl4r.v         v24, (t2)       \n\t"
+            "li             t6, 1           \n\t"
+            "M4_NO_PREFETCH%=:              \n\t"
 
             "vsetvli        t0, x0, e32, m1 \n\t"
             "vxor.vv        v16, v16, v16   \n\t"
@@ -6652,7 +6680,7 @@ static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
             : "t0", "t1", "t2", "t3", "t4", "t5", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10",
               "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
               "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4",
-              "s5");
+              "s5", "t6");
     }
 }
 
