@@ -266,7 +266,7 @@ jobs:
           rm -rf build/CMakeCache.txt
           cmake -B build \
               -DCMAKE_BUILD_TYPE=Release \
-              -DGGML_CPU_RISCV64_SPACEMIT=ON \
+              -DGGML_SPACEMIT=ON \
               -DGGML_CPU_REPACK=OFF \
               -DGGML_OPENMP=OFF \
               -DLLAMA_CURL=OFF \
@@ -527,7 +527,7 @@ jobs:
           rm -f build-ohos/tools/ui/llama-ui-embed-host
           cmake -B build-ohos \
               -DCMAKE_BUILD_TYPE=Release \
-              -DGGML_CPU_RISCV64_SPACEMIT=ON \
+              -DGGML_SPACEMIT=ON \
               -DGGML_CPU_REPACK=OFF \
               -DGGML_OPENMP=OFF \
               -DLLAMA_CURL=OFF \

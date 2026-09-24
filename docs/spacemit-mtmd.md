@@ -11,6 +11,8 @@ To build with SMT support, you need:
 
 - the SpacemiT RISC-V toolchain
 - `RISCV_ROOT_PATH` pointing to that toolchain
+- the SpacemiT spine-runtime (spert) package unpacked locally
+- `SPERT_DIR` pointing to the unpacked spine-runtime directory
 - the SpacemiT ORT package unpacked locally
 - `SPACEMIT_ORT_DIR` pointing to the unpacked ORT directory
 
@@ -18,18 +20,25 @@ Download and unpack the required packages:
 
 ```bash
 wget https://github.com/spacemit-com/toolchain/releases/download/v1.1.2/spacemit-toolchain-linux-glibc-x86_64-v1.1.2.tar.xz
+wget https://github.com/spacemit-com/spine-runtime/releases/download/0.6.3/spine-runtime.riscv64.0.6.3.tar.gz
 wget https://github.com/spacemit-com/onnxruntime/releases/download/2.0.2/spacemit-ort.riscv64.2.0.2.tar.gz
 ```
+
+The SpacemiT backend itself is enabled with `-DGGML_SPACEMIT=ON` (the standalone
+`ggml-spacemit` backend). `-DGGML_CPU_RISCV64_SPACEMIT` is the legacy in-CPU path and is
+deprecated: when `GGML_SPACEMIT=ON` is set it is disabled automatically, so do not enable both.
 
 Then build:
 
 ```bash
 export RISCV_ROOT_PATH=/path/to/spacemit_toolchain
+export SPERT_DIR=/path/to/spine-runtime
 export SPACEMIT_ORT_DIR=/path/to/spacemit-ort
 
 cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_CPU_RISCV64_SPACEMIT=ON \
+    -DGGML_SPACEMIT=ON \
+    -DSPERT_DIR=${SPERT_DIR} \
     -DGGML_CPU_REPACK=OFF \
     -DGGML_OPENMP=OFF \
     -DLLAMA_CURL=OFF \

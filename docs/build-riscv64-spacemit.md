@@ -9,12 +9,31 @@ wget https://github.com/spacemit-com/toolchain/releases/download/v1.2.4/spacemit
 ~~~
 
 2. Build
-Below is the build script: it requires utilizing RISC-V vector instructions for acceleration. Ensure the `GGML_CPU_RISCV64_SPACEMIT` compilation option is enabled. The currently supported optimization version is `RISCV64_SPACEMIT_IME1` and `RISCV64_SPACEMIT_IME2`, corresponding to the `RISCV64_SPACEMIT_IME_SPEC` compilation option. Compiler configurations are defined in the `riscv64-spacemit-linux-gnu-gcc.cmake` file. Please ensure you have installed the RISC-V compiler and set the environment variable via `export RISCV_ROOT_PATH={your_compiler_path}`.
+Below is the build script: it requires utilizing RISC-V vector instructions for acceleration.
+
+The SpacemiT backend is enabled with **`-DGGML_SPACEMIT=ON`** (the standalone `ggml-spacemit`
+backend, `ggml/src/ggml-spacemit`). It consumes the `spine-runtime` (spert) release package as a
+prebuilt dependency, so `SPERT_DIR` must point at the extracted release tree (containing `include/`
+and `lib/`), for example:
+
+```bash
+wget https://github.com/spacemit-com/spine-runtime/releases/download/0.6.3/spine-runtime.riscv64.0.6.3.tar.gz
+tar xzf spine-runtime.riscv64.0.6.3.tar.gz
+export SPERT_DIR=${PWD}/spine-runtime.riscv64.0.6.3
+```
+
+The backend detects the IME (`.vmadot`) instructions your compiler supports and sets
+`RISCV64_SPACEMIT_IME_SPEC` (`RISCV64_SPACEMIT_IME1` / `RISCV64_SPACEMIT_IME2`) automatically.
+`-DGGML_CPU_RISCV64_SPACEMIT` is the legacy in-CPU path and is deprecated: when `GGML_SPACEMIT=ON`
+is set, it is disabled automatically (do not enable both). Compiler configurations are defined in
+the `riscv64-spacemit-linux-gnu-gcc.cmake` file. Please ensure you have installed the RISC-V compiler
+and set the environment variable via `export RISCV_ROOT_PATH={your_compiler_path}`.
 ```bash
 
 cmake -B build \
     -DCMAKE_BUILD_TYPE=Release \
-    -DGGML_CPU_RISCV64_SPACEMIT=ON \
+    -DGGML_SPACEMIT=ON \
+    -DSPERT_DIR=${SPERT_DIR} \
     -DGGML_CPU_REPACK=OFF \
     -DLLAMA_OPENSSL=OFF \
     -DGGML_RVV=ON \

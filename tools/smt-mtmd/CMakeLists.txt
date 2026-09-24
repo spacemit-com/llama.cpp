@@ -90,14 +90,16 @@ if(LLAMA_SERVER_SMT_MTMD)
     if(CMAKE_DL_LIBS)
         target_link_libraries(${TARGET} PRIVATE ${CMAKE_DL_LIBS})
     endif()
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND GGML_CPU_RISCV64_SPACEMIT)
-        get_target_property(QWEN3_TTS_RISCV_OPTIONS ggml-cpu COMPILE_OPTIONS)
-        if(QWEN3_TTS_RISCV_OPTIONS)
-            list(FILTER QWEN3_TTS_RISCV_OPTIONS INCLUDE REGEX "^-m(arch|abi)=")
-            set_source_files_properties(
-                smt/qwen3-tts/qwen3_tts_talker.cpp
-                PROPERTIES COMPILE_OPTIONS "${QWEN3_TTS_RISCV_OPTIONS}"
-            )
-        endif()
+    if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv" AND (GGML_SPACEMIT OR GGML_CPU_RISCV64_SPACEMIT))
+        # qwen3_tts_talker.cpp enables its RVV kernels behind
+        # `#if defined(__riscv_vector) && defined(__riscv_zvfh)`, so it needs an explicit
+        # -march/-mabi: ggml-cpu's ARCH_FLAGS and ggml-spacemit's SPACEMIT_MARCH are both
+        # target-PRIVATE (they do not propagate to targets that link them), and the OHOS
+        # toolchain intentionally leaves -march/-mabi unset globally. Without this the file
+        # silently falls back to its scalar dot_f16/f16_gemv path.
+        set_source_files_properties(
+            smt/qwen3-tts/qwen3_tts_talker.cpp
+            PROPERTIES COMPILE_OPTIONS "-march=rv64gcv_zfh_zvfh_zba_zicbop;-mabi=lp64d"
+        )
     endif()
 endif()
