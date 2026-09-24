@@ -3377,10 +3377,6 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                   "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4");
         }
     }
-    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
-        GGML_ASSERT(k_blks % 8 == 0);
-        gemm_kernel_i8i4_m4_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
-    }
 
 }
 void gemm_kernel_i8i4_hp_m4(size_t          blk_len,
