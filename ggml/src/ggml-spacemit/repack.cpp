@@ -989,6 +989,7 @@ static int repack_q4_k_to_q4_1_32_bl_ds(ggml_tensor *              t,
     GGML_ASSERT(t->type == GGML_TYPE_Q4_K);
     GGML_ASSERT(interleave_block == 32);
     GGML_ASSERT(QK_K / QK4_1 == 8);
+    GGML_UNUSED(data_size);
 
     constexpr int nrows_interleaved = 32;
     using dst_super = spacemit_kernels::nrow_super_q4_k_ds<nrows_interleaved>;
@@ -998,8 +999,6 @@ static int repack_q4_k_to_q4_1_32_bl_ds(ggml_tensor *              t,
     int     nrow    = ggml_nrows(t);
     int     nblocks = t->ne[0] / QK_K;
     block_q4_1 dst_tmp[nrows_interleaved];
-
-    const bool verify = false;
 
     if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_K != 0) {
         return -1;
@@ -1046,18 +1045,6 @@ static int repack_q4_k_to_q4_1_32_bl_ds(ggml_tensor *              t,
                         static_cast<uint8_t>(packed.zp[i] | (packed.zp[i + nrows_interleaved / 2] << 4));
                 }
                 std::memcpy(sub.qs, packed.qs, sizeof(sub.qs));
-
-                if (verify) {
-                    for (int i = 0; i < nrows_interleaved; i++) {
-                        const float df = GGML_FP16_TO_FP32(dst->d[i]);
-                        const uint16_t rec =
-                            static_cast<uint16_t>(GGML_FP32_TO_FP16(df * static_cast<float>(scv[i])));
-                        if (rec != static_cast<uint16_t>(packed.d[i])) {
-                            GGML_ABORT("Q4_K d-share rebuild mismatch row %d blk %d sub %d col %d\n",
-                                       b + i, (int) x, j, i);
-                        }
-                    }
-                }
             }
             ++dst;
         }
@@ -1065,8 +1052,6 @@ static int repack_q4_k_to_q4_1_32_bl_ds(ggml_tensor *              t,
     }
 
     return 0;
-
-    GGML_UNUSED(data_size);
 }
 
 static int repack_q6_k_to_q6_k_32_bl_dedup(ggml_tensor *              t,

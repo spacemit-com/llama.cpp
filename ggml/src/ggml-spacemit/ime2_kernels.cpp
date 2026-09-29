@@ -6,7 +6,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
+#include <memory>
 #include <stdexcept>
+#include <vector>
 
 #if !defined(__riscv_v) || !defined(__riscv_v_intrinsic)
 #    error "riscv v extension or v_intrinsic not enabled"
@@ -31,10 +34,6 @@
 
 namespace spacemit_kernels {
 namespace ime2 {
-inline bool spine_q4_d_shared() {
-    return true;
-}
-
 static thread_local bool spine_q4_legacy_override = false;
 
 static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks);
@@ -2444,7 +2443,7 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
                          size_t          count_n,
                          size_t          k_blks,
                          size_t          ldc) {
-    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+    if (quant_b_zp != NULL && !spine_q4_legacy_override) {
         GGML_ASSERT(k_blks % 8 == 0);
         gemm_kernel_i8i4_m1_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
         return;
@@ -2891,11 +2890,6 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 #endif
         }
     }
-    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
-        GGML_ASSERT(k_blks % 8 == 0);
-        gemm_kernel_i8i4_m1_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
-    }
-
 }
 void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                             const uint8_t * quant_a_ptr,
@@ -3030,7 +3024,7 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
                          size_t          count_n,
                          size_t          k_blks,
                          size_t          ldc) {
-    if (quant_b_zp != NULL && !spine_q4_legacy_override && spine_q4_d_shared()) {
+    if (quant_b_zp != NULL && !spine_q4_legacy_override) {
         GGML_ASSERT(k_blks % 8 == 0);
         gemm_kernel_i8i4_m4_zpds(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
         return;
@@ -5865,7 +5859,6 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
 
     for (size_t ni = 0; ni < count_n; ni += NB_COLS) {
         const size_t nb_real = std::min<size_t>(NB_COLS, count_n - ni);
-        // Start on sub[0]; the shared d array sits immediately before it.
         const uint8_t * b_data = quant_b_data + (ni / NB_COLS) * b_tile_stride + d_bytes;
         const uint8_t * a_data = quant_a_ptr;
         float * dst = c_ptr + ni;
@@ -6048,6 +6041,7 @@ static void gemm_kernel_i8i6k_m4_ime2_dedup(size_t          blk_len,
         const uint8_t * b_data = quant_b_data + (ni / NB_COLS) * b_tile_stride + d_bytes;
         const uint8_t * a_data = quant_a_ptr;
         float * dst = c_ptr + ni;
+        // One outer assembly iteration consumes 8 K32 blocks.
         size_t cnt = k_blks;
 
         asm volatile(
@@ -6336,6 +6330,37 @@ static void gemm_kernel_i8i6k_m4_ime2_dedup(size_t          blk_len,
     }
 }
 
+static void gemm_kernel_i8i6k_m4_via_m1(size_t          blk_len,
+                                        const uint8_t * quant_a_ptr,
+                                        const uint8_t * quant_b_data,
+                                        float *         c_ptr,
+                                        size_t          count_n,
+                                        size_t          k_blks,
+                                        size_t          ldc) {
+    GGML_ASSERT(blk_len == 32);
+    const size_t a1_stride = q8k_blk_size(blk_len);
+    const size_t a4_stride = a1_stride * 4;
+    const size_t a_row_size = a1_stride * k_blks;
+    std::vector<uint8_t> a_storage(a_row_size + 63);
+    void * a_row_aligned = a_storage.data();
+    size_t a_storage_size = a_storage.size();
+    GGML_ASSERT(std::align(64, a_row_size, a_row_aligned, a_storage_size) != nullptr);
+    auto * a_row = static_cast<uint8_t *>(a_row_aligned);
+
+    for (size_t mi = 0; mi < 4; ++mi) {
+        for (size_t ki = 0; ki < k_blks; ++ki) {
+            const uint8_t * src = quant_a_ptr + ki * a4_stride;
+            uint8_t *       dst = a_row + ki * a1_stride;
+            std::memcpy(dst, src + mi * sizeof(float), sizeof(float));
+            const size_t sum_offset = sizeof(float) * 4 + mi * 2 * sizeof(int16_t);
+            std::memcpy(dst + sizeof(float), src + sum_offset, 2 * sizeof(int16_t));
+            const size_t q_offset = sizeof(float) * 4 + sizeof(int16_t) * 8 + mi * blk_len;
+            std::memcpy(dst + sizeof(float) + 2 * sizeof(int16_t), src + q_offset, blk_len);
+        }
+        gemm_kernel_i8i6k_m1_ime2_dedup(blk_len, a_row, quant_b_data, c_ptr + mi * ldc, count_n, k_blks);
+    }
+}
+
 size_t gemm_kernel_i8i6k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
@@ -6351,10 +6376,14 @@ size_t gemm_kernel_i8i6k(size_t          blk_len,
         return 1;
     }
     if (count_m >= 4 && __riscv_vlenb() == 128) {
-        gemm_kernel_i8i6k_m4_ime2_dedup(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+        gemm_kernel_i8i6k_m4_via_m1(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
         return 4;
     }
-    gemm_kernel_i8i6k_mrow_ref_dedup<1, 32>(blk_len, quant_a_ptr, quant_b_data, c_ptr, count_m, count_n, k_blks, ldc);
+    if (count_m >= 4) {
+        gemm_kernel_i8i6k_mrow_ref_dedup<4, 32>(blk_len, quant_a_ptr, quant_b_data, c_ptr, 4, count_n, k_blks, ldc);
+        return 4;
+    }
+    gemm_kernel_i8i6k_mrow_ref_dedup<1, 32>(blk_len, quant_a_ptr, quant_b_data, c_ptr, 1, count_n, k_blks, ldc);
     return 1;
 }
 
@@ -6403,12 +6432,6 @@ static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
             "vl4r.v       v4, (s5)                \n\t"
             "addi         s5, s5, 560             \n\t"
 
-            // Rebuild the fp16 scale in place of the zpn kernel's 64 B load
-            // of eight materialised d1 values.  d_orig is fp16 and sc<=63, so
-            // their exact product needs <=17 significand bits and one IEEE
-            // rounding in fp16 reproduces fl16(fl32(d_orig)*fl32(sc)) bit for
-            // bit: verified exhaustively on the A100 (4,194,304 cases, 0
-            // mismatches, ill_probe2).  v12 stays live across all 8 k_blks.
             "vsetvli      t0, x0, e8, mf4         \n\t"
             "vle8.v       v29, (s4)               \n\t"
             "vwaddu.vx    v13, v29, x0            \n\t"
@@ -6546,22 +6569,14 @@ static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
             "flw            fa3, 12(%[A])   \n\t"
             "addi           %[A], %[A], 16  \n\t"
 
-            // Rebuild the fp16 scale into v12 with a single fp16 multiply
-            // (bit-exact vs fl16(fl32(d_orig)*sc): A100 exhaustive probe,
-            // 4,194,304 cases, 0 mismatches), then keep the zpn kernel's
-            // own widening step into v14 verbatim.  v15 holds d_orig as fp16
-            // and stays live across all 8 k_blks.
             "vsetvli        t0, x0, e8, mf4 \n\t"
             "vle8.v         v24, (%[B])     \n\t"
             "addi           %[B], %[B], 32  \n\t"
-            "vwaddu.vx      v12, v24, x0    \n\t"
+            "vfwcvt.f.xu.v  v12, v24        \n\t"
             "vsetvli        t0, x0, e16, mf2\n\t"
-            "vfcvt.f.x.v    v12, v12        \n\t"
             "vfmul.vv       v12, v15, v12   \n\t"
-            "vsetvli        t0, x0, e16, mf2\n\t"
             "vfwcvt.f.f.v   v14, v12        \n\t"
 
-            // zp4 expansion, verbatim from gemm_kernel_i8i4_m4_zpn.
             "vsetvli        t0, x0, e8, mf8 \n\t"
             "vle8.v         v24, (%[B])     \n\t"
             "vand.vi        v8, v24, 0xF    \n\t"
@@ -6592,7 +6607,6 @@ static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
             "vsrl.vi        v1, v0, 4       \n\t"
             "vnpack4.vv     v12, v0, v1, 3  \n\t"
             "vupack.vv      v2, v12, v12, 2 \n\t"
-            // Fetch next K32 payload while the current dot/scale work runs.
             "addi           t2, t5, -1      \n\t"
             "beqz           t2, M4_NO_PREFETCH%=\n\t"
             "addi           t2, %[A], 24    \n\t"

@@ -19,11 +19,7 @@ inline void spine_barrier_wait(spine_barrier_t * b) {
         b->pending_.store(b->total_);
         b->rounds_.store(cur_round + 1);
     } else {
-        int spin = 0;
         while (cur_round == b->rounds_.load(std::memory_order_relaxed)) {
-            if (++spin < 64) {
-                continue;
-            }
             __asm__ volatile("pause " ::: "memory");
         }
     }
