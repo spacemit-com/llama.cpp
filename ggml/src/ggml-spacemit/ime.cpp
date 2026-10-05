@@ -9,7 +9,6 @@
 #include "ggml-cpu.h"
 #include "ime_kernels.h"
 #include "repack.h"
-#include "pp_q4k.hpp"
 #include "rvv_kernels.h"
 #include "scalar_kernels.h"
 #include "spacemit-context.h"
@@ -434,24 +433,41 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
 #if defined(RISCV64_SPACEMIT_IME2)
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
-            const int64_t k_blocks = gemm_k / static_cast<int64_t>(q4k_pp::kBlockK);
-            const size_t a_tile_bytes = static_cast<size_t>(2 * k_blocks) * sizeof(q4k_pp::PackedABlockM8Ime);
-            if (q4_legacy_layout && gemm_m >= 16 && gemm_m % 16 == 0 &&
+            const int64_t k_blocks = gemm_k / 32;
+            const size_t  m8_a_tile_bytes =
+                static_cast<size_t>(k_blocks) * sizeof(spacemit_kernels::ime2::q4_k_pp_block_a);
+            // K3 A100 PP8: use M8 only for the small Q4_K shapes that beat the legacy path.
+            if (q4_legacy_layout && gemm_m == 8 && gemm_n >= 512 && gemm_n <= 1024 && gemm_k <= 1024 &&
                 gemm_n % 32 == 0 && gemm_k % QK_K == 0 && tcm_buffer != nullptr &&
                 reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
-                a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
-                const auto * expanded_b = reinterpret_cast<const q4k_pp::PackedBlockQ8N32Ime *>(
+                m8_a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
+                const auto * expanded_b = reinterpret_cast<const spacemit_kernels::ime2::q4_k_pp_block_b *>(
                     static_cast<const uint8_t *>(src0->data) + spine_q4_k_expanded_offset(src0));
-                auto * packed_a = static_cast<q4k_pp::PackedABlockM8Ime *>(tcm_buffer);
+                auto * packed_a = static_cast<spacemit_kernels::ime2::q4_k_pp_block_a *>(tcm_buffer);
+                spacemit_kernels::ime2::quantize_a_m8_ime(feature, gemm_k, packed_a);
+                for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
+                    const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
+                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(packed_a, b_tile, output + ni, k_blocks, gemm_n);
+                }
+                return true;
+            }
+            const size_t a_tile_bytes =
+                static_cast<size_t>(2 * k_blocks) * sizeof(spacemit_kernels::ime2::q4_k_pp_block_a);
+            if (q4_legacy_layout && gemm_m >= 16 && gemm_m % 16 == 0 && gemm_n % 32 == 0 && gemm_k % QK_K == 0 &&
+                tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
+                a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
+                const auto * expanded_b = reinterpret_cast<const spacemit_kernels::ime2::q4_k_pp_block_b *>(
+                    static_cast<const uint8_t *>(src0->data) + spine_q4_k_expanded_offset(src0));
+                auto * packed_a = static_cast<spacemit_kernels::ime2::q4_k_pp_block_a *>(tcm_buffer);
                 for (int64_t mi = static_cast<int64_t>(ith) * 16; mi < gemm_m; mi += 16 * nth) {
-                    q4k_pp::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
-                    q4k_pp::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
+                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
+                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
                     for (int64_t ni = 0; ni < gemm_n; ni += 32) {
                         const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
-                        q4k_pp::gemm_m8_q8_ab_prepacked(packed_a, b_tile, output + mi * gemm_n + ni,
-                                                       k_blocks, gemm_n);
-                        q4k_pp::gemm_m8_q8_ab_prepacked(packed_a + k_blocks, b_tile,
-                                                       output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
+                        spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(packed_a, b_tile, output + mi * gemm_n + ni,
+                                                                        k_blocks, gemm_n);
+                        spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                            packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
                     }
                 }
                 return true;
@@ -1802,9 +1818,10 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     switch (tensor->type) {
         case GGML_TYPE_Q4_K:
             if (ggml::cpu::riscv64_spacemit::spine_q4_m_split_enabled(tensor)) {
-                nbytes = ggml::cpu::riscv64_spacemit::spine_q4_k_expanded_offset(tensor) +
-                         (static_cast<size_t>(ggml_nrows(tensor)) * static_cast<size_t>(tensor->ne[0] / QK_K) * 8 /
-                          q4k_pp::kTileN) * sizeof(q4k_pp::PackedBlockQ8N32Ime);
+                nbytes =
+                    ggml::cpu::riscv64_spacemit::spine_q4_k_expanded_offset(tensor) +
+                    (static_cast<size_t>(ggml_nrows(tensor)) * static_cast<size_t>(tensor->ne[0] / QK_K) * 8 / 32) *
+                        sizeof(spacemit_kernels::ime2::q4_k_pp_block_b);
             } else {
                 nbytes = remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8);
             }
