@@ -56,6 +56,8 @@ ggml_add_backend_library(${TARGET_NAME}
     rvv_kernels.cpp
     scalar_kernels.cpp
     repack.cpp
+    pp_q4k.cpp
+    pp_m8_ab.cpp
     spacemit-context.h
     spacemit-env.h
     spine_mem_pool.cpp

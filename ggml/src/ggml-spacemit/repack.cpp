@@ -7,6 +7,7 @@
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
 #include "ime_kernels.h"
+#include "pp_q4k.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -1898,10 +1899,14 @@ template <> int repack<block_q4_1, 256, 32>(ggml_tensor * t, const void * data, 
 
 template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     if (t->ne[0] % QK_K == 0 && t->ne[1] % 32 == 0) {
+        static_assert(sizeof(block_q4_1x32) == sizeof(q4k_pp::PackedBlockQ4N32));
+        static_assert(offsetof(block_q4_1x32, qs) == offsetof(q4k_pp::PackedBlockQ4N32, qs));
         const size_t nrows   = static_cast<size_t>(ggml_nrows(t));
         const size_t nblocks = static_cast<size_t>(t->ne[0] / QK_K);
         const size_t compressed_size = nrows * nblocks * size_t{ 142 };
         const size_t legacy_offset   = GGML_PAD(compressed_size, size_t{ 64 });
+        const size_t legacy_size     = nrows * nblocks * size_t{ 152 };
+        const size_t expanded_offset = GGML_PAD(legacy_offset + legacy_size, size_t{ 64 });
 
         ggml_tensor compressed_t = *t;
         compressed_t.data = t->data;
@@ -1912,7 +1917,20 @@ template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, s
 
         ggml_tensor legacy_t = *t;
         legacy_t.data = static_cast<uint8_t *>(t->data) + legacy_offset;
-        return repack_q4_k_to_q4_1_32_bl(&legacy_t, 32, data, data_size);
+        rc = repack_q4_k_to_q4_1_32_bl(&legacy_t, 32, data, data_size);
+        if (rc != 0) {
+            return rc;
+        }
+        const size_t packed_blocks = nrows * nblocks * 8 / 32;
+        const auto * packed_q4 = reinterpret_cast<const q4k_pp::PackedBlockQ4N32 *>(legacy_t.data);
+        auto * packed_q8 = reinterpret_cast<q4k_pp::PackedBlockQ8N32Ime *>(
+            static_cast<uint8_t *>(t->data) + expanded_offset);
+        for (size_t block = 0; block < packed_blocks; ++block) {
+            q4k_pp::PackedBlockQ8N32 expanded;
+            q4k_pp::expand_q4n32_to_q8n32(packed_q4 + block, &expanded, 32, 32);
+            q4k_pp::prepack_q8n32_for_ime(&expanded, packed_q8 + block, 32, 32);
+        }
+        return 0;
     }
     return repack_q4_k_to_q4_1_32_bl(t, 32, data, data_size);
 }
