@@ -1844,6 +1844,35 @@ namespace ggml::cpu::riscv64_spacemit {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
 
+static void repack_q4_0_pp_weights(ggml_tensor * t, const void * data) {
+    GGML_ASSERT(q4_0_pp_weights_enabled(t));
+    const size_t nrows   = static_cast<size_t>(ggml_nrows(t));
+    const size_t nblocks = static_cast<size_t>(t->ne[0] / QK4_0);
+    GGML_ASSERT(nrows % 32 == 0 && nblocks != 0);
+
+    const auto * src = static_cast<const block_q4_0 *>(data);
+    auto * dst = reinterpret_cast<spacemit_kernels::ime2::q4_pp_block_b *>(
+        static_cast<uint8_t *>(t->data) + GGML_PAD(nrows * nblocks * sizeof(block_q4_0), size_t{ 64 }));
+
+    for (size_t row = 0; row < nrows; row += 32) {
+        for (size_t block = 0; block < nblocks; ++block) {
+            auto & out = dst[(row / 32) * nblocks + block];
+            for (size_t quarter = 0; quarter < 4; ++quarter) {
+                for (size_t col = 0; col < 8; ++col) {
+                    const auto & in = src[(row + quarter * 8 + col) * nblocks + block];
+                    out.d[quarter * 8 + col] = in.d;
+                    for (size_t ki = 0; ki < QK4_0; ++ki) {
+                        const uint8_t byte = in.qs[ki & 15];
+                        const int q = ((ki < 16 ? byte : byte >> 4) & 15) - 8;
+                        const size_t lane = quarter * 256 + col * 16 + (ki & 15) + (ki >= 16 ? 128 : 0);
+                        out.qs[lane] = static_cast<int8_t>(q);
+                    }
+                }
+            }
+        }
+    }
+}
+
 template <> int repack<block_q4_0, 32, 16>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_0_to_q4_0_16_bl(t, 16, data, data_size);
 }
@@ -1865,19 +1894,19 @@ template <> int repack<block_q3_K, 256, 32>(ggml_tensor * t, const void * data, 
 }
 
 template <> int repack<block_q4_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-#if 0
-    return repack_q4_0_to_q4_0_32_bl_ref(t, 32, data, data_size);
-#else
-    return repack_q4_0_to_q4_0_32_bl(t, 32, data, data_size);
-#endif
+    const int rc = repack_q4_0_to_q4_0_32_bl(t, 32, data, data_size);
+    if (rc == 0 && q4_0_pp_weights_enabled(t)) {
+        repack_q4_0_pp_weights(t, data);
+    }
+    return rc;
 }
 
 template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-#if 1
-    return repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
-#else
-    //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
-#endif
+    const int rc = repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
+    if (rc == 0 && q4_0_pp_weights_enabled(t)) {
+        repack_q4_0_pp_weights(t, data);
+    }
+    return rc;
 }
 
 template <> int repack<block_q4_1, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1922,7 +1951,7 @@ template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, s
         }
         const size_t packed_blocks = nrows * nblocks * 8 / 32;
         const auto * packed_q4     = static_cast<const block_q4_1x32 *>(legacy_t.data);
-        auto * packed_q8 = reinterpret_cast<spacemit_kernels::ime2::q4_k_pp_block_b *>(static_cast<uint8_t *>(t->data) +
+        auto * packed_q8 = reinterpret_cast<spacemit_kernels::ime2::q4_pp_block_b *>(static_cast<uint8_t *>(t->data) +
                                                                                        expanded_offset);
         for (size_t block = 0; block < packed_blocks; ++block) {
             const auto & src = packed_q4[block];

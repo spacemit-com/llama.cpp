@@ -34,6 +34,7 @@
 
 namespace spacemit_kernels {
 namespace ime2 {
+// TODO: Remove this legacy override after the Q4_K M>1 path no longer needs the legacy kernel.
 static thread_local bool spine_q4_legacy_override = false;
 
 static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks);
@@ -3184,7 +3185,7 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
 
                 "vsetvli        t0, x0, e8, m1          \n\t"
                 "vl1r.v         v16, (%[A])             \n\t"
-                "addi           %[A], %[A], 128         \n\t"  // 4*32@i8
+                "addi           %[A], %[A], 136         \n\t"  // 4*32@i8 + 8 B Q8 padding
                 "vl4r.v         v4, (%[B])              \n\t"  // 32*32@i4
                 "addi           %[B], %[B], 512         \n\t"
                 "vsrl.vi        v17, v16, 4             \n\t"
@@ -3290,7 +3291,7 @@ void gemm_kernel_i8i4_m4(size_t          blk_len,
 
                 "vsetvli        t0, x0, e8, m1  \n\t"
                 "vl1r.v         v0, (%[A])      \n\t"
-                "addi           %[A], %[A], 128 \n\t"  // 4*32@i8
+                "addi           %[A], %[A], 136 \n\t"  // 4*32@i8 + 8 B Q8 padding
                 "vl4r.v         v4, (%[B])      \n\t"  // 32*32@i4
                 "addi           %[B], %[B], 512 \n\t"
                 "vsrl.vi        v1, v0, 4       \n\t"
@@ -5876,8 +5877,9 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
             "addi           t4, %[B], -64           \n\t"
             "vsetvli        t0, x0, e16, mf2        \n\t"
             "vle16.v        v0, (t4)                \n\t"
-            "vsetvli        t0, x0, e32, m1         \n\t"
+            // Widen while the source is e16/mf2; e32/m1 would reinterpret fp16 bits.
             "vfwcvt.f.f.v   v2, v0                 \n\t"
+            "vsetvli        t0, x0, e32, m1         \n\t"
             "li             s3, 8                   \n\t"
 
             // Load one complete 832 B sub-block in address order before decoding it.
@@ -6056,8 +6058,9 @@ static void gemm_kernel_i8i6k_m4_ime2_dedup(size_t          blk_len,
             "addi           t4, %[B], -64           \n\t"
             "vsetvli        t0, x0, e16, mf2        \n\t"
             "vle16.v        v0, (t4)                \n\t"
-            "vsetvli        t0, x0, e32, m1         \n\t"
+            // Keep the FP16 source type until the widening conversion completes.
             "vfwcvt.f.f.v   v2, v0                 \n\t"
+            "vsetvli        t0, x0, e32, m1         \n\t"
             "li             s3, 8                   \n\t"
 
             // Load one complete 832 B sub-block in address order before decoding it.
@@ -6405,7 +6408,8 @@ static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
             "vsetvli      t0, x0, e16, m1         \n\t"
             "vmv.v.i      v0, 1                   \n\t"
             "mv           s2, %[pA]               \n\t"
-            "addi         s3, %[pA], 4+2          \n\t"
+            // A block: 8-byte scale/sum header followed by 32 quantized values.
+            "addi         s3, %[pA], 8            \n\t"
             "mv           s6, %[pC]               \n\t"
             "mv           s7, %[pB]               \n\t"
             "addi         s4, %[pB], 64           \n\t"
@@ -6450,11 +6454,11 @@ static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
             "addi         s4, s4, 560             \n\t"
 
             "vle8.v       v3, (s3)                \n\t"
-            "addi         s3, s3, 32+6            \n\t"
+            "addi         s3, s3, 40              \n\t"
 
             "flw          f0, (s2)                \n\t"
             "lh           t2, 4(s2)               \n\t"
-            "addi         s2, s2, 6+32            \n\t"
+            "addi         s2, s2, 40              \n\t"
 
             "vsetvli      t0, x0, e8, m1          \n\t"
             "vsrl.vi      v24, v3, 4              \n\t"
@@ -6712,7 +6716,7 @@ size_t gemm_kernel_i8i4_legacy(size_t          blk_len,
     return handled;
 }
 
-void quantize_a_m8_ime(const float * source, size_t k, q4_k_pp_block_a * destination) {
+void quantize_a_m8_ime(const float * source, size_t k, q4_pp_block_a * destination) {
     GGML_ASSERT(__riscv_vlenb() == 128 && k != 0 && k % 32 == 0);
     for (size_t offset = 0; offset < k; offset += 32) {
         auto & out = destination[offset / 32];
@@ -6759,8 +6763,8 @@ void quantize_a_m8_ime(const float * source, size_t k, q4_k_pp_block_a * destina
     }
 }
 
-void gemm_m8_q8_ab_prepacked(const q4_k_pp_block_a * packed_a,
-                             const q4_k_pp_block_b * packed_b,
+void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
+                             const q4_pp_block_b * packed_b,
                              float *                 output,
                              size_t                  k_blocks,
                              size_t                  ldc) {

@@ -137,27 +137,27 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 }  // namespace ime1
 
 namespace ime2 {
-// Q4_K PP weights are expanded to signed Q8 once at repack time. Each block
+// Q4 PP weights are expanded to signed Q8 once at repack time. Each block
 // contains 32 output columns and one K32 slice in the IME2 dot layout.
-struct q4_k_pp_block_b {
+struct q4_pp_block_b {
     uint16_t d[32];
     int8_t   qs[1024];
 };
 
 // One M8 x K32 activation tile; duplicated scales match the IME2 dot lanes.
-struct q4_k_pp_block_a {
+struct q4_pp_block_a {
     float  scale[64];
     int8_t qs[256];
 };
 
-static_assert(sizeof(q4_k_pp_block_b) == 1088, "wrong Q4_K PP B block size");
-static_assert(offsetof(q4_k_pp_block_b, qs) == 64, "wrong Q4_K PP B layout");
-static_assert(sizeof(q4_k_pp_block_a) == 512, "wrong Q4_K PP A block size");
-static_assert(offsetof(q4_k_pp_block_a, qs) == 256, "wrong Q4_K PP A layout");
+static_assert(sizeof(q4_pp_block_b) == 1088, "wrong Q4 PP B block size");
+static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");
+static_assert(sizeof(q4_pp_block_a) == 512, "wrong Q4 PP A block size");
+static_assert(offsetof(q4_pp_block_a, qs) == 256, "wrong Q4 PP A layout");
 
-void quantize_a_m8_ime(const float * source, size_t k, q4_k_pp_block_a * destination);
-void gemm_m8_q8_ab_prepacked(const q4_k_pp_block_a * packed_a,
-                             const q4_k_pp_block_b * packed_b,
+void quantize_a_m8_ime(const float * source, size_t k, q4_pp_block_a * destination);
+void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
+                             const q4_pp_block_b * packed_b,
                              float *                 output,
                              size_t                  k_blocks,
                              size_t                  ldc);
