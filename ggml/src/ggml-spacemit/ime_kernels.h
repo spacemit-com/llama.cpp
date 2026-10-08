@@ -138,17 +138,22 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 
 namespace ime2 {
 // Q4 PP weights are expanded to signed Q8 once at repack time. Each block
-// contains 32 output columns and one K32 slice in the IME2 dot layout.
-struct q4_pp_block_b {
-    uint16_t d[32];
-    int8_t   qs[1024];
+// contains N output columns and one K slice in the IME2 dot layout.
+template <int K, int N> struct q4_pp_weight_block {
+    static_assert(K > 0 && N > 0);
+    uint16_t d[N];
+    int8_t   qs[K * N];
 };
 
-// One M8 x K32 activation tile; duplicated scales match the IME2 dot lanes.
-struct q4_pp_block_a {
-    float  scale[64];
-    int8_t qs[256];
+// One M x K activation tile; duplicated scales match the IME2 dot lanes.
+template <int K, int M> struct q4_pp_activation_block {
+    static_assert(K > 0 && K % 4 == 0 && M > 0);
+    float  scale[(K / 4) * M];
+    int8_t qs[K * M];
 };
+
+using q4_pp_block_b = q4_pp_weight_block<32, 32>;
+using q4_pp_block_a = q4_pp_activation_block<32, 8>;
 
 static_assert(sizeof(q4_pp_block_b) == 1088, "wrong Q4 PP B block size");
 static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");

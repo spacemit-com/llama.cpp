@@ -96,21 +96,16 @@ inline bool spine_q4_m_split_enabled(const ggml_tensor * tensor = nullptr) {
     return tensor == nullptr || (tensor->ne[0] % QK_K == 0 && tensor->ne[1] % 32 == 0);
 }
 
-inline size_t spine_q4_k_layout_nbytes(const ggml_tensor * tensor, bool compressed) {
+inline size_t spine_q4_k_compressed_nbytes(const ggml_tensor * tensor) {
     GGML_ASSERT(tensor != nullptr && tensor->type == GGML_TYPE_Q4_K);
     GGML_ASSERT(tensor->ne[0] % QK_K == 0 && tensor->ne[1] % 32 == 0);
     const size_t nrows   = static_cast<size_t>(ggml_nrows(tensor));
     const size_t nblocks = static_cast<size_t>(tensor->ne[0] / QK_K);
-    const size_t per_k256_per_row = compressed ? size_t{ 142 } : size_t{ 152 };
-    return nrows * nblocks * per_k256_per_row;
-}
-
-inline size_t spine_q4_k_legacy_offset(const ggml_tensor * tensor) {
-    return GGML_PAD(spine_q4_k_layout_nbytes(tensor, true), size_t{ 64 });
+    return nrows * nblocks * size_t{ 142 };
 }
 
 inline size_t spine_q4_k_expanded_offset(const ggml_tensor * tensor) {
-    return GGML_PAD(spine_q4_k_legacy_offset(tensor) + spine_q4_k_layout_nbytes(tensor, false), size_t{ 64 });
+    return GGML_PAD(spine_q4_k_compressed_nbytes(tensor), size_t{ 64 });
 }
 
 inline size_t spine_q4_0_expanded_offset(const ggml_tensor * tensor) {
@@ -120,11 +115,9 @@ inline size_t spine_q4_0_expanded_offset(const ggml_tensor * tensor) {
 }
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
-inline int64_t spine_row_stride_b(int64_t b_k_blks, bool compressed = true) {
+inline int64_t spine_row_stride_b(int64_t b_k_blks) {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
-        if (compressed) {
-            return (b_k_blks / 8) * 142;
-        }
+        return (b_k_blks / 8) * 142;
     }
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
         return (b_k_blks / 8) * static_cast<int64_t>(sizeof(spacemit_kernels::nrow_super_q6_k<1>));
@@ -325,14 +318,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t gemm_m = ne11 * ne12 * ne13;
         const int64_t gemm_k = ne10;
         const int64_t gemm_n = ne01;
-        bool q4_m_split       = false;
-        bool q4_legacy_layout = false;
+        bool q4_m_split = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
-            q4_m_split       = spine_q4_m_split_enabled(src0);
-            q4_legacy_layout = q4_m_split && gemm_m > 1;
-            if (q4_legacy_layout) {
-                w_data = static_cast<uint8_t *>(w_data) + spine_q4_k_legacy_offset(src0);
-            }
+            q4_m_split = spine_q4_m_split_enabled(src0);
         }
 
         spacemit_kernels::quantize_a_row_def       quantize_a_row_i8;
@@ -366,7 +354,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     block_stride_a     = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
                     set_kernel_impl    = true;
                 } else {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
+                    // Q4_1 keeps the standard per-block scale layout; ZPDS expects Q4_K's shared-scale layout.
+                    gemm_kernel = std::is_same_v<BLOC_TYPE, block_q4_1>
+                                      ? spacemit_kernels::ime2::gemm_kernel_i8i4_legacy
+                                      : spacemit_kernels::ime2::gemm_kernel_i8i4;
                     quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8;
                     quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
                     block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
@@ -397,13 +388,6 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         }
 #endif
 
-#if defined(RISCV64_SPACEMIT_IME2)
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
-            if (q4_legacy_layout && global_spine_env_info.use_ime2) {
-                gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_legacy;
-            }
-        }
-#endif
 #if defined(RISCV64_SPACEMIT_IME1)
         if (!set_kernel_impl && (global_spine_env_info.use_ime1)) {
             quantize_a_row_i8  = spacemit_kernels::ime1::quantize_a_row_i8;
@@ -443,7 +427,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                        (INTER_SIZE == 32 || INTER_SIZE == 256))) {
             const bool expanded_weights = [&]() {
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                    return q4_legacy_layout;
+                    return q4_m_split;
                 } else {
                     return q4_0_pp_weights_enabled(src0);
                 }
@@ -510,7 +494,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         constexpr int64_t row_align = 4;
         const int64_t     row_blks  = spacemit_kernels::div_round_up(gemm_m, row_align);
 
-        const int64_t row_stride_b      = spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks, !q4_legacy_layout);
+        const int64_t row_stride_b      = spine_row_stride_b<BLOC_TYPE, INTER_SIZE, NB_COLS>(b_k_blks);
         const int64_t per_mb_rows_wsize = row_align * row_stride_a;
         const int64_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
@@ -848,7 +832,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     block_stride_a    = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
                     set_kernel_impl   = true;
                 } else {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
+                    gemm_kernel = std::is_same_v<BLOC_TYPE, block_q4_1>
+                                      ? spacemit_kernels::ime2::gemm_kernel_i8i4_legacy
+                                      : spacemit_kernels::ime2::gemm_kernel_i8i4;
                     moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i4;
                     quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8;
                     block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);

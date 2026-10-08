@@ -1927,14 +1927,10 @@ template <> int repack<block_q4_1, 256, 32>(ggml_tensor * t, const void * data, 
 
 template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     if (t->ne[0] % QK_K == 0 && t->ne[1] % 32 == 0) {
-        static_assert(sizeof(block_q4_1x32) == 608, "wrong Q4_K legacy block size");
-        static_assert(offsetof(block_q4_1x32, qs) == 96, "wrong Q4_K legacy block layout");
         const size_t nrows           = static_cast<size_t>(ggml_nrows(t));
         const size_t nblocks         = static_cast<size_t>(t->ne[0] / QK_K);
         const size_t compressed_size = nrows * nblocks * size_t{ 142 };
-        const size_t legacy_offset   = GGML_PAD(compressed_size, size_t{ 64 });
-        const size_t legacy_size     = nrows * nblocks * size_t{ 152 };
-        const size_t expanded_offset = GGML_PAD(legacy_offset + legacy_size, size_t{ 64 });
+        const size_t expanded_offset = GGML_PAD(compressed_size, size_t{ 64 });
 
         ggml_tensor compressed_t = *t;
         compressed_t.data        = t->data;
@@ -1943,28 +1939,27 @@ template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, s
             return rc;
         }
 
-        ggml_tensor legacy_t = *t;
-        legacy_t.data        = static_cast<uint8_t *>(t->data) + legacy_offset;
-        rc                   = repack_q4_k_to_q4_1_32_bl(&legacy_t, 32, data, data_size);
-        if (rc != 0) {
-            return rc;
-        }
         const size_t packed_blocks = nrows * nblocks * 8 / 32;
-        const auto * packed_q4     = static_cast<const block_q4_1x32 *>(legacy_t.data);
+        const auto * packed_q4     = static_cast<const spacemit_kernels::nrow_super_q4_k_ds<32> *>(compressed_t.data);
         auto * packed_q8 = reinterpret_cast<spacemit_kernels::ime2::q4_pp_block_b *>(static_cast<uint8_t *>(t->data) +
                                                                                        expanded_offset);
         for (size_t block = 0; block < packed_blocks; ++block) {
-            const auto & src = packed_q4[block];
+            const auto & super = packed_q4[block / 8];
+            const auto & sub   = super.sub[block % 8];
             auto &       dst = packed_q8[block];
-            std::memcpy(dst.d, src.d, sizeof(dst.d));
+            for (size_t col = 0; col < 32; ++col) {
+                dst.d[col] = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(super.d[col]) * sub.sc[col]);
+            }
             for (size_t quarter = 0; quarter < 4; ++quarter) {
                 for (size_t col = 0; col < 8; ++col) {
                     const size_t column = quarter * 8 + col;
+                    const uint8_t  zp_byte = sub.zp4[column % 16];
+                    const int      zp      = column < 16 ? zp_byte & 15 : zp_byte >> 4;
                     for (size_t ki = 0; ki < 32; ++ki) {
-                        const uint8_t byte = src.qs[column * 16 + ki / 2];
+                        const uint8_t byte = sub.qs[column * 16 + ki / 2];
                         const int     q    = (ki & 1) == 0 ? byte & 15 : byte >> 4;
                         const size_t  lane = quarter * 256 + col * 16 + (ki & 15) + (ki >= 16 ? 128 : 0);
-                        dst.qs[lane]       = static_cast<int8_t>(q - src.zp[column]);
+                        dst.qs[lane]       = static_cast<int8_t>(q - zp);
                     }
                 }
             }
