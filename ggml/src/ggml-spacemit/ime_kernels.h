@@ -155,6 +155,15 @@ template <int K, int M> struct q4_pp_activation_block {
 using q4_pp_block_b = q4_pp_weight_block<32, 32>;
 using q4_pp_block_a = q4_pp_activation_block<32, 8>;
 
+// View of the existing repacked Q8_0 N32/K32 block; qs remain row-major.
+template <int K, int N> struct q8_0_weight_block {
+    uint16_t d[N];
+    int8_t   qs[K * N];
+};
+using q8_0_block_b = q8_0_weight_block<32, 32>;
+static_assert(sizeof(q8_0_block_b) == 1088, "wrong Q8_0 B block size");
+static_assert(offsetof(q8_0_block_b, qs) == 64, "wrong Q8_0 B layout");
+
 static_assert(sizeof(q4_pp_block_b) == 1088, "wrong Q4 PP B block size");
 static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");
 static_assert(sizeof(q4_pp_block_a) == 512, "wrong Q4 PP A block size");
@@ -166,6 +175,11 @@ void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
                              float *                 output,
                              size_t                  k_blocks,
                              size_t                  ldc);
+void gemm_m8_q8_0_ab_prepacked(const q4_pp_block_a * packed_a,
+                               const q8_0_block_b * packed_b,
+                               float *               output,
+                               size_t                k_blocks,
+                               size_t                ldc);
 
 size_t gemm_kernel_i8i6k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,

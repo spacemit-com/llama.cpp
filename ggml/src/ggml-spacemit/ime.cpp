@@ -473,6 +473,22 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 const auto * expanded_b = reinterpret_cast<const spacemit_kernels::ime2::q4_pp_block_b *>(
                     static_cast<const uint8_t *>(src0->data) + expanded_offset);
                 auto * packed_a = static_cast<spacemit_kernels::ime2::q4_pp_block_a *>(tcm_buffer);
+                // Split output N32 tiles across cores when M16 tiles alone cannot fill the chip.
+                if (gemm_m / 16 < nth && gemm_n >= 32 * nth) {
+                    for (int64_t mi = 0; mi < gemm_m; mi += 16) {
+                        spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
+                        spacemit_kernels::ime2::quantize_a_m8_ime(
+                            feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
+                        for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
+                            const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
+                            spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                                packed_a, b_tile, output + mi * gemm_n + ni, k_blocks, gemm_n);
+                            spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                                packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
+                        }
+                    }
+                    return true;
+                }
                 for (int64_t mi = static_cast<int64_t>(ith) * 16; mi < gemm_m; mi += 16 * nth) {
                     spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
                     spacemit_kernels::ime2::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
@@ -482,6 +498,60 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                                                                         k_blocks, gemm_n);
                         spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
                             packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
+                    }
+                }
+                return true;
+            }
+        }
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0> && INTER_SIZE == 32 && NB_COLS == 32) {
+            // Q8_0 already has one N32/K32 block with FP16 scales followed by
+            // row-major int8 values. The M8 kernel rearranges values in registers.
+            const int64_t k_blocks = gemm_k / 32;
+            const auto * packed_b = reinterpret_cast<const spacemit_kernels::ime2::q8_0_block_b *>(src0->data);
+            auto * packed_a = static_cast<spacemit_kernels::ime2::q4_pp_block_a *>(tcm_buffer);
+            const size_t m8_a_tile_bytes =
+                static_cast<size_t>(k_blocks) * sizeof(spacemit_kernels::ime2::q4_pp_block_a);
+            if (gemm_m == 8 && gemm_n >= 256 && gemm_n % 32 == 0 && gemm_k % QK8_0 == 0 &&
+                tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
+                m8_a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
+                spacemit_kernels::ime2::quantize_a_m8_ime(feature, gemm_k, packed_a);
+                for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
+                    const auto * b_tile = packed_b + (ni / 32) * k_blocks;
+                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                        packed_a, b_tile, output + ni, k_blocks, gemm_n);
+                }
+                return true;
+            }
+
+            const size_t m16_a_tile_bytes = 2 * m8_a_tile_bytes;
+            if (gemm_m >= 16 && gemm_m % 16 == 0 && gemm_n % 32 == 0 && gemm_k % QK8_0 == 0 &&
+                tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
+                m16_a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
+                const auto quantize_m16 = [&](int64_t mi) {
+                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
+                    spacemit_kernels::ime2::quantize_a_m8_ime(
+                        feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
+                };
+                const auto compute_n32 = [&](int64_t mi, int64_t ni) {
+                    const auto * b_tile = packed_b + (ni / 32) * k_blocks;
+                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                        packed_a, b_tile, output + mi * gemm_n + ni, k_blocks, gemm_n);
+                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                        packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
+                };
+                if (gemm_m / 16 < nth && gemm_n >= 32 * nth) {
+                    for (int64_t mi = 0; mi < gemm_m; mi += 16) {
+                        quantize_m16(mi);
+                        for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
+                            compute_n32(mi, ni);
+                        }
+                    }
+                } else {
+                    for (int64_t mi = static_cast<int64_t>(ith) * 16; mi < gemm_m; mi += 16 * nth) {
+                        quantize_m16(mi);
+                        for (int64_t ni = 0; ni < gemm_n; ni += 32) {
+                            compute_n32(mi, ni);
+                        }
                     }
                 }
                 return true;
