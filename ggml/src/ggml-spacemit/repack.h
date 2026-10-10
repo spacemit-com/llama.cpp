@@ -14,7 +14,7 @@ inline bool q4_pp_stream_weights_enabled(const ggml_tensor * tensor) {
         tensor->ne[1] % 32 != 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
         return false;
     }
-    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_K) {
+    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_1 && tensor->type != GGML_TYPE_Q4_K) {
         return false;
     }
     return tensor->ne[0] % ggml_blck_size(tensor->type) == 0;

@@ -168,7 +168,7 @@ bool spine_q4_stream_graph_enabled(const ggml_cgraph * graph) {
             continue;
         }
         const ggml_tensor * weight = op->src[0];
-        if (weight->type != GGML_TYPE_Q4_0 && weight->type != GGML_TYPE_Q4_K) {
+        if (weight->type != GGML_TYPE_Q4_0 && weight->type != GGML_TYPE_Q4_1 && weight->type != GGML_TYPE_Q4_K) {
             continue;
         }
         const int64_t k = weight->ne[0];
@@ -259,6 +259,14 @@ struct spine_q40_stream_block {
 
 static_assert(sizeof(spine_q40_stream_block) == 576);
 
+struct spine_q41_stream_block {
+    uint16_t d[32];
+    uint8_t  zp[32];
+    uint8_t  qs[512];
+};
+
+static_assert(sizeof(spine_q41_stream_block) == 608);
+
 inline void spine_q4_stream_unpack_quarter(const uint8_t * src, const uint8_t * zp4, int quarter, int8_t * dst) {
     const size_t vl64 = __riscv_vsetvl_e64m2(8);
     GGML_ASSERT(vl64 == 8);
@@ -307,6 +315,16 @@ inline void spine_q4_stream_pack_tile(const uint8_t * compressed, int64_t tile, 
             const auto & sub = super.sub[b % 8];
             std::memcpy(dst[b].d, precomputed_scales + (tile * k_blocks + b) * 32, sizeof(dst[b].d));
             spine_q4_stream_unpack_block(sub.qs, sub.zp4, dst[b].qs);
+        }
+    } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_1>) {
+        const auto * src = reinterpret_cast<const spine_q41_stream_block *>(compressed) + tile * k_blocks;
+        for (int64_t b = 0; b < k_blocks; ++b) {
+            std::memcpy(dst[b].d, src[b].d, sizeof(dst[b].d));
+            uint8_t zp4[16];
+            for (size_t col = 0; col < 16; ++col) {
+                zp4[col] = (src[b].zp[col] & 15) | (src[b].zp[col + 16] << 4);
+            }
+            spine_q4_stream_unpack_block(src[b].qs, zp4, dst[b].qs);
         }
     } else {
         const auto * src = reinterpret_cast<const spine_q40_stream_block *>(compressed) + tile * k_blocks;
@@ -420,6 +438,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     }
 
                     if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) ||
+                                  (std::is_same_v<BLOC_TYPE, block_q4_1> && INTER_SIZE == 32 && NB_COLS == 32) ||
                                   (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 32 &&
                                    (INTER_SIZE == 32 || INTER_SIZE == 256))) {
                         const int64_t gemm_k = op->src[0]->ne[0];
@@ -647,6 +666,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
 #if defined(RISCV64_SPACEMIT_IME2)
         if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) ||
+                      (std::is_same_v<BLOC_TYPE, block_q4_1> && INTER_SIZE == 32 && NB_COLS == 32) ||
                       (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 32 &&
                        (INTER_SIZE == 32 || INTER_SIZE == 256))) {
             const bool expanded_weights = [&]() -> bool {
