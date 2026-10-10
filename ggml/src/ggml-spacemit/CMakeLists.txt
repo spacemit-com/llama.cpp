@@ -13,12 +13,6 @@ endif()
 find_library(SPERT_LIB NAMES spert PATHS "${SPERT_DIR}/lib" NO_CMAKE_FIND_ROOT_PATH REQUIRED)
 message(STATUS "SpacemiT backend using spine-runtime at ${SPERT_DIR} (${SPERT_LIB})")
 
-# The standalone backend owns the SpacemiT kernels and dispatch path.
-if(GGML_SPACEMIT AND GGML_CPU_RISCV64_SPACEMIT)
-    message(STATUS "GGML_SPACEMIT is ON -> disabling GGML_CPU_RISCV64_SPACEMIT")
-    set(GGML_CPU_RISCV64_SPACEMIT OFF CACHE BOOL "" FORCE)
-endif()
-
 # Detect IME support (inline version of FindSMTIME.cmake)
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     include(CheckCSourceCompiles)
@@ -60,6 +54,10 @@ ggml_add_backend_library(${TARGET_NAME}
     spacemit-env.h
     spine_mem_pool.cpp
     ../../include/ggml-spacemit.h)
+
+set_target_properties(${TARGET_NAME} PROPERTIES
+    C_VISIBILITY_PRESET hidden
+    CXX_VISIBILITY_PRESET hidden)
 
 target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB})
 target_link_directories(${TARGET_NAME} PUBLIC "${SPERT_DIR}/lib")

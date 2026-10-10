@@ -799,13 +799,25 @@ static const char * ggml_backend_spacemit_reg_get_name(ggml_backend_reg_t reg) {
     GGML_UNUSED(reg);
 }
 
+static bool ggml_spacemit_disabled(void) {
+    const char * str = getenv("GGML_SPACEMIT_BACKEND");
+    return str == nullptr || strcmp(str, "1") != 0;
+}
+
 static size_t ggml_backend_spacemit_reg_get_device_count(ggml_backend_reg_t reg) {
+    if (ggml_spacemit_disabled()) {
+        return 0;
+    }
     return GGML_SPACEMIT_MAX_DEVICES;
     GGML_UNUSED(reg);
 }
 
 static ggml_backend_dev_t ggml_backend_spacemit_reg_get_device(ggml_backend_reg_t reg, size_t index) {
     auto hreg = static_cast<ggml_spacemit_registry *>(reg->context);
+
+    if (hreg == nullptr) {
+        return nullptr;
+    }
 
     if (index >= GGML_SPACEMIT_MAX_DEVICES || !hreg->devices[index].context) {
         return nullptr;
@@ -821,9 +833,13 @@ static void * ggml_backend_spacemit_get_proc_address(ggml_backend_reg_t reg, con
 }
 
 static void ggml_spacemit_init(ggml_backend_reg * reg) {
-    const char * str_fusion  = getenv("GGML_SPACEMIT_FUSION");
+    const char * str_fusion = getenv("GGML_SPACEMIT_FUSION");
 
     opt_fusion  = str_fusion ? atoi(str_fusion)  : opt_fusion;
+
+    if (ggml_spacemit_disabled()) {
+        return;
+    }
 
     reg->context = new ggml_spacemit_registry(reg);
 }
@@ -857,6 +873,10 @@ ggml_backend_reg_t ggml_backend_spacemit_reg(void) {
 ggml_backend_t ggml_backend_spacemit_init(void) {
     ggml_backend_reg_t reg = ggml_backend_spacemit_reg();
     if (!reg) {
+        return nullptr;
+    }
+
+    if (ggml_spacemit_disabled()) {
         return nullptr;
     }
 
