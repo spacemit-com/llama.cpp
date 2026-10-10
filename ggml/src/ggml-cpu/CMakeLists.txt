@@ -447,6 +447,9 @@ function(ggml_add_cpu_backend_variant_impl tag_name)
         if (GGML_CPU_RISCV64_SPACEMIT)
             include(ggml-cpu/cmake/FindSMTIME.cmake)
             target_compile_definitions(${GGML_CPU_NAME} PRIVATE GGML_USE_CPU_RISCV64_SPACEMIT ${RISCV64_SPACEMIT_IME_SPEC})
+            set_target_properties(${GGML_CPU_NAME} PROPERTIES
+                C_VISIBILITY_PRESET hidden
+                CXX_VISIBILITY_PRESET hidden)
 
             # spine-runtime (spert) is consumed as a prebuilt release package, not a submodule.
             # Point SPERT_DIR at the extracted release tree (contains include/ and lib/), e.g.

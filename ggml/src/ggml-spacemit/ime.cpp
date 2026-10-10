@@ -1882,7 +1882,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             break;
         case GGML_OP_GATED_DELTA_NET:
-            return common;
+            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2) {
+                return common;
+            }
+            break;
         case GGML_OP_SSM_CONV:
             if (op->src[0] && op->src[0]->type == GGML_TYPE_F32)
                 return common;
