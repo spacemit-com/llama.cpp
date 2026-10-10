@@ -130,8 +130,6 @@ struct spine_dyn_n_schedule_state {
 
 // Two X100 threads unpack Q4 N32 tiles into a bounded DRAM ring while
 // the A100 workers consume the preceding tiles.
-static constexpr int spine_q4_ring_slots = 16;
-
 // Space out readers without imposing 64-byte alignment on realloc's workspace.
 struct spine_q4_reader_progress {
     std::atomic<int64_t> tile{ -1 };
@@ -141,7 +139,6 @@ struct spine_q4_reader_progress {
 static_assert(sizeof(spine_q4_reader_progress) == 64);
 
 struct spine_q4_stream_state {
-    std::atomic<int64_t>     slots[spine_q4_ring_slots];
     spine_q4_reader_progress consumed[8];
 };
 
@@ -321,13 +318,14 @@ inline void spine_q4_stream_pack_tile(const uint8_t * compressed, int64_t tile, 
 }
 
 template <typename BLOC_TYPE>
-inline void spine_q4_stream_produce(spine_q4_stream_state & state, const uint8_t * compressed,
+inline void spine_q4_stream_produce(spine_q4_stream_state & state, std::atomic<int64_t> * slots,
+                                   uint32_t ring_slots, const uint8_t * compressed,
                                    spacemit_kernels::ime2::q4_pp_block_b * ring, int64_t k_blocks, int64_t n_tiles,
                                    int id, const uint16_t * precomputed_scales) {
     for (int64_t tile = id; tile < n_tiles; tile += 2) {
-        const int slot = tile % spine_q4_ring_slots;
-        if (tile >= spine_q4_ring_slots) {
-            const int64_t previous = tile - spine_q4_ring_slots;
+        const int slot = tile % ring_slots;
+        if (tile >= ring_slots) {
+            const int64_t previous = tile - ring_slots;
             for (int reader = 0; reader < 8; ++reader) {
                 while (state.consumed[reader].tile.load(std::memory_order_acquire) < previous) {
                     __asm__ volatile("pause" ::: "memory");
@@ -336,7 +334,7 @@ inline void spine_q4_stream_produce(spine_q4_stream_state & state, const uint8_t
         }
         spine_q4_stream_pack_tile<BLOC_TYPE>(compressed, tile, k_blocks, ring + slot * k_blocks,
                                              precomputed_scales);
-        state.slots[slot].store(tile, std::memory_order_release);
+        slots[slot].store(tile, std::memory_order_release);
     }
 }
 
@@ -393,7 +391,7 @@ template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 class tensor_traits : public ggml::spacemit::tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) const override {
+    bool work_size(int /* n_threads */, uint32_t ring_slots, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -427,9 +425,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         const int64_t gemm_k = op->src[0]->ne[0];
                         if (q4_pp_stream_weights_enabled(op->src[0]) &&
                             spine_q4_stream_shape(gemm_m, gemm_k, op->src[0]->ne[1])) {
-                            const size_t ring_bytes = spine_q4_ring_slots * static_cast<size_t>(gemm_k / 32) *
+                            const size_t ring_bytes = ring_slots * static_cast<size_t>(gemm_k / 32) *
                                                       sizeof(spacemit_kernels::ime2::q4_pp_block_b);
-                            size = GGML_PAD(size, size_t{ 64 }) + sizeof(spine_q4_stream_state);
+                            size = GGML_PAD(size, size_t{ 64 }) + sizeof(spine_q4_stream_state) +
+                                   ring_slots * sizeof(std::atomic<int64_t>);
                             size = GGML_PAD(size, size_t{ 64 });
                             size += ring_bytes + 64;
                         }
@@ -676,10 +675,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 const auto * expanded_b = reinterpret_cast<const spacemit_kernels::ime2::q4_pp_block_b *>(
                     static_cast<const uint8_t *>(src0->data) + expanded_offset);
                 auto * packed_a = static_cast<spacemit_kernels::ime2::q4_pp_block_a *>(tcm_buffer);
-                spacemit_kernels::ime2::quantize_a_m8_ime(feature, gemm_k, packed_a);
+                spacemit_kernels::ime2::quantize_a_m8_i8(feature, gemm_k, packed_a);
                 for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
                     const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
-                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(packed_a, b_tile, output + ni, k_blocks, gemm_n);
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(packed_a, b_tile, output + ni, k_blocks, gemm_n);
                 }
                 return true;
             }
@@ -692,15 +691,16 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 const size_t state_offset = GGML_PAD(static_cast<size_t>(gemm_workspace_size), size_t{ 64 });
                 auto *       state =
                     reinterpret_cast<spine_q4_stream_state *>(static_cast<uint8_t *>(ctx.workspace) + state_offset);
+                auto * slots = reinterpret_cast<std::atomic<int64_t> *>(state + 1);
                 auto * ring  = reinterpret_cast<spacemit_kernels::ime2::q4_pp_block_b *>(
-                    GGML_PAD(reinterpret_cast<uintptr_t>(state + 1), uintptr_t{ 64 }));
-                const size_t ring_bytes = spine_q4_ring_slots * packed_b_bytes;
+                    GGML_PAD(reinterpret_cast<uintptr_t>(slots + ctx.ring_slots), uintptr_t{ 64 }));
+                const size_t ring_bytes = ctx.ring_slots * packed_b_bytes;
                 GGML_ASSERT(reinterpret_cast<uintptr_t>(ring) + ring_bytes <=
                             reinterpret_cast<uintptr_t>(ctx.workspace) + ctx.workspace_size);
                 if (ith == 0) {
                     new (state) spine_q4_stream_state();
-                    for (int slot = 0; slot < spine_q4_ring_slots; ++slot) {
-                        state->slots[slot].store(-1, std::memory_order_relaxed);
+                    for (uint32_t slot = 0; slot < ctx.ring_slots; ++slot) {
+                        new (slots + slot) std::atomic<int64_t>(-1);
                     }
                     for (int reader = 0; reader < 8; ++reader) {
                         state->consumed[reader].tile.store(-1, std::memory_order_relaxed);
@@ -710,6 +710,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 auto * host = static_cast<spine_q4_stream_host *>(ctx.q4_stream_host);
                 struct job {
                     spine_q4_stream_state * state;
+                    std::atomic<int64_t> * slots;
+                    uint32_t ring_slots;
                     const uint8_t * compressed;
                     spacemit_kernels::ime2::q4_pp_block_b * ring;
                     int64_t k_blocks;
@@ -723,28 +725,29 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             static_cast<const uint8_t *>(src0->data) + spine_q4_k_expanded_offset(src0));
                         GGML_ASSERT(precomputed_scales != nullptr);
                     }
-                    producer_job = { state, static_cast<const uint8_t *>(src0->data), ring,
+                    producer_job = { state, slots, ctx.ring_slots, static_cast<const uint8_t *>(src0->data), ring,
                                      k_blocks, gemm_n / 32, precomputed_scales };
                     spine_q4_stream_host_submit(host, [](void * arg, int id) {
                         const auto & job = *static_cast<const struct job *>(arg);
-                        spine_q4_stream_produce<BLOC_TYPE>(*job.state, job.compressed, job.ring,
-                                                            job.k_blocks, job.n_tiles, id, job.precomputed_scales);
+                        spine_q4_stream_produce<BLOC_TYPE>(*job.state, job.slots, job.ring_slots, job.compressed,
+                                                            job.ring, job.k_blocks, job.n_tiles, id,
+                                                            job.precomputed_scales);
                     }, &producer_job);
                 }
                 auto * tcm_a = static_cast<spacemit_kernels::ime2::q4_pp_block_a *>(tcm_buffer);
                 const int64_t mi = static_cast<int64_t>(ith) * 16;
-                spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, tcm_a);
-                spacemit_kernels::ime2::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k,
+                spacemit_kernels::ime2::quantize_a_m8_i8(feature + mi * gemm_k, gemm_k, tcm_a);
+                spacemit_kernels::ime2::quantize_a_m8_i8(feature + (mi + 8) * gemm_k, gemm_k,
                                                            tcm_a + k_blocks);
                 for (int64_t tile = 0; tile < gemm_n / 32; ++tile) {
-                    const int slot = tile % spine_q4_ring_slots;
-                    while (state->slots[slot].load(std::memory_order_acquire) != tile) {
+                    const int slot = tile % ctx.ring_slots;
+                    while (slots[slot].load(std::memory_order_acquire) != tile) {
                         __asm__ volatile("pause" ::: "memory");
                     }
                     const auto * b_tile = ring + slot * k_blocks;
-                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(
                         tcm_a, b_tile, output + mi * gemm_n + tile * 32, k_blocks, gemm_n);
-                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(
                         tcm_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + tile * 32, k_blocks, gemm_n);
                     state->consumed[ith].tile.store(tile, std::memory_order_release);
                 }
@@ -763,27 +766,27 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 // Split output N32 tiles across cores when M16 tiles alone cannot fill the chip.
                 if (gemm_m / 16 < nth && gemm_n >= 32 * nth) {
                     for (int64_t mi = 0; mi < gemm_m; mi += 16) {
-                        spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
-                        spacemit_kernels::ime2::quantize_a_m8_ime(
+                        spacemit_kernels::ime2::quantize_a_m8_i8(feature + mi * gemm_k, gemm_k, packed_a);
+                        spacemit_kernels::ime2::quantize_a_m8_i8(
                             feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
                         for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
                             const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
-                            spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                            spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(
                                 packed_a, b_tile, output + mi * gemm_n + ni, k_blocks, gemm_n);
-                            spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                            spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(
                                 packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
                         }
                     }
                     return true;
                 }
                 for (int64_t mi = static_cast<int64_t>(ith) * 16; mi < gemm_m; mi += 16 * nth) {
-                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
-                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
+                    spacemit_kernels::ime2::quantize_a_m8_i8(feature + mi * gemm_k, gemm_k, packed_a);
+                    spacemit_kernels::ime2::quantize_a_m8_i8(feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
                     for (int64_t ni = 0; ni < gemm_n; ni += 32) {
                         const auto * b_tile = expanded_b + (ni / 32) * k_blocks;
-                        spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(packed_a, b_tile, output + mi * gemm_n + ni,
+                        spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(packed_a, b_tile, output + mi * gemm_n + ni,
                                                                         k_blocks, gemm_n);
-                        spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                        spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q4_prepacked(
                             packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
                     }
                 }
@@ -801,10 +804,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             if (gemm_m == 8 && gemm_n >= 256 && gemm_n % 32 == 0 && gemm_k % QK8_0 == 0 &&
                 tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
                 m8_a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
-                spacemit_kernels::ime2::quantize_a_m8_ime(feature, gemm_k, packed_a);
+                spacemit_kernels::ime2::quantize_a_m8_i8(feature, gemm_k, packed_a);
                 for (int64_t ni = static_cast<int64_t>(ith) * 32; ni < gemm_n; ni += 32 * nth) {
                     const auto * b_tile = packed_b + (ni / 32) * k_blocks;
-                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q8_0(
                         packed_a, b_tile, output + ni, k_blocks, gemm_n);
                 }
                 return true;
@@ -815,15 +818,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
                 m16_a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
                 const auto quantize_m16 = [&](int64_t mi) {
-                    spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, packed_a);
-                    spacemit_kernels::ime2::quantize_a_m8_ime(
+                    spacemit_kernels::ime2::quantize_a_m8_i8(feature + mi * gemm_k, gemm_k, packed_a);
+                    spacemit_kernels::ime2::quantize_a_m8_i8(
                         feature + (mi + 8) * gemm_k, gemm_k, packed_a + k_blocks);
                 };
                 const auto compute_n32 = [&](int64_t mi, int64_t ni) {
                     const auto * b_tile = packed_b + (ni / 32) * k_blocks;
-                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q8_0(
                         packed_a, b_tile, output + mi * gemm_n + ni, k_blocks, gemm_n);
-                    spacemit_kernels::ime2::gemm_m8_q8_0_ab_prepacked(
+                    spacemit_kernels::ime2::gemm_kernel_i8i8_m8_q8_0(
                         packed_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + ni, k_blocks, gemm_n);
                 };
                 if (gemm_m / 16 < nth && gemm_n >= 32 * nth) {
@@ -1546,7 +1549,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 };
 
 class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
-    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
+    bool work_size(int n_threads, uint32_t /* ring_slots */, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32) {
@@ -2534,9 +2537,9 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
     return 0;
 }
 
-bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {
+bool ggml_spacemit_get_work_size(int n_threads, uint32_t ring_slots, const ggml_tensor * op, size_t * size) {
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
-    return traits != nullptr && traits->work_size(n_threads, op, *size);
+    return traits != nullptr && traits->work_size(n_threads, ring_slots, op, *size);
 }
 
 bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) {

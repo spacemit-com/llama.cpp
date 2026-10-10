@@ -169,17 +169,17 @@ static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");
 static_assert(sizeof(q4_pp_block_a) == 512, "wrong Q4 PP A block size");
 static_assert(offsetof(q4_pp_block_a, qs) == 256, "wrong Q4 PP A layout");
 
-void quantize_a_m8_ime(const float * source, size_t k, q4_pp_block_a * destination);
-void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
-                             const q4_pp_block_b * packed_b,
-                             float *                 output,
-                             size_t                  k_blocks,
-                             size_t                  ldc);
-void gemm_m8_q8_0_ab_prepacked(const q4_pp_block_a * packed_a,
-                               const q8_0_block_b * packed_b,
-                               float *               output,
-                               size_t                k_blocks,
-                               size_t                ldc);
+void quantize_a_m8_i8(const float * source, size_t k, q4_pp_block_a * destination);
+void gemm_kernel_i8i8_m8_q4_prepacked(const q4_pp_block_a * packed_a,
+                               const q4_pp_block_b * packed_b,
+                               float *                 output,
+                               size_t                  k_blocks,
+                               size_t                  ldc);
+void gemm_kernel_i8i8_m8_q8_0(const q4_pp_block_a * packed_a,
+                              const q8_0_block_b * packed_b,
+                              float *               output,
+                              size_t                k_blocks,
+                              size_t                ldc);
 
 size_t gemm_kernel_i8i6k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
@@ -220,6 +220,19 @@ size_t gemm_kernel_i8i4(size_t          blk_len,
                         size_t          count_n,
                         size_t          k_blks,
                         size_t          ldc);
+
+void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              float *         c_ptr,
+                              size_t          count_n,
+                              size_t          k_blks);
+
+void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              float *         c_ptr,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc);
 
 size_t gemm_kernel_i8i4_legacy(size_t          blk_len,
                                const uint8_t * quant_a_ptr,

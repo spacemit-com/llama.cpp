@@ -313,9 +313,18 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        const auto init_backend = [&](ggml_backend_dev_t dev) {
+            const ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+            std::string backend_params;
+            if (reg != nullptr && std::strcmp(ggml_backend_reg_name(reg), "SPACEMIT") == 0) {
+                backend_params = std::to_string(params.spacemit_ring_slots);
+            }
+            return ggml_backend_dev_init(dev, backend_params.empty() ? nullptr : backend_params.c_str());
+        };
+
         // GPU backends
         for (const auto & dev : model.devices) {
-            ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);
+            ggml_backend_t backend = init_backend(dev.dev);
             if (backend == nullptr) {
                 throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev.dev)));
             }
@@ -326,7 +335,7 @@ llama_context::llama_context(
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             ggml_backend_dev_t dev = ggml_backend_dev_get(i);
             if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_ACCEL) {
-                ggml_backend_t backend = ggml_backend_dev_init(dev, nullptr);
+                ggml_backend_t backend = init_backend(dev);
                 if (backend == nullptr) {
                     throw std::runtime_error(format("failed to initialize %s backend", ggml_backend_dev_name(dev)));
                 }
@@ -3481,6 +3490,7 @@ llama_context_params llama_context_default_params() {
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
+        /*.spacemit_ring_slots         =*/ 16,
     };
 
     return result;

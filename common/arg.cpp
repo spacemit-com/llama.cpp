@@ -1464,6 +1464,17 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_UBATCH"));
     add_opt(common_arg(
+        {"--spacemit-ring-slots"}, "N",
+        string_format("Spacemit Q4 PP streaming ring slots (1-1024, multiple of A100 cores, default: %d)",
+                      params.spacemit_ring_slots),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("spacemit-ring-slots must be between 1 and 1024");
+            }
+            params.spacemit_ring_slots = value;
+        }
+    ));
+    add_opt(common_arg(
         {"--keep"}, "N",
         string_format("number of tokens to keep from the initial prompt (default: %d, -1 = all)", params.n_keep),
         [](common_params & params, int value) {

@@ -37,9 +37,6 @@ namespace ime2 {
 // TODO: Remove this legacy override after the Q4_K M>1 path no longer needs the legacy kernel.
 static thread_local bool spine_q4_legacy_override = false;
 
-static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks);
-static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr, const uint8_t * quant_b_data, float * c_ptr, size_t count_n, size_t k_blks, size_t ldc);
-
 template <size_t MB_ROWS, size_t NB_COLS>
 void gemm_kernel_i8i2k_mrow_ref(size_t          blk_len,
                                 const uint8_t * quant_a_ptr,
@@ -6023,317 +6020,6 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
     }
 }
 
-static void gemm_kernel_i8i6k_m4_ime2_dedup(size_t          blk_len,
-                                            const uint8_t * quant_a_ptr,
-                                            const uint8_t * quant_b_data,
-                                            float *         c_ptr,
-                                            size_t          count_n,
-                                            size_t          k_blks,
-                                            size_t          ldc) {
-    constexpr size_t NB_COLS = 32;
-    using super_type = nrow_super_q6_k<NB_COLS>;
-    GGML_ASSERT(blk_len == 32);
-    GGML_ASSERT(__riscv_vlenb() == 128);
-    GGML_ASSERT(k_blks % 8 == 0);
-
-    const size_t b_tile_stride = (k_blks / 8) * sizeof(super_type);
-    const size_t d_bytes = sizeof(uint16_t) * NB_COLS;
-
-    for (size_t ni = 0; ni < count_n; ni += NB_COLS) {
-        const size_t nb_real = std::min<size_t>(NB_COLS, count_n - ni);
-        const uint8_t * b_data = quant_b_data + (ni / NB_COLS) * b_tile_stride + d_bytes;
-        const uint8_t * a_data = quant_a_ptr;
-        float * dst = c_ptr + ni;
-        // One outer assembly iteration consumes 8 K32 blocks.
-        size_t cnt = k_blks;
-
-        asm volatile(
-            "vsetvli        t0, x0, e32, m1         \n\t"
-            "vxor.vv        v3, v3, v3              \n\t"
-            "vxor.vv        v5, v5, v5              \n\t"
-            "vxor.vv        v7, v7, v7              \n\t"
-            "vxor.vv        v31, v31, v31           \n\t"
-
-            ".align 4                               \n\t"
-            "SUPER_LOOP4D%=:                        \n\t"
-            "addi           t4, %[B], -64           \n\t"
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "vle16.v        v0, (t4)                \n\t"
-            // Keep the FP16 source type until the widening conversion completes.
-            "vfwcvt.f.f.v   v2, v0                 \n\t"
-            "vsetvli        t0, x0, e32, m1         \n\t"
-            "li             s3, 8                   \n\t"
-
-            // Load one complete 832 B sub-block in address order before decoding it.
-            "vsetvli        t0, x0, e8, mf2        \n\t"
-            "vle8.v         v24, (%[B])            \n\t"  // scales[64]
-            "addi           t1, %[B], 64            \n\t"
-            "addi           t2, %[B], 192           \n\t"
-            "addi           t3, %[B], 320           \n\t"
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vle8.v         v0, (t1)                \n\t"  // qh plane 0[128]
-            "vle8.v         v1, (t2)                \n\t"  // qh plane 1[128]
-            "vl4r.v         v8, (t3)                \n\t"  // ql[512]
-
-            ".align 4                               \n\t"
-            "BLK_LOOP4D%=:                          \n\t"
-            "li             t6, 32                  \n\t"
-            "vsetvli        t0, x0, e8, mf2        \n\t"
-            "vslidedown.vx  v25, v24, t6           \n\t"
-
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vand.vi        v12, v8, 0xF            \n\t"
-            "vand.vi        v13, v9, 0xF            \n\t"
-            "vand.vi        v14, v10, 0xF           \n\t"
-            "vand.vi        v15, v11, 0xF           \n\t"
-            "vsrl.vi        v8, v8, 4               \n\t"
-            "vsrl.vi        v9, v9, 4               \n\t"
-            "vsrl.vi        v10, v10, 4             \n\t"
-            "vsrl.vi        v11, v11, 4             \n\t"
-            "vpack.vv       v16, v12, v8, 0         \n\t"
-            "vpack.vv       v18, v13, v9, 0         \n\t"
-            "vpack.vv       v20, v14, v10, 0        \n\t"
-            "vpack.vv       v22, v15, v11, 0        \n\t"
-
-            "li             t6, 16                  \n\t"
-            "vsetvli        t0, x0, e8, m8          \n\t"
-            "vadd.vx        v16, v16, t6, v0.t      \n\t"
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vmv.v.v        v0, v1                  \n\t"
-            "li             t6, 32                  \n\t"
-            "vsetvli        t0, x0, e8, m8          \n\t"
-            "vadd.vx        v16, v16, t6, v0.t      \n\t"
-
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vupack.vv      v8, v16, v17, 1         \n\t"
-            "vupack.vv      v10, v18, v19, 1        \n\t"
-            "vupack.vv      v12, v20, v21, 1        \n\t"
-            "vupack.vv      v14, v22, v23, 1        \n\t"
-            "vmv.v.v        v16, v8                 \n\t"
-            "vmv.v.v        v17, v9                 \n\t"
-            "vmv.v.v        v18, v10                \n\t"
-            "vmv.v.v        v19, v11                \n\t"
-            "vmv.v.v        v20, v12                \n\t"
-            "vmv.v.v        v21, v13                \n\t"
-            "vmv.v.v        v22, v14                \n\t"
-            "vmv.v.v        v23, v15                \n\t"
-
-            // Expand the already-loaded scales once and reuse them for all four rows.
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "vsext.vf2      v8, v24                 \n\t"
-            "vsext.vf2      v10, v25                \n\t"
-            "vsetvli        t0, x0, e32, m1         \n\t"
-            "vsext.vf2      v12, v8                 \n\t"
-            "vsext.vf2      v14, v10                \n\t"
-
-            // Row 0.
-            "flw            f0, 0(%[A])              \n\t"
-            "lh             s1, 16(%[A])             \n\t"
-            "lh             s2, 18(%[A])             \n\t"
-            "addi           t5, %[A], 32            \n\t"
-            "vsetvli        t0, x0, e8, mf4          \n\t"
-            "vle8.v         v1, (t5)                 \n\t"
-            "vsetvli        t0, x0, e64, m1          \n\t"
-            "vslidedown.vi  v6, v1, 2               \n\t"
-            "vsetvli        t0, x0, e32, m1          \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v1, v16, i8         \n\t"
-            "vmadot         v26, v1, v18, i8         \n\t"
-            "vmadot         v28, v1, v20, i8         \n\t"
-            "vmadot         v30, v1, v22, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v4, v8, v10, 3           \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v6, v17, i8         \n\t"
-            "vmadot         v26, v6, v19, i8         \n\t"
-            "vmadot         v28, v6, v21, i8         \n\t"
-            "vmadot         v30, v6, v23, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v24, v8, v10, 3          \n\t"
-            "slli           s1, s1, 5                \n\t"
-            "slli           s2, s2, 5                \n\t"
-            "vadd.vx        v4, v4, s1               \n\t"
-            "vadd.vx        v24, v24, s2             \n\t"
-            "vmul.vv        v4, v4, v12             \n\t"
-            "vmacc.vv       v4, v24, v14            \n\t"
-            "vfcvt.f.x.v    v8, v4                  \n\t"
-            "vfmul.vf       v10, v2, f0             \n\t"
-            "vfmacc.vv      v3, v10, v8             \n\t"
-
-            // Row 1.
-            "flw            f1, 4(%[A])              \n\t"
-            "lh             s1, 20(%[A])             \n\t"
-            "lh             s2, 22(%[A])             \n\t"
-            "addi           t5, %[A], 64            \n\t"
-            "vsetvli        t0, x0, e8, mf4          \n\t"
-            "vle8.v         v1, (t5)                 \n\t"
-            "vsetvli        t0, x0, e64, m1          \n\t"
-            "vslidedown.vi  v6, v1, 2               \n\t"
-            "vsetvli        t0, x0, e32, m1          \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v1, v16, i8         \n\t"
-            "vmadot         v26, v1, v18, i8         \n\t"
-            "vmadot         v28, v1, v20, i8         \n\t"
-            "vmadot         v30, v1, v22, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v4, v8, v10, 3           \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v6, v17, i8         \n\t"
-            "vmadot         v26, v6, v19, i8         \n\t"
-            "vmadot         v28, v6, v21, i8         \n\t"
-            "vmadot         v30, v6, v23, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v24, v8, v10, 3          \n\t"
-            "slli           s1, s1, 5                \n\t"
-            "slli           s2, s2, 5                \n\t"
-            "vadd.vx        v4, v4, s1               \n\t"
-            "vadd.vx        v24, v24, s2             \n\t"
-            "vmul.vv        v4, v4, v12             \n\t"
-            "vmacc.vv       v4, v24, v14            \n\t"
-            "vfcvt.f.x.v    v8, v4                  \n\t"
-            "vfmul.vf       v10, v2, f1             \n\t"
-            "vfmacc.vv      v5, v10, v8             \n\t"
-
-            // Row 2.
-            "flw            f2, 8(%[A])              \n\t"
-            "lh             s1, 24(%[A])             \n\t"
-            "lh             s2, 26(%[A])             \n\t"
-            "addi           t5, %[A], 96            \n\t"
-            "vsetvli        t0, x0, e8, mf4          \n\t"
-            "vle8.v         v1, (t5)                 \n\t"
-            "vsetvli        t0, x0, e64, m1          \n\t"
-            "vslidedown.vi  v6, v1, 2               \n\t"
-            "vsetvli        t0, x0, e32, m1          \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v1, v16, i8         \n\t"
-            "vmadot         v26, v1, v18, i8         \n\t"
-            "vmadot         v28, v1, v20, i8         \n\t"
-            "vmadot         v30, v1, v22, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v4, v8, v10, 3           \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v6, v17, i8         \n\t"
-            "vmadot         v26, v6, v19, i8         \n\t"
-            "vmadot         v28, v6, v21, i8         \n\t"
-            "vmadot         v30, v6, v23, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v24, v8, v10, 3          \n\t"
-            "slli           s1, s1, 5                \n\t"
-            "slli           s2, s2, 5                \n\t"
-            "vadd.vx        v4, v4, s1               \n\t"
-            "vadd.vx        v24, v24, s2             \n\t"
-            "vmul.vv        v4, v4, v12             \n\t"
-            "vmacc.vv       v4, v24, v14            \n\t"
-            "vfcvt.f.x.v    v8, v4                  \n\t"
-            "vfmul.vf       v10, v2, f2             \n\t"
-            "vfmacc.vv      v7, v10, v8             \n\t"
-
-            // Row 3.
-            "flw            f3, 12(%[A])             \n\t"
-            "lh             s1, 28(%[A])             \n\t"
-            "lh             s2, 30(%[A])             \n\t"
-            "addi           t5, %[A], 128           \n\t"
-            "vsetvli        t0, x0, e8, mf4          \n\t"
-            "vle8.v         v1, (t5)                 \n\t"
-            "vsetvli        t0, x0, e64, m1          \n\t"
-            "vslidedown.vi  v6, v1, 2               \n\t"
-            "vsetvli        t0, x0, e32, m1          \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v1, v16, i8         \n\t"
-            "vmadot         v26, v1, v18, i8         \n\t"
-            "vmadot         v28, v1, v20, i8         \n\t"
-            "vmadot         v30, v1, v22, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v4, v8, v10, 3           \n\t"
-            "vxor.vv        v24, v24, v24            \n\t"
-            "vxor.vv        v26, v26, v26            \n\t"
-            "vxor.vv        v28, v28, v28            \n\t"
-            "vxor.vv        v30, v30, v30            \n\t"
-            "vmadot         v24, v6, v17, i8         \n\t"
-            "vmadot         v26, v6, v19, i8         \n\t"
-            "vmadot         v28, v6, v21, i8         \n\t"
-            "vmadot         v30, v6, v23, i8         \n\t"
-            "vpack.vv       v8, v24, v26, 2          \n\t"
-            "vpack.vv       v10, v28, v30, 2         \n\t"
-            "vpack.vv       v24, v8, v10, 3          \n\t"
-            "slli           s1, s1, 5                \n\t"
-            "slli           s2, s2, 5                \n\t"
-            "vadd.vx        v4, v4, s1               \n\t"
-            "vadd.vx        v24, v24, s2             \n\t"
-            "vmul.vv        v4, v4, v12             \n\t"
-            "vmacc.vv       v4, v24, v14            \n\t"
-
-            "addi           s3, s3, -1              \n\t"
-            "beqz           s3, NO_PREFETCH4D%=     \n\t"
-            "addi           t4, %[B], 832           \n\t"
-            "vsetvli        t0, x0, e8, mf2        \n\t"
-            "vle8.v         v24, (t4)               \n\t"
-            "addi           t1, t4, 64              \n\t"
-            "addi           t2, t4, 192             \n\t"
-            "addi           t3, t4, 320             \n\t"
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vle8.v         v0, (t1)                \n\t"
-            "vle8.v         v1, (t2)                \n\t"
-            "vl4r.v         v8, (t3)                \n\t"
-            "NO_PREFETCH4D%=:                       \n\t"
-
-            "vsetvli        t0, x0, e32, m1         \n\t"
-            "vfcvt.f.x.v    v26, v4                 \n\t"
-            "vfmul.vf       v28, v2, f3             \n\t"
-            "vfmacc.vv      v31, v28, v26           \n\t"
-
-            "addi           %[A], %[A], 160         \n\t"
-            "addi           %[B], %[B], 832         \n\t"
-            "addi           %[BK], %[BK], -1        \n\t"
-            "bgtz           s3, BLK_LOOP4D%=        \n\t"
-            "addi           %[B], %[B], 64           \n\t"
-            "bgtz           %[BK], SUPER_LOOP4D%=   \n\t"
-
-            "vsetvli        t0, %[NR], e32, m1      \n\t"
-            "vse32.v        v3, (%[DST])            \n\t"
-            "add            t1, %[LDC], %[DST]      \n\t"
-            "vse32.v        v5, (t1)               \n\t"
-            "add            t2, %[LDC], t1          \n\t"
-            "vse32.v        v7, (t2)               \n\t"
-            "add            t3, %[LDC], t2          \n\t"
-            "vse32.v        v31, (t3)              \n\t"
-            : [A] "+r"(a_data), [B] "+r"(b_data), [BK] "+r"(cnt)
-            : [DST] "r"(dst), [LDC] "r"(ldc * sizeof(float)), [NR] "r"(nb_real)
-            : "cc", "memory", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s1", "s2", "s3",
-              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
-              "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26",
-              "v27", "v28", "v29", "v30", "v31", "f0", "f1", "f2", "f3");
-    }
-}
-
 static void gemm_kernel_i8i6k_m4_via_m1(size_t          blk_len,
                                         const uint8_t * quant_a_ptr,
                                         const uint8_t * quant_b_data,
@@ -6391,11 +6077,11 @@ size_t gemm_kernel_i8i6k(size_t          blk_len,
     return 1;
 }
 
-static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
-                                     const uint8_t * quant_b_data,
-                                     float *         c_ptr,
-                                     size_t          count_n,
-                                     size_t          k_blks) {
+void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              float *         c_ptr,
+                              size_t          count_n,
+                              size_t          k_blks) {
     const size_t supers = k_blks / 8;
     for (size_t n = 0; n < count_n; n += 32) {
         const size_t nblks = (count_n - n) > 32 ? 32 : count_n - n;
@@ -6523,12 +6209,12 @@ static void gemm_kernel_i8i4_m1_zpds(const uint8_t * quant_a_ptr,
     }
 }
 
-static void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
-                                     const uint8_t * quant_b_data,
-                                     float *         c_ptr,
-                                     size_t          count_n,
-                                     size_t          k_blks,
-                                     size_t          ldc) {
+void gemm_kernel_i8i4_m4_zpds(const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              float *         c_ptr,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc) {
     const size_t supers = k_blks / 8;
     for (size_t ni = 0; ni < count_n; ni += 32) {
         uint8_t * b_data = (uint8_t *) quant_b_data + (ni / 32) * supers * 4544;
@@ -6717,7 +6403,7 @@ size_t gemm_kernel_i8i4_legacy(size_t          blk_len,
     return handled;
 }
 
-void quantize_a_m8_ime(const float * source, size_t k, q4_pp_block_a * destination) {
+void quantize_a_m8_i8(const float * source, size_t k, q4_pp_block_a * destination) {
     GGML_ASSERT(__riscv_vlenb() == 128 && k != 0 && k % 32 == 0);
     for (size_t offset = 0; offset < k; offset += 32) {
         auto & out = destination[offset / 32];
@@ -6764,11 +6450,11 @@ void quantize_a_m8_ime(const float * source, size_t k, q4_pp_block_a * destinati
     }
 }
 
-void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
-                             const q4_pp_block_b * packed_b,
-                             float *                 output,
-                             size_t                  k_blocks,
-                             size_t                  ldc) {
+void gemm_kernel_i8i8_m8_q4_prepacked(const q4_pp_block_a * packed_a,
+                               const q4_pp_block_b * packed_b,
+                               float *                 output,
+                               size_t                  k_blocks,
+                               size_t                  ldc) {
     const std::uint8_t * a_data    = reinterpret_cast<const std::uint8_t *>(packed_a);
     const std::uint8_t * b_data    = reinterpret_cast<const std::uint8_t *>(packed_b);
     const size_t         ldc_bytes = ldc * sizeof(float);
@@ -6887,11 +6573,11 @@ void gemm_m8_q8_ab_prepacked(const q4_pp_block_a * packed_a,
           "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7");
 }
 
-void gemm_m8_q8_0_ab_prepacked(const q4_pp_block_a * packed_a,
-                               const q8_0_block_b * packed_b,
-                               float *               output,
-                               size_t                k_blocks,
-                               size_t                ldc) {
+void gemm_kernel_i8i8_m8_q8_0(const q4_pp_block_a * packed_a,
+                              const q8_0_block_b * packed_b,
+                              float *               output,
+                              size_t                k_blocks,
+                              size_t                ldc) {
     const std::uint8_t * a_data = reinterpret_cast<const std::uint8_t *>(packed_a);
     const std::uint8_t * b_data = reinterpret_cast<const std::uint8_t *>(packed_b);
     const size_t ldc_bytes = ldc * sizeof(float);

@@ -404,6 +404,9 @@ extern "C" {
         // a source/target/parent context
         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
         struct llama_context * ctx_other;
+
+        // number of Q4 PP streaming ring slots used by the Spacemit backend (default: 16)
+        uint32_t spacemit_ring_slots;
     };
 
     struct llama_model_tensor_override {

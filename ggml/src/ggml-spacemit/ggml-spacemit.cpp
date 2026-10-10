@@ -411,18 +411,25 @@ spacemit_session::~spacemit_session() {
     free(workspace);
 }
 
+struct spacemit_backend_context {
+    spacemit_session * session;
+    uint32_t ring_slots;
+};
+
 static const char * ggml_backend_spacemit_name(ggml_backend_t backend) {
-    auto sess = static_cast<spacemit_session *>(backend->context);
-    return sess->c_name();
+    auto * ctx = static_cast<spacemit_backend_context *>(backend->context);
+    return ctx->session->c_name();
 }
 
 static void ggml_backend_spacemit_free(ggml_backend_t backend) {
     // The device registry owns the shared session.
+    delete static_cast<spacemit_backend_context *>(backend->context);
     delete backend;
 }
 
 static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, ggml_cgraph * graph) {
-    auto sess = static_cast<spacemit_session *>(backend->context);
+    auto * backend_ctx = static_cast<spacemit_backend_context *>(backend->context);
+    auto * sess = backend_ctx->session;
     // Serialize hardware use across backend handles. The Stream itself remains
     // graph-scoped so idle contexts do not retain CC hardware resources.
     std::lock_guard<std::mutex> stream_lock(sess->stream_mutex);
@@ -438,7 +445,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         }
 
         size_t node_workspace_size = 0;
-        if (ggml_spacemit_get_work_size(n_threads, node, &node_workspace_size)) {
+        if (ggml_spacemit_get_work_size(n_threads, backend_ctx->ring_slots, node, &node_workspace_size)) {
             workspace_size = std::max(workspace_size, node_workspace_size);
         }
     }
@@ -471,6 +478,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
         [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
+         ring_slots = backend_ctx->ring_slots,
          q4_stream_host_ptr = q4_stream_host.get(),
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
             // Match the old ggml-cpu/spacemit path: use the complete
@@ -485,7 +493,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
             const uint32_t ith = runtime->program_id(0);
             auto & ctx = contexts[ith];
-            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared, q4_stream_host_ptr);
+            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared, q4_stream_host_ptr,
+                      ring_slots);
 
             for (int i = 0; i < n_nodes; i++) {
                 ggml_tensor * node = nodes[i];
@@ -559,15 +568,27 @@ bool ggml_backend_is_spacemit(ggml_backend_t backend) {
 
 static ggml_backend_t ggml_backend_spacemit_device_init(ggml_backend_dev_t dev, const char * params) {
     auto sess = static_cast<spacemit_session *>(dev->context);
+    uint32_t ring_slots = 16;
+    if (params != nullptr) {
+        char * end = nullptr;
+        const long value = strtol(params, &end, 10);
+        if (end == params || *end != '\0' || value < 1 || value > 1024) {
+            GGML_LOG_ERROR("ggml-spacemit: ring slots must be between 1 and 1024\n");
+            return nullptr;
+        }
+        ring_slots = static_cast<uint32_t>(value);
+    }
+    if (sess->num_cores == 0 || ring_slots % sess->num_cores != 0) {
+        GGML_LOG_ERROR("ggml-spacemit: ring slots must be a multiple of the %u A100 cores\n", sess->num_cores);
+        return nullptr;
+    }
 
     return new ggml_backend{
         /* .guid      = */ ggml_backend_spacemit_guid(),
         /* .interface = */ spacemit_backend_i,
         /* .device    = */ dev,
-        /* .context   = */ sess,
+        /* .context   = */ new spacemit_backend_context{ sess, ring_slots },
     };
-
-    GGML_UNUSED(params);
 }
 
 static const char * ggml_backend_spacemit_device_get_name(ggml_backend_dev_t dev) {
