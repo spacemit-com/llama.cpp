@@ -6,6 +6,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -453,6 +454,10 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     }
     auto * workspace = static_cast<uint8_t *>(sess->workspace);
 
+    std::unique_ptr<spine_q4_stream_host, decltype(&spine_q4_stream_host_destroy)> q4_stream_host(
+        n_threads == 8 && spine_q4_stream_graph_enabled(graph) ? spine_q4_stream_host_create() : nullptr,
+        spine_q4_stream_host_destroy);
+
     spert::Stream stream(sess->num_cores);
     if (!stream.valid()) {
         GGML_LOG_ERROR("ggml-spacemit: failed to create spert stream\n");
@@ -466,6 +471,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
         [nodes, n_nodes, workspace_size = sess->workspace_size, workspace, contexts,
+         q4_stream_host_ptr = q4_stream_host.get(),
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
             // Match the old ggml-cpu/spacemit path: use the complete
             // worker-local TCM buffer directly.  alloc_shared() is a
@@ -479,7 +485,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
             const uint32_t ith = runtime->program_id(0);
             auto & ctx = contexts[ith];
-            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared);
+            ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared, q4_stream_host_ptr);
 
             for (int i = 0; i < n_nodes; i++) {
                 ggml_tensor * node = nodes[i];

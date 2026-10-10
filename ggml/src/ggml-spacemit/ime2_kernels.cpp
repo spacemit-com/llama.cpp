@@ -4919,6 +4919,7 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
                          size_t          ldc) {
     int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
     for (size_t ni = 0; ni < count_n; ni += 32) {
+        const size_t store_cols = count_n - ni;
         uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
         int8_t *  a_data = (int8_t *) quant_a_ptr;
         float *   dst_c  = c_ptr + ni;
@@ -5004,7 +5005,7 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
             "bgtz           %[BK], BLK_LOOP%=     \n\t"
 
             // save
-            "vsetvli        t0, x0, e32, m1       \n\t"
+            "vsetvli        t0, %[NC], e32, m1   \n\t"
             "add            t2, %[LDC], %[DST]    \n\t"
             "vse32.v        v28, (%[DST])         \n\t"
             "add            t3, %[LDC], t2        \n\t"
@@ -5013,7 +5014,7 @@ void gemm_kernel_i8i8_m4(size_t          blk_len,
             "vse32.v        v30, (t3)             \n\t"
             "vse32.v        v31, (t2)             \n\t"
             : [A] "+r"(a_data), [B] "+r"(b_data)
-            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks)
+            : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks), [NC] "r"(store_cols)
             : "t0", "t1", "t2", "t3", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12",
               "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27",
               "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3");

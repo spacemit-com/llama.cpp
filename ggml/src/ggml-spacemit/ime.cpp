@@ -17,14 +17,19 @@
 #include "vec.h"
 
 #include <fcntl.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <cerrno>
 #include <cmath>
 #include <cstdio>  // for GGML_ASSERT
+#include <cstring>
+#include <new>
 #include <stdexcept>
 #include <thread>
 // clang-format off
@@ -108,12 +113,6 @@ inline size_t spine_q4_k_expanded_offset(const ggml_tensor * tensor) {
     return GGML_PAD(spine_q4_k_compressed_nbytes(tensor), size_t{ 64 });
 }
 
-inline size_t spine_q4_0_expanded_offset(const ggml_tensor * tensor) {
-    GGML_ASSERT(tensor != nullptr && q4_0_pp_weights_enabled(tensor));
-    const size_t nblocks = static_cast<size_t>(tensor->ne[0] / QK4_0);
-    return GGML_PAD(static_cast<size_t>(ggml_nrows(tensor)) * nblocks * sizeof(block_q4_0), size_t{ 64 });
-}
-
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 inline int64_t spine_row_stride_b(int64_t b_k_blks) {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) {
@@ -128,6 +127,218 @@ inline int64_t spine_row_stride_b(int64_t b_k_blks) {
 struct spine_dyn_n_schedule_state {
     int64_t counters[8];
 };
+
+// Two X100 threads unpack Q4 N32 tiles into a bounded DRAM ring while
+// the A100 workers consume the preceding tiles.
+static constexpr int spine_q4_ring_slots = 16;
+
+// Space out readers without imposing 64-byte alignment on realloc's workspace.
+struct spine_q4_reader_progress {
+    std::atomic<int64_t> tile{ -1 };
+    uint8_t              padding[64 - sizeof(std::atomic<int64_t>)];
+};
+
+static_assert(sizeof(spine_q4_reader_progress) == 64);
+
+struct spine_q4_stream_state {
+    std::atomic<int64_t>     slots[spine_q4_ring_slots];
+    spine_q4_reader_progress consumed[8];
+};
+
+struct spine_q4_stream_host {
+    std::atomic<uint64_t> generation{0};
+    std::atomic<uint64_t> completed[2]{};
+    std::atomic<bool>     ready[2]{};
+    std::atomic<bool>     failed{false};
+    std::atomic<bool>     stop{false};
+    void (*run)(void *, int) = nullptr;
+    void * arg = nullptr;
+    std::thread workers[2];
+};
+
+inline bool spine_q4_stream_shape(int64_t m, int64_t k, int64_t n) {
+    return m == 128 && k > 0 && k % 32 == 0 && n > 0 && n % 32 == 0;
+}
+
+bool spine_q4_stream_graph_enabled(const ggml_cgraph * graph) {
+    if (!global_spine_env_info.use_ime2) {
+        return false;
+    }
+    const size_t tcm_size = spert::backend_info().shared_mem_size;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * op = graph->nodes[i];
+        if (op->op != GGML_OP_MUL_MAT || op->src[0] == nullptr || op->src[1] == nullptr) {
+            continue;
+        }
+        const ggml_tensor * weight = op->src[0];
+        if (weight->type != GGML_TYPE_Q4_0 && weight->type != GGML_TYPE_Q4_K) {
+            continue;
+        }
+        const int64_t k = weight->ne[0];
+        const int64_t n = weight->ne[1];
+        const int64_t m = op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
+        if (!spine_q4_stream_shape(m, k, n)) {
+            continue;
+        }
+        if (!q4_pp_stream_weights_enabled(weight)) {
+            continue;
+        }
+        if (weight->type == GGML_TYPE_Q4_K && !spine_q4_m_split_enabled(weight)) {
+            continue;
+        }
+        const size_t k_blocks = static_cast<size_t>(k / 32);
+        if (2 * k_blocks * sizeof(spacemit_kernels::ime2::q4_pp_block_a) <= tcm_size) {
+            return true;
+        }
+    }
+    return false;
+}
+
+spine_q4_stream_host * spine_q4_stream_host_create() {
+    auto * host = new spine_q4_stream_host;
+    for (int id = 0; id < 2; ++id) {
+        host->workers[id] = std::thread([host, id]() {
+            cpu_set_t mask;
+            CPU_ZERO(&mask);
+            CPU_SET(id, &mask);
+            if (pthread_setaffinity_np(pthread_self(), sizeof(mask), &mask) != 0) {
+                host->failed.store(true, std::memory_order_release);
+            }
+            host->ready[id].store(true, std::memory_order_release);
+            uint64_t observed = 0;
+            while (!host->stop.load(std::memory_order_acquire)) {
+                const uint64_t generation = host->generation.load(std::memory_order_acquire);
+                if (generation != observed) {
+                    host->run(host->arg, id);
+                    observed = generation;
+                    host->completed[id].store(generation, std::memory_order_release);
+                } else {
+                    __asm__ volatile("pause" ::: "memory");
+                }
+            }
+        });
+    }
+    while (!host->ready[0].load(std::memory_order_acquire) ||
+           !host->ready[1].load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+    if (host->failed.load(std::memory_order_acquire)) {
+        spine_q4_stream_host_destroy(host);
+        return nullptr;
+    }
+    return host;
+}
+
+void spine_q4_stream_host_destroy(spine_q4_stream_host * host) {
+    if (host == nullptr) {
+        return;
+    }
+    host->stop.store(true, std::memory_order_release);
+    for (auto & worker : host->workers) {
+        worker.join();
+    }
+    delete host;
+}
+
+static void spine_q4_stream_host_submit(spine_q4_stream_host * host, void (*run)(void *, int), void * arg) {
+    host->run = run;
+    host->arg = arg;
+    host->generation.fetch_add(1, std::memory_order_release);
+}
+
+static void spine_q4_stream_host_wait(spine_q4_stream_host * host) {
+    const uint64_t generation = host->generation.load(std::memory_order_acquire);
+    for (int id = 0; id < 2; ++id) {
+        while (host->completed[id].load(std::memory_order_acquire) != generation) {
+            __asm__ volatile("pause" ::: "memory");
+        }
+    }
+}
+
+struct spine_q40_stream_block {
+    uint16_t d[32];
+    uint8_t  qs[512];
+};
+
+static_assert(sizeof(spine_q40_stream_block) == 576);
+
+inline void spine_q4_stream_unpack_quarter(const uint8_t * src, const uint8_t * zp4, int quarter, int8_t * dst) {
+    const size_t vl64 = __riscv_vsetvl_e64m2(8);
+    GGML_ASSERT(vl64 == 8);
+    const auto halves = __riscv_vlseg2e64_v_u64m2x2(reinterpret_cast<const uint64_t *>(src), vl64);
+    const size_t vl = __riscv_vsetvl_e8m2(64);
+    GGML_ASSERT(vl == 64);
+    vuint16m4_t zp;
+    if (zp4 != nullptr) {
+        const auto packed_zp = __riscv_vle8_v_u8m2(zp4 + (quarter & 1) * 8, 8);
+        const auto zp_index = __riscv_vsrl_vx_u8m2(__riscv_vid_v_u8m2(vl), 3, vl);
+        const auto zp_byte = __riscv_vrgather_vv_u8m2(packed_zp, zp_index, vl);
+        const auto zp_nibble = quarter < 2 ? __riscv_vand_vx_u8m2(zp_byte, 15, vl)
+                                             : __riscv_vsrl_vx_u8m2(zp_byte, 4, vl);
+        zp = __riscv_vzext_vf2_u16m4(zp_nibble, vl);
+    } else {
+        zp = __riscv_vmv_v_x_u16m4(8, vl);
+    }
+    const auto store_part = [&](vuint64m2_t words, int part) {
+        const auto bytes = __riscv_vreinterpret_v_u64m2_u8m2(words);
+        const auto wide = __riscv_vzext_vf2_u16m4(bytes, vl);
+        const auto low = __riscv_vsub_vv_u16m4(__riscv_vand_vx_u16m4(wide, 15, vl), zp, vl);
+        const auto high = __riscv_vsub_vv_u16m4(__riscv_vsrl_vx_u16m4(wide, 4, vl), zp, vl);
+        const auto pair = __riscv_vor_vv_u16m4(
+            __riscv_vand_vx_u16m4(low, 255, vl), __riscv_vsll_vx_u16m4(high, 8, vl), vl);
+        __riscv_vse16_v_u16m4(reinterpret_cast<uint16_t *>(dst + part * 128), pair, vl);
+    };
+    store_part(__riscv_vget_v_u64m2x2_u64m2(halves, 0), 0);
+    store_part(__riscv_vget_v_u64m2x2_u64m2(halves, 1), 1);
+}
+
+inline void spine_q4_stream_unpack_block(const uint8_t * qs, const uint8_t * zp4, int8_t * dst) {
+    for (int q = 0; q < 4; ++q) {
+        spine_q4_stream_unpack_quarter(qs + q * 128, zp4, q, dst + q * 256);
+    }
+}
+
+template <typename BLOC_TYPE>
+inline void spine_q4_stream_pack_tile(const uint8_t * compressed, int64_t tile, int64_t k_blocks,
+                                      spacemit_kernels::ime2::q4_pp_block_b * dst,
+                                      const uint16_t * precomputed_scales) {
+    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
+        using super_block = spacemit_kernels::nrow_super_q4_k_ds<32>;
+        const auto * src = reinterpret_cast<const super_block *>(compressed) + tile * (k_blocks / 8);
+        for (int64_t b = 0; b < k_blocks; ++b) {
+            const auto & super = src[b / 8];
+            const auto & sub = super.sub[b % 8];
+            std::memcpy(dst[b].d, precomputed_scales + (tile * k_blocks + b) * 32, sizeof(dst[b].d));
+            spine_q4_stream_unpack_block(sub.qs, sub.zp4, dst[b].qs);
+        }
+    } else {
+        const auto * src = reinterpret_cast<const spine_q40_stream_block *>(compressed) + tile * k_blocks;
+        for (int64_t b = 0; b < k_blocks; ++b) {
+            std::memcpy(dst[b].d, src[b].d, sizeof(dst[b].d));
+            spine_q4_stream_unpack_block(src[b].qs, nullptr, dst[b].qs);
+        }
+    }
+}
+
+template <typename BLOC_TYPE>
+inline void spine_q4_stream_produce(spine_q4_stream_state & state, const uint8_t * compressed,
+                                   spacemit_kernels::ime2::q4_pp_block_b * ring, int64_t k_blocks, int64_t n_tiles,
+                                   int id, const uint16_t * precomputed_scales) {
+    for (int64_t tile = id; tile < n_tiles; tile += 2) {
+        const int slot = tile % spine_q4_ring_slots;
+        if (tile >= spine_q4_ring_slots) {
+            const int64_t previous = tile - spine_q4_ring_slots;
+            for (int reader = 0; reader < 8; ++reader) {
+                while (state.consumed[reader].tile.load(std::memory_order_acquire) < previous) {
+                    __asm__ volatile("pause" ::: "memory");
+                }
+            }
+        }
+        spine_q4_stream_pack_tile<BLOC_TYPE>(compressed, tile, k_blocks, ring + slot * k_blocks,
+                                             precomputed_scales);
+        state.slots[slot].store(tile, std::memory_order_release);
+    }
+}
 
 template <typename Fn>
 inline bool spine_dyn_n_schedule(ggml::spacemit::context & ctx, spine_dyn_n_schedule_state & state, int64_t n_tiles,
@@ -208,6 +419,20 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     const int64_t gemm_m = op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
                     if (gemm_m == 1 || gemm_m == 4) {
                         size += sizeof(spine_dyn_n_schedule_state);
+                    }
+
+                    if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) ||
+                                  (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 32 &&
+                                   (INTER_SIZE == 32 || INTER_SIZE == 256))) {
+                        const int64_t gemm_k = op->src[0]->ne[0];
+                        if (q4_pp_stream_weights_enabled(op->src[0]) &&
+                            spine_q4_stream_shape(gemm_m, gemm_k, op->src[0]->ne[1])) {
+                            const size_t ring_bytes = spine_q4_ring_slots * static_cast<size_t>(gemm_k / 32) *
+                                                      sizeof(spacemit_kernels::ime2::q4_pp_block_b);
+                            size = GGML_PAD(size, size_t{ 64 }) + sizeof(spine_q4_stream_state);
+                            size = GGML_PAD(size, size_t{ 64 });
+                            size += ring_bytes + 64;
+                        }
                     }
 
                     return true;
@@ -425,20 +650,13 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_K> && INTER_SIZE == 32 && NB_COLS == 32) ||
                       (std::is_same_v<BLOC_TYPE, block_q4_0> && NB_COLS == 32 &&
                        (INTER_SIZE == 32 || INTER_SIZE == 256))) {
-            const bool expanded_weights = [&]() {
+            const bool expanded_weights = [&]() -> bool {
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                    return q4_m_split;
-                } else {
-                    return q4_0_pp_weights_enabled(src0);
+                    return q4_m_split && !q4_pp_stream_weights_enabled(src0);
                 }
+                return false;
             }();
-            const size_t expanded_offset = expanded_weights ? [&]() {
-                if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                    return spine_q4_k_expanded_offset(src0);
-                } else {
-                    return spine_q4_0_expanded_offset(src0);
-                }
-            }() : 0;
+            const size_t expanded_offset = expanded_weights ? spine_q4_k_expanded_offset(src0) : 0;
             const int64_t k_blocks = gemm_k / 32;
             const bool m8_shape = [&]() {
                 if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
@@ -467,6 +685,75 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
             const size_t a_tile_bytes =
                 static_cast<size_t>(2 * k_blocks) * sizeof(spacemit_kernels::ime2::q4_pp_block_a);
+            const size_t packed_b_bytes = static_cast<size_t>(k_blocks) * sizeof(spacemit_kernels::ime2::q4_pp_block_b);
+            if (q4_pp_stream_weights_enabled(src0) && spine_q4_stream_shape(gemm_m, gemm_k, gemm_n) && nth == 8 &&
+                global_spine_env_info.use_ime2 && tcm_buffer != nullptr &&
+                a_tile_bytes <= static_cast<size_t>(tcm_buffer_size) && ctx.q4_stream_host != nullptr) {
+                const size_t state_offset = GGML_PAD(static_cast<size_t>(gemm_workspace_size), size_t{ 64 });
+                auto *       state =
+                    reinterpret_cast<spine_q4_stream_state *>(static_cast<uint8_t *>(ctx.workspace) + state_offset);
+                auto * ring  = reinterpret_cast<spacemit_kernels::ime2::q4_pp_block_b *>(
+                    GGML_PAD(reinterpret_cast<uintptr_t>(state + 1), uintptr_t{ 64 }));
+                const size_t ring_bytes = spine_q4_ring_slots * packed_b_bytes;
+                GGML_ASSERT(reinterpret_cast<uintptr_t>(ring) + ring_bytes <=
+                            reinterpret_cast<uintptr_t>(ctx.workspace) + ctx.workspace_size);
+                if (ith == 0) {
+                    new (state) spine_q4_stream_state();
+                    for (int slot = 0; slot < spine_q4_ring_slots; ++slot) {
+                        state->slots[slot].store(-1, std::memory_order_relaxed);
+                    }
+                    for (int reader = 0; reader < 8; ++reader) {
+                        state->consumed[reader].tile.store(-1, std::memory_order_relaxed);
+                    }
+                }
+                ctx.sync();
+                auto * host = static_cast<spine_q4_stream_host *>(ctx.q4_stream_host);
+                struct job {
+                    spine_q4_stream_state * state;
+                    const uint8_t * compressed;
+                    spacemit_kernels::ime2::q4_pp_block_b * ring;
+                    int64_t k_blocks;
+                    int64_t n_tiles;
+                    const uint16_t * precomputed_scales;
+                } producer_job{};
+                if (ith == 0) {
+                    const uint16_t * precomputed_scales = nullptr;
+                    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_K>) {
+                        precomputed_scales = reinterpret_cast<const uint16_t *>(
+                            static_cast<const uint8_t *>(src0->data) + spine_q4_k_expanded_offset(src0));
+                        GGML_ASSERT(precomputed_scales != nullptr);
+                    }
+                    producer_job = { state, static_cast<const uint8_t *>(src0->data), ring,
+                                     k_blocks, gemm_n / 32, precomputed_scales };
+                    spine_q4_stream_host_submit(host, [](void * arg, int id) {
+                        const auto & job = *static_cast<const struct job *>(arg);
+                        spine_q4_stream_produce<BLOC_TYPE>(*job.state, job.compressed, job.ring,
+                                                            job.k_blocks, job.n_tiles, id, job.precomputed_scales);
+                    }, &producer_job);
+                }
+                auto * tcm_a = static_cast<spacemit_kernels::ime2::q4_pp_block_a *>(tcm_buffer);
+                const int64_t mi = static_cast<int64_t>(ith) * 16;
+                spacemit_kernels::ime2::quantize_a_m8_ime(feature + mi * gemm_k, gemm_k, tcm_a);
+                spacemit_kernels::ime2::quantize_a_m8_ime(feature + (mi + 8) * gemm_k, gemm_k,
+                                                           tcm_a + k_blocks);
+                for (int64_t tile = 0; tile < gemm_n / 32; ++tile) {
+                    const int slot = tile % spine_q4_ring_slots;
+                    while (state->slots[slot].load(std::memory_order_acquire) != tile) {
+                        __asm__ volatile("pause" ::: "memory");
+                    }
+                    const auto * b_tile = ring + slot * k_blocks;
+                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                        tcm_a, b_tile, output + mi * gemm_n + tile * 32, k_blocks, gemm_n);
+                    spacemit_kernels::ime2::gemm_m8_q8_ab_prepacked(
+                        tcm_a + k_blocks, b_tile, output + (mi + 8) * gemm_n + tile * 32, k_blocks, gemm_n);
+                    state->consumed[ith].tile.store(tile, std::memory_order_release);
+                }
+                if (ith == 0) {
+                    spine_q4_stream_host_wait(host);
+                }
+                // The graph loop synchronizes all workers after this operator.
+                return true;
+            }
             if (expanded_weights && gemm_m >= 16 && gemm_m % 16 == 0 && gemm_n % 32 == 0 && gemm_k % QK_K == 0 &&
                 tcm_buffer != nullptr && reinterpret_cast<uintptr_t>(tcm_buffer) % 64 == 0 &&
                 a_tile_bytes <= static_cast<size_t>(tcm_buffer_size)) {
@@ -1903,17 +2190,16 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     size_t nbytes = row_nbytes;
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 &&
-                ggml::cpu::riscv64_spacemit::q4_0_pp_weights_enabled(tensor)) {
-                nbytes = ggml::cpu::riscv64_spacemit::spine_q4_0_expanded_offset(tensor) +
-                         (static_cast<size_t>(ggml_nrows(tensor)) / 32 * static_cast<size_t>(tensor->ne[0] / QK4_0)) *
-                             sizeof(spacemit_kernels::ime2::q4_pp_block_b);
-            } else {
-                nbytes = add_strided_nbytes(row_nbytes, 1, 1);
-            }
+            nbytes = add_strided_nbytes(row_nbytes, 1, 1);
             break;
         case GGML_TYPE_Q4_K:
-            if (ggml::cpu::riscv64_spacemit::spine_q4_m_split_enabled(tensor)) {
+            if (ggml::cpu::riscv64_spacemit::q4_pp_stream_weights_enabled(tensor) &&
+                ggml::cpu::riscv64_spacemit::spine_q4_m_split_enabled(tensor)) {
+                const size_t scale_blocks =
+                    static_cast<size_t>(ggml_nrows(tensor)) / 32 * static_cast<size_t>(tensor->ne[0] / 32);
+                nbytes = ggml::cpu::riscv64_spacemit::spine_q4_k_expanded_offset(tensor) +
+                         scale_blocks * sizeof(uint16_t) * 32;
+            } else if (ggml::cpu::riscv64_spacemit::spine_q4_m_split_enabled(tensor)) {
                 nbytes =
                     ggml::cpu::riscv64_spacemit::spine_q4_k_expanded_offset(tensor) +
                     (static_cast<size_t>(ggml_nrows(tensor)) * static_cast<size_t>(tensor->ne[0] / QK_K) * 8 / 32) *

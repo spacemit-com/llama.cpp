@@ -8,11 +8,16 @@
 
 namespace ggml::cpu::riscv64_spacemit {
 
-inline bool q4_0_pp_weights_enabled(const ggml_tensor * tensor) {
-    // The two M8 activation tiles for M16 need 32 bytes of TCM per K element.
-    constexpr int64_t max_k = 393216 / 32;
-    return tensor->type == GGML_TYPE_Q4_0 && tensor->ne[0] % 32 == 0 && tensor->ne[1] % 32 == 0 &&
-           tensor->ne[2] == 1 && tensor->ne[3] == 1 && tensor->ne[0] <= max_k;
+inline bool q4_pp_stream_weights_enabled(const ggml_tensor * tensor) {
+    constexpr int64_t max_k = 393216 / 32;  // two M8 A tiles in one A100 worker's TCM
+    if (tensor == nullptr || tensor->ne[0] <= 0 || tensor->ne[0] > max_k || tensor->ne[1] <= 0 ||
+        tensor->ne[1] % 32 != 0 || tensor->ne[2] != 1 || tensor->ne[3] != 1) {
+        return false;
+    }
+    if (tensor->type != GGML_TYPE_Q4_0 && tensor->type != GGML_TYPE_Q4_K) {
+        return false;
+    }
+    return tensor->ne[0] % ggml_blck_size(tensor->type) == 0;
 }
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>

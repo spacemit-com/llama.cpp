@@ -15,18 +15,21 @@ struct context {
     spert::Context *        runtime       = nullptr;
     uint32_t                ith           = 0;
     uint32_t                nth           = 0;
-    void *                  workspace     = nullptr;
+    void *                  workspace      = nullptr;
     size_t                  workspace_size = 0;
-    spert::SharedBufferView shared        = {};
+    spert::SharedBufferView shared         = {};
+    void *                  q4_stream_host = nullptr;
 
     void reset(spert::Context & runtime_in, uint32_t ith_in, uint32_t nth_in,
-               void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in) {
+               void * workspace_in, size_t workspace_size_in, spert::SharedBufferView shared_in,
+               void * q4_stream_host_in = nullptr) {
         runtime        = &runtime_in;
         ith            = ith_in;
         nth            = nth_in;
         workspace      = workspace_in;
         workspace_size = workspace_size_in;
         shared         = shared_in;
+        q4_stream_host = q4_stream_host_in;
     }
 
     void clear() {
@@ -36,6 +39,7 @@ struct context {
         workspace      = nullptr;
         workspace_size = 0;
         shared         = {};
+        q4_stream_host = nullptr;
     }
 
     void sync() { runtime->sync(); }
