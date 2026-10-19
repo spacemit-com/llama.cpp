@@ -116,26 +116,22 @@ inline int64_t spine_row_stride_b(int64_t b_k_blks) {
     return b_k_blks * static_cast<int64_t>(get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>());
 }
 
+struct alignas(64) spine_dyn_n_schedule_counter {
+    int64_t value;
+};
+
 struct spine_dyn_n_schedule_state {
-    int64_t counters[8];
+    spine_dyn_n_schedule_counter counters[8];
 };
 
 template <typename Fn>
-inline bool spine_dyn_n_schedule(ggml::spacemit::context & ctx, spine_dyn_n_schedule_state & state, int64_t n_tiles,
-                                 int64_t ith, int64_t nth, int64_t dyn_groups, int64_t claim_gran,
-                                 Fn && process_tile) {
+inline bool spine_dyn_n_schedule(spine_dyn_n_schedule_state & state, int64_t n_tiles, int64_t ith, int64_t nth,
+                                 int64_t dyn_groups, int64_t claim_gran, Fn && process_tile) {
     constexpr int64_t max_groups = sizeof(state.counters) / sizeof(state.counters[0]);
     if (n_tiles <= 0 || dyn_groups <= 0 || dyn_groups > max_groups || dyn_groups > nth ||
         claim_gran <= 0) {
         return false;
     }
-
-    if (ith == 0) {
-        for (int64_t g = 0; g < dyn_groups; ++g) {
-            __atomic_store_n(&state.counters[g], int64_t{0}, __ATOMIC_RELAXED);
-        }
-    }
-    ctx.sync();
 
     const int64_t group = std::min<int64_t>(dyn_groups - 1, (ith * dyn_groups) / nth);
     const int64_t group_begin = (n_tiles * group) / dyn_groups;
@@ -144,7 +140,7 @@ inline bool spine_dyn_n_schedule(ggml::spacemit::context & ctx, spine_dyn_n_sche
     const int64_t gran = std::max<int64_t>(1, std::min(claim_gran, group_tiles));
 
     for (;;) {
-        const int64_t first = __atomic_fetch_add(&state.counters[group], gran, __ATOMIC_RELAXED);
+        const int64_t first = __atomic_fetch_add(&state.counters[group].value, gran, __ATOMIC_RELAXED);
         if (first >= group_tiles) {
             break;
         }
@@ -195,10 +191,12 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         GGML_ABORT("unsupported block type");
                     }
 
-                    size = GGML_PAD(size, sizeof(int64_t));
                     const int64_t gemm_m = op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
                     if (gemm_m == 1 || gemm_m == 4) {
+                        size = GGML_PAD(size, alignof(spine_dyn_n_schedule_state));
                         size += sizeof(spine_dyn_n_schedule_state);
+                    } else {
+                        size = GGML_PAD(size, sizeof(int64_t));
                     }
 
                     return true;
@@ -405,6 +403,21 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(ctx.workspace);
 
+        constexpr int64_t dyn_groups     = 2;
+        constexpr int64_t dyn_claim_gran = 1;
+        spine_dyn_n_schedule_state * dyn_state = nullptr;
+        if (gemm_m == 1 || gemm_m == 4) {
+            if (ctx.workspace_size < dyn_state_offset + sizeof(spine_dyn_n_schedule_state)) {
+                GGML_ABORT("wsize less than dynamic N scheduler state");
+            }
+            dyn_state = reinterpret_cast<spine_dyn_n_schedule_state *>(ws_ptr + dyn_state_offset);
+            if (ith == 0) {
+                for (int64_t group = 0; group < dyn_groups; ++group) {
+                    __atomic_store_n(&dyn_state->counters[group].value, int64_t{0}, __ATOMIC_RELAXED);
+                }
+            }
+        }
+
         void *        tcm_buffer      = ctx.shared.data;
         const int64_t tcm_buffer_size = ctx.shared.size;
 
@@ -588,21 +601,10 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     spacemit_kernels::rvv::memcpy1d(a_dir, quant_a_buffer, gemm_workspace_size);
                 }
 
-                struct dyn_n_config {
-                    int64_t groups;
-                    int64_t claim_gran;
-                };
-                const dyn_n_config m1_config{2, 1};
-                const dyn_n_config m4_config{2, 1};
-                const dyn_n_config & dyn_config = gemm_m == 1 ? m1_config : m4_config;
                 const int64_t n_tiles = spacemit_kernels::div_round_up(gemm_n, static_cast<int64_t>(NB_COLS));
-                if (ith == 0 && ctx.workspace_size < dyn_state_offset + sizeof(spine_dyn_n_schedule_state)) {
-                    GGML_ABORT("wsize less than dynamic N scheduler state");
-                }
-                auto * dyn_state = reinterpret_cast<spine_dyn_n_schedule_state *>(ws_ptr + dyn_state_offset);
                 const bool dyn_scheduled = spine_dyn_n_schedule(
-                    ctx, *dyn_state, n_tiles, static_cast<int64_t>(ith), static_cast<int64_t>(nth), dyn_config.groups,
-                    dyn_config.claim_gran,
+                    *dyn_state, n_tiles, static_cast<int64_t>(ith), static_cast<int64_t>(nth), dyn_groups,
+                    dyn_claim_gran,
                     [&](int64_t tile) {
                         const int64_t ni = tile * NB_COLS;
                         const int64_t nb_real = std::min(gemm_n - ni, static_cast<int64_t>(NB_COLS));
