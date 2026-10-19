@@ -137,23 +137,15 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 }  // namespace ime1
 
 namespace ime2 {
-// Q4 PP weights are expanded to signed Q8 once at repack time. Each block
-// contains N output columns and one K slice in the IME2 dot layout.
-template <int K, int N> struct q4_pp_weight_block {
-    static_assert(K > 0 && N > 0);
-    uint16_t d[N];
-    int8_t   qs[K * N];
-};
 
 // One M x K activation tile; duplicated scales match the IME2 dot lanes.
-template <int K, int M> struct q4_pp_activation_block {
+template <int K, int M> struct q8_pp_activation_block {
     static_assert(K > 0 && K % 4 == 0 && M > 0);
     float  scale[(K / 4) * M];
     int8_t qs[K * M];
 };
 
-using q4_pp_block_b = q4_pp_weight_block<32, 32>;
-using q4_pp_block_a = q4_pp_activation_block<32, 8>;
+using q8_pp_block_a = q8_pp_activation_block<32, 8>;
 
 // View of the existing repacked Q8_0 N32/K32 block; qs remain row-major.
 template <int K, int N> struct q8_0_weight_block {
@@ -164,18 +156,11 @@ using q8_0_block_b = q8_0_weight_block<32, 32>;
 static_assert(sizeof(q8_0_block_b) == 1088, "wrong Q8_0 B block size");
 static_assert(offsetof(q8_0_block_b, qs) == 64, "wrong Q8_0 B layout");
 
-static_assert(sizeof(q4_pp_block_b) == 1088, "wrong Q4 PP B block size");
-static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");
-static_assert(sizeof(q4_pp_block_a) == 512, "wrong Q4 PP A block size");
-static_assert(offsetof(q4_pp_block_a, qs) == 256, "wrong Q4 PP A layout");
+static_assert(sizeof(q8_pp_block_a) == 512, "wrong Q8 PP A block size");
+static_assert(offsetof(q8_pp_block_a, qs) == 256, "wrong Q8 PP A layout");
 
-void quantize_a_m8_i8(const float * source, size_t k, q4_pp_block_a * destination);
-void gemm_kernel_i8i8_m8_q4_prepacked(const q4_pp_block_a * packed_a,
-                             const q4_pp_block_b * packed_b,
-                             float *                 output,
-                             size_t                  k_blocks,
-                             size_t                  ldc);
-void gemm_kernel_i8i8_m8_q8_0(const q4_pp_block_a * packed_a,
+void quantize_a_m8_i8(const float * source, size_t k, q8_pp_block_a * destination);
+void gemm_kernel_i8i8_m8_q8_0(const q8_pp_block_a * packed_a,
                                const q8_0_block_b * packed_b,
                                float *               output,
                                size_t                k_blocks,
