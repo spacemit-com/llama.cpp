@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 
 namespace spacemit_kernels {
@@ -33,11 +34,61 @@ template <int N> struct nrow_block_q3_k {
     uint16_t scales16[N];
 };
 
+template <int N> struct nrow_block_q6_k_body {
+    int8_t  scales[2 * N];
+    uint8_t qh[8 * N];
+    uint8_t ql[16 * N];
+};
+
+template <int N> struct nrow_super_q6_k {
+    uint16_t                scales16[N];
+    nrow_block_q6_k_body<N> sub[8];
+};
+
+static_assert(sizeof(nrow_block_q6_k_body<1>) == 26, "wrong q6_k dedup body size");
+static_assert(sizeof(nrow_super_q6_k<1>) == 210, "wrong q6_k dedup super-tile size");
+static_assert(sizeof(nrow_block_q6_k_body<32>) == 832, "wrong q6_k dedup N32 body size");
+static_assert(sizeof(nrow_super_q6_k<32>) == 6720, "wrong q6_k dedup N32 super-tile size");
+
 template <int N> struct nrow_block_mxfp4 {
     uint8_t e[N];
     uint8_t qh[4 * N];
     uint8_t qs[16 * N];
 };
+// q4_K with the fp16 scale de-duplicated ACROSS the K256 super-block.
+//
+// repack_q4_k_to_q4_1_32_bl computes, per (row, K32 sub-block j),
+//     d1 = GGML_FP32_TO_FP16(GGML_FP16_TO_FP32(src.d) * sc_j)
+// where src.d is ONE fp16 per (row, K256) and sc_j is a 6-bit value from
+// get_scale_min_k4(j, ...).  So the eight stored fp16 d1 values of a K256 are
+// fully determined by one fp16 plus eight 6-bit integers, yet all eight are
+// materialised: 8 x 64 B = 512 B per (32 cols x K256).
+//
+// Storing d_orig once and sc per sub-block, and rebuilding d1 in the kernel,
+// costs 64 + 8*32 = 320 B instead of 512 B.  Combined with the nibble-packed zp
+// this makes the super-tile 4544 B instead of 4736 B (zpn) / 4864 B (legacy),
+// i.e. 4.4375 bits/weight -- BELOW the 4.5 of the GGUF's own block_q4_K, which
+// is legitimate because zp needs only 4 bits where q4_K's min uses 6, and canon
+// is defined by the d*(q-zp) approximation, not by exact q4_K semantics.
+//
+// Bit-exactness of the in-kernel rebuild is not assumed: it was proven by
+// exhaustive comparison over all 65536 fp16 patterns x all sc in [0,63]
+// (4,194,304 cases, 0 mismatches) on an A100 core -- see plan 9.49 item 4.
+// d leads the super-tile so the DRAM first-touch order stays strictly
+// sequential, per the design rule established in plan 9.48.
+template <int N> struct __attribute__((packed)) q4_k_ds_sub {
+    uint8_t sc[N];
+    uint8_t zp4[N / 2];
+    uint8_t qs[16 * N];
+};
+
+template <int N> struct __attribute__((packed)) nrow_super_q4_k_ds {
+    uint16_t         d[N];
+    q4_k_ds_sub<N>   sub[8];
+};
+
+static_assert(sizeof(q4_k_ds_sub<32>) == 560, "wrong q4_k ds sub-block size");
+static_assert(sizeof(nrow_super_q4_k_ds<32>) == 4544, "wrong q4_k ds super-tile size");
 
 template <int N> struct __attribute__((packed)) nrow_block_q5_1 {
     uint16_t scales16[N];
@@ -86,6 +137,60 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
 }  // namespace ime1
 
 namespace ime2 {
+// Q4 PP weights are expanded to signed Q8 once at repack time. Each block
+// contains N output columns and one K slice in the IME2 dot layout.
+template <int K, int N> struct q4_pp_weight_block {
+    static_assert(K > 0 && N > 0);
+    uint16_t d[N];
+    int8_t   qs[K * N];
+};
+
+// One M x K activation tile; duplicated scales match the IME2 dot lanes.
+template <int K, int M> struct q4_pp_activation_block {
+    static_assert(K > 0 && K % 4 == 0 && M > 0);
+    float  scale[(K / 4) * M];
+    int8_t qs[K * M];
+};
+
+using q4_pp_block_b = q4_pp_weight_block<32, 32>;
+using q4_pp_block_a = q4_pp_activation_block<32, 8>;
+
+// View of the existing repacked Q8_0 N32/K32 block; qs remain row-major.
+template <int K, int N> struct q8_0_weight_block {
+    uint16_t d[N];
+    int8_t   qs[K * N];
+};
+using q8_0_block_b = q8_0_weight_block<32, 32>;
+static_assert(sizeof(q8_0_block_b) == 1088, "wrong Q8_0 B block size");
+static_assert(offsetof(q8_0_block_b, qs) == 64, "wrong Q8_0 B layout");
+
+static_assert(sizeof(q4_pp_block_b) == 1088, "wrong Q4 PP B block size");
+static_assert(offsetof(q4_pp_block_b, qs) == 64, "wrong Q4 PP B layout");
+static_assert(sizeof(q4_pp_block_a) == 512, "wrong Q4 PP A block size");
+static_assert(offsetof(q4_pp_block_a, qs) == 256, "wrong Q4 PP A layout");
+
+void quantize_a_m8_i8(const float * source, size_t k, q4_pp_block_a * destination);
+void gemm_kernel_i8i8_m8_q4_prepacked(const q4_pp_block_a * packed_a,
+                             const q4_pp_block_b * packed_b,
+                             float *                 output,
+                             size_t                  k_blocks,
+                             size_t                  ldc);
+void gemm_kernel_i8i8_m8_q8_0(const q4_pp_block_a * packed_a,
+                               const q8_0_block_b * packed_b,
+                               float *               output,
+                               size_t                k_blocks,
+                               size_t                ldc);
+
+size_t gemm_kernel_i8i6k(size_t          blk_len,
+                         const uint8_t * quant_a_ptr,
+                         const uint8_t * quant_b_data,
+                         const uint8_t * quant_b_zp,
+                         float *         c_ptr,
+                         size_t          count_m,
+                         size_t          count_n,
+                         size_t          k_blks,
+                         size_t          ldc);
+
 size_t gemm_kernel_i8i2k(size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
@@ -116,6 +221,15 @@ size_t gemm_kernel_i8i4(size_t          blk_len,
                         size_t          k_blks,
                         size_t          ldc);
 
+size_t gemm_kernel_i8i4_zpds(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc);
 size_t gemm_kernel_i8i4_hp(size_t          blk_len,
                            const uint8_t * quant_a_ptr,
                            const uint8_t * quant_b_data,

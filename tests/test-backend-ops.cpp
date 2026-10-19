@@ -9625,6 +9625,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
 
+    // SpacemiT IME2: M1/M4 scheduling, M8/M16 PP, and scalar-row tails.
+    // Keep Q4_1 as a control for the non-ZPDS layout.
+    for (ggml_type type : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, GGML_TYPE_Q4_1}) {
+        for (int64_t m : {1, 3, 4, 8, 16, 32, 128}) {
+            for (int64_t k : {512, 1024}) {
+                test_cases.emplace_back(new test_mul_mat(type, GGML_TYPE_F32, 512, m, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
         for (int v : {0, 1}) {
