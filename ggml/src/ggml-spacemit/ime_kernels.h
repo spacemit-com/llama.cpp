@@ -50,6 +50,27 @@ static_assert(sizeof(nrow_super_q6_k<1>) == 210, "wrong q6_k dedup super-tile si
 static_assert(sizeof(nrow_block_q6_k_body<32>) == 832, "wrong q6_k dedup N32 body size");
 static_assert(sizeof(nrow_super_q6_k<32>) == 6720, "wrong q6_k dedup N32 super-tile size");
 
+// Q6_K layout v2: within each N8 group, K0..15 precedes K16..31.
+// Keep a distinct type because the byte size is identical to the original layout.
+constexpr size_t q6_k16_lane(size_t column, size_t k) {
+    return (column / 8) * 256 + (k / 16) * 128 + (column % 8) * 16 + k % 16;
+}
+
+template <int N> struct nrow_block_q6_k_k16_body {
+    static_assert(N % 8 == 0, "K16-first Q6 requires complete N8 groups");
+    int8_t  scales[2 * N];
+    uint8_t qh[8 * N];
+    uint8_t ql[16 * N];
+};
+
+template <int N> struct nrow_super_q6_k_k16 {
+    uint16_t                    scales16[N];
+    nrow_block_q6_k_k16_body<N> sub[8];
+};
+
+static_assert(sizeof(nrow_block_q6_k_k16_body<32>) == 832, "wrong Q6 K16 body size");
+static_assert(sizeof(nrow_super_q6_k_k16<32>) == 6720, "wrong Q6 K16 super-tile size");
+
 template <int N> struct nrow_block_mxfp4 {
     uint8_t e[N];
     uint8_t qh[4 * N];

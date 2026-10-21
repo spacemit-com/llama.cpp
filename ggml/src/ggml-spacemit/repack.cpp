@@ -1063,8 +1063,8 @@ static int repack_q6_k_to_q6_k_32_bl_dedup(ggml_tensor *              t,
     GGML_ASSERT(QK_K == 256);
 
     constexpr int nrows_interleaved = 32;
-    using dst_body  = spacemit_kernels::nrow_block_q6_k_body<nrows_interleaved>;
-    using dst_super = spacemit_kernels::nrow_super_q6_k<nrows_interleaved>;
+    using dst_body  = spacemit_kernels::nrow_block_q6_k_k16_body<nrows_interleaved>;
+    using dst_super = spacemit_kernels::nrow_super_q6_k_k16<nrows_interleaved>;
 
     const auto * src = static_cast<const block_q6_K *>(data);
     auto * dst = static_cast<dst_super *>(t->data);
@@ -1109,9 +1109,10 @@ static int repack_q6_k_to_q6_k_32_bl_dedup(ggml_tensor *              t,
                         }
                         const uint8_t hi = (qh[l] >> (2 * quarter)) & 0x03;
 
-                        dsub->ql[i * 16 + k / 2] |= lo << (4 * (k & 1));
-                        dsub->qh[i * 4 + k / 8] |= (hi & 1) << (k & 7);
-                        dsub->qh[4 * nrows_interleaved + i * 4 + k / 8] |= ((hi >> 1) & 1) << (k & 7);
+                        const size_t lane = spacemit_kernels::q6_k16_lane(i, k);
+                        dsub->ql[lane / 2] |= lo << (4 * (lane & 1));
+                        dsub->qh[lane / 8] |= (hi & 1) << (lane & 7);
+                        dsub->qh[4 * nrows_interleaved + lane / 8] |= ((hi >> 1) & 1) << (lane & 7);
                     }
                 }
             }

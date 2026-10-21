@@ -2884,7 +2884,7 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
         }
     }
 }
-void gemm_kernel_i8i4_hp_m1_n32(size_t          blk_len,
+void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
                               const uint8_t * quant_a_ptr,
                               const uint8_t * quant_b_data,
                               const uint8_t * quant_b_zp,
@@ -3004,144 +3004,7 @@ void gemm_kernel_i8i4_hp_m1_n32(size_t          blk_len,
         }
     } else {
         // TODO: support quant_b_zp for i8i4 hp kernel
-        GGML_ABORT("gemm_kernel_i8i4_hp_m1_n32 with quant_b_zp is not supported yet");
-    }
-}
-
-// Share the activation load/unpack across two adjacent N32 weight tiles.
-// The packed weights and the FP16 accumulation order are unchanged.
-void gemm_kernel_i8i4_hp_m1_n64(size_t          blk_len,
-                              const uint8_t * quant_a_ptr,
-                              const uint8_t * quant_b_data,
-                              const uint8_t * quant_b_zp,
-                              float *         c_ptr,
-                              size_t          count_m,
-                              size_t          count_n,
-                              size_t          k_blks,
-                              size_t          ldc) {
-    constexpr size_t NB_COLS = 32;
-    constexpr size_t k_subblks_per_superblk = 8;
-    const size_t b_tile_stride = k_blks * k_subblks_per_superblk * (sizeof(_Float16) * NB_COLS + 16 * NB_COLS);
-
-    GGML_ASSERT(blk_len == 256);
-    GGML_ASSERT(quant_b_zp == nullptr);
-    GGML_ASSERT(count_n % (2 * NB_COLS) == 0);
-
-    for (size_t ni = 0; ni < count_n; ni += 2 * NB_COLS) {
-        const uint8_t * a_data  = quant_a_ptr;
-        const uint8_t * b_data  = quant_b_data + (ni / NB_COLS) * b_tile_stride;
-        const uint8_t * b_data1 = b_data + b_tile_stride;
-        float *        dst_c   = c_ptr + ni;
-
-        asm volatile(
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vxor.vv        v31, v31, v31           \n\t"
-            "vxor.vv        v30, v30, v30           \n\t"
-            "mv             t4, %[BK]              \n\t"
-            "li             t0, 0x4c00              \n\t"  // 16 in fp16
-            "fmv.h.x        fa0, t0                 \n\t"
-
-            ".align 4                               \n\t"
-            "BLK_LOOP%=:                            \n\t"
-            "li             t5, 8                   \n\t"
-            "addi           t6, %[A], 288           \n\t"
-            "flh            ft1, (t6)               \n\t"  // K256 activation scale
-            "addi           t6, %[A], 272           \n\t"  // activation sums
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vxor.vv        v16, v18, v18           \n\t"
-            "vxor.vv        v17, v18, v18           \n\t"
-            "vxor.vv        v18, v18, v18           \n\t"
-            "vxor.vv        v19, v18, v18           \n\t"
-            "vxor.vv        v20, v20, v20           \n\t"
-            "vxor.vv        v21, v21, v21           \n\t"
-            "vxor.vv        v22, v22, v22           \n\t"
-            "vxor.vv        v23, v23, v23           \n\t"
-
-            "INNER_BLK_LOOP%=:                      \n\t"
-            // Load the shared K32 activation and its metadata once.
-            "flh            fa1, (t6)               \n\t"
-            "addi           t6, t6, 2               \n\t"
-            "flh            ft0, (%[A])             \n\t"
-            "addi           %[A], %[A], 2           \n\t"
-            "vsetvli        t0, x0, e8, mf4         \n\t"
-            "vle8.v         v3, (%[A])              \n\t"
-            "addi           %[A], %[A], 32          \n\t"
-
-            // First N32: weight scales, correction and nibble dots.
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "vle16.v        v8, (%[B])              \n\t"
-            "addi           %[B], %[B], 64          \n\t"
-            "vl4r.v         v4, (%[B])              \n\t"
-            "addi           %[B], %[B], 512         \n\t"
-            "vfmul.vf       v8, v8, ft0             \n\t"
-            "vfmul.vf       v9, v8, fa0             \n\t"
-            "vfmul.vf       v10, v8, fa1            \n\t"
-            "vfwmacc.vf     v31, ft1, v10           \n\t"
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vpack.vv       v0, v8, v9, 3           \n\t"
-            "vsrl.vi        v28, v3, 4              \n\t"
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vnpack4.vv     v2, v3, v3, 3           \n\t"
-            "vnpack4.vv     v3, v28, v28, 3         \n\t"
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"
-            "vmadotsu.hp    v17, v3, v5, v0, 5, i4  \n\t"
-            "vmadotsu.hp    v18, v3, v6, v0, 6, i4  \n\t"
-            "vmadotsu.hp    v19, v3, v7, v0, 7, i4  \n\t"
-            "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"
-            "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
-            "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
-            "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
-
-            // Second N32: reuse v2/v3, keep separate FP16 accumulators.
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "vle16.v        v8, (%[B1])             \n\t"
-            "addi           %[B1], %[B1], 64        \n\t"
-            "vl4r.v         v4, (%[B1])             \n\t"
-            "addi           %[B1], %[B1], 512       \n\t"
-            "vfmul.vf       v8, v8, ft0             \n\t"
-            "vfmul.vf       v9, v8, fa0             \n\t"
-            "vfmul.vf       v10, v8, fa1            \n\t"
-            "vfwmacc.vf     v30, ft1, v10           \n\t"
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vpack.vv       v0, v8, v9, 3           \n\t"
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vmadotsu.hp    v20, v3, v4, v0, 4, i4  \n\t"
-            "vmadotsu.hp    v21, v3, v5, v0, 5, i4  \n\t"
-            "vmadotsu.hp    v22, v3, v6, v0, 6, i4  \n\t"
-            "vmadotsu.hp    v23, v3, v7, v0, 7, i4  \n\t"
-            "vmadotu.hp     v20, v2, v4, v0, 0, i4  \n\t"
-            "vmadotu.hp     v21, v2, v5, v0, 1, i4  \n\t"
-            "vmadotu.hp     v22, v2, v6, v0, 2, i4  \n\t"
-            "vmadotu.hp     v23, v2, v7, v0, 3, i4  \n\t"
-            "addi           t5, t5, -1              \n\t"
-            "bgtz           t5, INNER_BLK_LOOP%=    \n\t"
-
-            // Accumulate both K256 results in FP32, preserving N32 order.
-            "vpack.vv       v8, v16, v17, 1         \n\t"
-            "vpack.vv       v12, v18, v19, 1        \n\t"
-            "vpack.vv       v24, v8, v12, 2         \n\t"
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "addi           t4, t4, -1              \n\t"
-            "vfwmacc.vf     v31, ft1, v24           \n\t"
-            "vsetvli        t0, x0, e16, m1         \n\t"
-            "vpack.vv       v8, v20, v21, 1         \n\t"
-            "vpack.vv       v12, v22, v23, 1        \n\t"
-            "vpack.vv       v24, v8, v12, 2         \n\t"
-            "vsetvli        t0, x0, e16, mf2        \n\t"
-            "vfwmacc.vf     v30, ft1, v24           \n\t"
-            "addi           %[A], t6, 2             \n\t"
-            "bgtz           t4, BLK_LOOP%=          \n\t"
-
-            "vsetvli        t0, x0, e32, m1         \n\t"
-            "vse32.v        v31, (%[DST])           \n\t"
-            "addi           t1, %[DST], 128        \n\t"
-            "vse32.v        v30, (t1)               \n\t"
-            : [A] "+&r"(a_data), [B] "+&r"(b_data), [B1] "+&r"(b_data1)
-            : [DST] "r"(dst_c), [BK] "r"(k_blks)
-            : "memory", "t0", "t1", "t2", "t3", "t4", "t5", "t6", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-              "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21",
-              "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "ft0", "ft1");
+        GGML_ABORT("gemm_kernel_i8i4_hp_m1 with quant_b_zp is not supported yet");
     }
 }
 
@@ -5771,21 +5634,7 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
         gemm_kernel_i8i4_hp_mrow_ref<1, 32>(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n,
                                             k_blks, ldc);
 #else
-        // N64 wins for the measured K512/K1024 cases; keep N32 for larger
-        // or unvalidated K, explicit zero points, and the remaining N32 tile.
-        size_t n64_cols = 0;
-        if (blk_len == 256 && quant_b_zp == nullptr && (k_blks == 2 || k_blks == 4)) {
-            n64_cols = count_n / 64 * 64;
-        }
-        if (n64_cols != 0) {
-            gemm_kernel_i8i4_hp_m1_n64(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, n64_cols,
-                                     k_blks, ldc);
-        }
-        if (n64_cols < count_n) {
-            const size_t b_tile_stride = k_blks * 8 * (sizeof(_Float16) * 32 + 16 * 32);
-            gemm_kernel_i8i4_hp_m1_n32(blk_len, quant_a_ptr, quant_b_data + (n64_cols / 32) * b_tile_stride,
-                                     quant_b_zp, c_ptr + n64_cols, count_m, count_n - n64_cols, k_blks, ldc);
-        }
+        gemm_kernel_i8i4_hp_m1(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
 #endif
         return 1;
     }
@@ -5928,8 +5777,8 @@ void gemm_kernel_i8i6k_mrow_ref_dedup(size_t          blk_len,
                                       size_t          count_n,
                                       size_t          k_blks,
                                       size_t          ldc) {
-    using super_type = nrow_super_q6_k<NB_COLS>;
-    using body_type  = nrow_block_q6_k_body<NB_COLS>;
+    using super_type = nrow_super_q6_k_k16<NB_COLS>;
+    using body_type  = nrow_block_q6_k_k16_body<NB_COLS>;
     GGML_ASSERT(blk_len == 32);
     GGML_ASSERT(k_blks % 8 == 0);
 
@@ -5954,12 +5803,13 @@ void gemm_kernel_i8i6k_mrow_ref_dedup(size_t          blk_len,
                 for (size_t ci = 0; ci < NB_COLS; ++ci) {
                     int32_t acc[2] = { 0, 0 };
                     for (size_t k = 0; k < 32; ++k) {
+                        const size_t lane = q6_k16_lane(ci, k);
                         const uint8_t lo =
-                            (b_block->ql[ci * 16 + k / 2] >> (4 * (k & 1))) & 0x0f;
+                            (b_block->ql[lane / 2] >> (4 * (lane & 1))) & 0x0f;
                         const uint8_t hi0 =
-                            (b_block->qh[ci * 4 + k / 8] >> (k & 7)) & 1;
+                            (b_block->qh[lane / 8] >> (lane & 7)) & 1;
                         const uint8_t hi1 =
-                            (b_block->qh[4 * NB_COLS + ci * 4 + k / 8] >> (k & 7)) & 1;
+                            (b_block->qh[4 * NB_COLS + lane / 8] >> (lane & 7)) & 1;
                         const uint8_t hi = hi0 | (hi1 << 1);
                         const int8_t q = static_cast<int8_t>(lo | (hi << 4)) - 32;
                         acc[k / 16] += static_cast<int32_t>(a_data[mi * 32 + k]) * q;
@@ -5988,7 +5838,7 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
                                             size_t          count_n,
                                             size_t          k_blks) {
     constexpr size_t NB_COLS = 32;
-    using super_type = nrow_super_q6_k<NB_COLS>;
+    using super_type = nrow_super_q6_k_k16<NB_COLS>;
     GGML_ASSERT(blk_len == 32);
     GGML_ASSERT(__riscv_vlenb() == 128);
     GGML_ASSERT(k_blks % 8 == 0);
@@ -6029,7 +5879,7 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
             "vsetvli        t0, x0, e8, m1          \n\t"
             "vle8.v         v0, (t1)                \n\t"  // qh plane 0[128]
             "vle8.v         v1, (t2)                \n\t"  // qh plane 1[128]
-            "vl4r.v         v8, (t3)                \n\t"  // ql[512]
+            "vl4r.v         v16, (t3)               \n\t"  // K16-first ql[512]
 
             ".align 4                               \n\t"
             "BLK_LOOPD%=:                           \n\t"
@@ -6038,37 +5888,25 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
             "vsetvli        t0, x0, e8, mf2        \n\t"
             "vslidedown.vx  v7, v6, t6             \n\t"
 
-            // Split low nibbles and arrange them in the proven i8xi4 vmadot layout.
+            // K16-first ql expands directly into the eight VMADOT B operands.
+            "vsetvli        t0, x0, e8, m4          \n\t"
+            "vand.vi        v20, v16, 0xF           \n\t"
+            "vsrl.vi        v16, v16, 4             \n\t"
             "vsetvli        t0, x0, e8, m1          \n\t"
-            "vand.vi        v12, v8, 0xF            \n\t"
-            "vand.vi        v13, v9, 0xF            \n\t"
-            "vand.vi        v14, v10, 0xF           \n\t"
-            "vand.vi        v15, v11, 0xF           \n\t"
-            "vsrl.vi        v8, v8, 4               \n\t"
-            "vsrl.vi        v9, v9, 4               \n\t"
-            "vsrl.vi        v10, v10, 4             \n\t"
-            "vsrl.vi        v11, v11, 4             \n\t"
-            "vpack.vv       v16, v12, v8, 0         \n\t"
-            "vpack.vv       v18, v13, v9, 0         \n\t"
-            "vpack.vv       v20, v14, v10, 0        \n\t"
-            "vpack.vv       v22, v15, v11, 0        \n\t"
+            "vpack.vv       v8, v20, v16, 0         \n\t"
+            "vpack.vv       v10, v21, v17, 0        \n\t"
+            "vpack.vv       v12, v22, v18, 0        \n\t"
+            "vpack.vv       v14, v23, v19, 0        \n\t"
 
             // Inject the two exact high-bit planes: unsigned_q6 = low4 + 16*bit0 + 32*bit1.
             "li             t6, 16                  \n\t"
             "vsetvli        t0, x0, e8, m8          \n\t"
-            "vadd.vx        v16, v16, t6, v0.t      \n\t"
+            "vadd.vx        v8, v8, t6, v0.t        \n\t"
             "vsetvli        t0, x0, e8, m1          \n\t"
             "vmv.v.v        v0, v1                  \n\t"
             "li             t6, 32                  \n\t"
             "vsetvli        t0, x0, e8, m8          \n\t"
-            "vadd.vx        v16, v16, t6, v0.t      \n\t"
-
-            // v8/v10/v12/v14 hold K0..15; odd registers hold K16..31.
-            "vsetvli        t0, x0, e8, m1          \n\t"
-            "vupack.vv      v8, v16, v17, 1         \n\t"
-            "vupack.vv      v10, v18, v19, 1        \n\t"
-            "vupack.vv      v12, v20, v21, 1        \n\t"
-            "vupack.vv      v14, v22, v23, 1        \n\t"
+            "vadd.vx        v8, v8, t6, v0.t        \n\t"
 
             // Load A scale, two negative K16 sums, and K32 int8 data.
             "flw            f0, 0(%[A])             \n\t"
@@ -6133,7 +5971,7 @@ static void gemm_kernel_i8i6k_m1_ime2_dedup(size_t          blk_len,
             "vsetvli        t0, x0, e8, m1          \n\t"
             "vle8.v         v0, (t1)                \n\t"
             "vle8.v         v1, (t2)                \n\t"
-            "vl4r.v         v8, (t3)                \n\t"
+            "vl4r.v         v16, (t3)               \n\t"
             "NO_PREFETCHD%=:                        \n\t"
 
             // Multiply by d and the activation scale while prefetched loads retire.
