@@ -9,13 +9,16 @@ extern "C" {
 
 #ifdef GGML_BUILD_PROFILE
 extern int g_current_token_idx;
+// These are consumed by other shared ggml objects (e.g. libggml-cpu), so they
+// must stay exported after upstream switched ggml targets to hidden visibility
+// (#30014). ggml_profile_log_spacemit_op_* below already carry GGML_API.
 void ggml_profile_init_trace_file(void);
 void ggml_profile_flush_trace(void);
 void ggml_set_current_token_idx(int idx);
 void ggml_trace_log_begin(const char * name, const char * cat, const char * args);
 void ggml_trace_log_end(const char * name, const char * cat, const char * args);
-void ggml_profile_log_op_begin(struct ggml_tensor * tensor, int ith, int nth);
-void ggml_profile_log_op_end(struct ggml_tensor * tensor, int ith, int nth);
+GGML_API void ggml_profile_log_op_begin(struct ggml_tensor * tensor, int ith, int nth);
+GGML_API void ggml_profile_log_op_end(struct ggml_tensor * tensor, int ith, int nth);
 GGML_API void ggml_profile_log_spacemit_op_begin(struct ggml_tensor * tensor, int ith, int nth);
 GGML_API void ggml_profile_log_spacemit_op_end(struct ggml_tensor * tensor, int ith, int nth);
 void ggml_profile_flush_tls(void);

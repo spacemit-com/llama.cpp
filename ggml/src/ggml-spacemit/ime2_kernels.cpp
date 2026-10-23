@@ -4,6 +4,9 @@
 #include "rvv_kernels.h"
 #include "string.h"
 
+// spe_kernels.h vendors the spine-kernel asm kernels this TU already uses.
+#include "spe_kernels.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -2878,6 +2881,130 @@ void gemm_kernel_i8i4_m1(size_t          blk_len,
 #endif
         }
     }
+}
+
+// Q41Block<32,32,2>-layout variant of gemm_kernel_i8i4_m1 (decode GEMV) for
+// the q4_0_f16 path: same vmadot hp inner loop and same A-side layout, but B
+// blocks come from spine-kernel's Q41 repack instead of the legacy
+// block_q4_0x32.  Only the B field offsets and block stride differ:
+//   legacy block_q4_0x32 (576B): scale @ +0,  data @ +64,  stride 576
+//   Q41Block<32,32,2>   (608B): data  @ +0,  scale @ +544, stride 608
+// (608 = 512B data + 32B zp + 64B scale; zp[0]=8 matches the implicit 8 the
+// legacy path bakes into the vmv.v.i v28, 8 correction).  The nibble order
+// and the [rows/32][kblocks] block indexing are identical between the two
+// repacks, so the vmadot core is reused verbatim.  Per-row tile pitch is
+// 608/32 = 19 bytes.
+size_t gemm_kernel_i8i4_m1_q41(size_t          blk_len,
+                             const uint8_t * quant_a_ptr,
+                             const uint8_t * quant_b_data,
+                             const uint8_t * quant_b_zp,
+                             float *         c_ptr,
+                             size_t          count_m,
+                             size_t          count_n,
+                             size_t          k_blks,
+                             size_t          ldc) {
+    GGML_UNUSED(blk_len);
+    GGML_UNUSED(quant_b_zp);
+    GGML_UNUSED(count_m);
+    GGML_UNUSED(ldc);
+
+    for (size_t n = 0; n < count_n; n += 32) {
+        size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + n * k_blks * 19;  // n * k_blks * 608/32
+        float *   CPtr          = c_ptr + n;
+        size_t    cnt           = k_blks;
+
+        __asm__ volatile(
+
+            // t3 = k/32
+            "mv           t3, %[BCK]              \n\t"
+            "mv           t4, %[NBLKS]            \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.i      v0, 1                   \n\t"  // init the scale
+            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
+            "addi         s3, %[pA], 4+2          \n\t"  // s3 = pAData, (pA+AScl+ASum)
+            "addi         s4, %[pB], 512+32       \n\t"  // s4 = pBSCL, (pB+Data+zp)
+            "mv           s5, %[pB]               \n\t"  // s5 = pBdata;
+            "mv           s6, %[pC]               \n\t"
+
+            "vsll.vi      v1, v0, 4               \n\t"
+            "vxor.vv      v2, v0, v0              \n\t"  // clear acc
+            "vfcvt.f.x.v  v0, v0                  \n\t"
+            "vfcvt.f.x.v  v1, v1                  \n\t"
+
+            // vmadot hp: vle*7 flw*1 vecIns*14 vmadot*8
+            ".align 4                             \n\t"
+            "_K_LPST%=:                           \n\t"
+
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vl4r.v       v4, (s5)                \n\t"  // B Data 4VRF * 8Row * 32
+            "addi         s5, s5, 128*4+96        \n\t"  // 1024bit + zp, Q41 block 608B
+
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v30, (s4)               \n\t"  // B Scale 4VRF*8Row*FP16 = 512bit
+            "addi         s4, s4, 96+128*4        \n\t"
+
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vle8.v       v3, (s3)                \n\t"  // A Data M1*K32*int8 = 256bit
+            "addi         s3, s3, 32+6            \n\t"
+
+            "flw          f0, (s2)                \n\t"  // A Scale fp32
+            "lh           t2, 4(s2)               \n\t"  // A sum of int16
+            "addi         s2, s2, 6+32            \n\t"
+
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.i      v28, 8                  \n\t"  // Bzp u8 -> u16 (Q41 zp[0]=8)
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vsrl.vi      v24, v3, 4              \n\t"
+
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmul.vx      v26, v28, t2            \n\t"  // asum*zp i16*i16
+            "vnpack4.vv   v8, v3, v3, 3           \n\t"  // lo4 of A
+            "vnpack4.vv   v10, v24, v24, 3        \n\t"  // hi4 of A
+
+            "vfcvt.f.x.v  v16, v26                \n\t"  // zp i16 -> fp16
+            "vadd.vi      v18, v16, 0             \n\t"
+            "vadd.vi      v20, v16, 0             \n\t"
+            "vadd.vi      v22, v16, 0             \n\t"
+
+            "vmadotsu.hp  v16, v10, v4, v1, 0, i4 \n\t"  // high 4
+            "vmadotsu.hp  v18, v10, v5, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v20, v10, v6, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v22, v10, v7, v1, 0, i4 \n\t"
+            "vmadotu.hp   v16, v8, v4, v0, 0, i4  \n\t"  // low 4
+            "vmadotu.hp   v18, v8, v5, v0, 0, i4  \n\t"
+            "vmadotu.hp   v20, v8, v6, v0, 0, i4  \n\t"
+            "vmadotu.hp   v22, v8, v7, v0, 0, i4  \n\t"
+
+            "vpack.vv     v24, v16, v18, 1        \n\t"
+            "vpack.vv     v26, v20, v22, 1        \n\t"
+            "vpack.vv     v16, v24, v26, 2        \n\t"
+
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            // mac result * b_scale; f16*f16->f32
+            "vfwmul.vv     v31, v30, v16          \n\t"
+
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            // static_cast<float>(qsum * b_scale) * a_scale;
+            "vfmacc.vf    v2, f0, v31             \n\t"
+
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, _K_LPST%=           \n\t"
+            "_K_LPND%=:                           \n\t"
+
+            //-----------------------------------------
+            // STORE Equal 32N-------------------------
+            "_ST32%=:                             \n\t"
+            "vsetvli      t0, t4, e32, m1         \n\t"
+            "vse32.v      v2, (s6)                \n\t"  // M0 [N0 : N32]; FP32(1024bit)
+
+            "_FUNC_END%=:                         \n\t"
+
+            :
+            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
+            : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+    }
+    return 1;
 }
 
 void gemm_kernel_i8i4_hp_m1(size_t          blk_len,
@@ -5762,6 +5889,165 @@ size_t moe_m2_gemm_kernel_i8i5(size_t           blk_len,
     moe_m2_gemm_kernel_i8i5_impl(blk_len, quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_m, count_n, k_blks, ldc);
 #endif
     return 2;
+}
+
+void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(count_m > 0 && count_m <= 16);
+    GGML_ASSERT(count_n > 0 && count_n <= 32);
+    GGML_ASSERT(gemm_k % 8 == 0);
+    // The spine mmt4d kernel has no accumulate epilogue (C = A @ B only).
+    GGML_ASSERT(!accumulate);
+
+    // Same native [K/8][M16|N32][K8] A/B layouts as the f32 kernel.  kc counts
+    // K8 groups and c_stride is a byte row stride; each row store is one
+    // vse16.v of count_n f16, so the caller must 64B-align c_ptr to keep one
+    // store inside a single DDR bank.
+    mlir::speir::spekernel::ime2::_spe_hpgemm_impl_m16n32k8_none(
+        count_m, count_n, gemm_k / 8, a_f16_k8, b_f16_k8, reinterpret_cast<int8_t *>(c_ptr),
+        ldc * sizeof(_Float16));
+}
+
+// f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
+// M-split schedule (whole K loop inside one call, C written straight to the
+// f32 output).  Ported from llama.cpp-f16try: A/B native [K/8][M16|N32][K8]
+// layouts; accumulate=true seeds the accumulators from c_ptr's rows first.
+void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        float *          c_ptr,
+                                        size_t           count_m,
+                                        size_t          count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(count_m > 0 && count_m <= 16);
+    GGML_ASSERT(count_n > 0 && count_n <= 32);
+    GGML_ASSERT(gemm_k % 8 == 0);
+    // count_n < 32 with a partial-M accumulate seed is not supported (every
+    // call site gates on N % 32 == 0, so tiles are always full N32).
+    GGML_ASSERT(count_m == 16 || count_n == 32 || !accumulate);
+
+    alignas(128) float tile[16 * 32];
+    const _Float16 * a0            = a_f16_k8;
+    const _Float16 * a1            = a_f16_k8 + 64;
+    const _Float16 * b0            = b_f16_k8;
+    const _Float16 * b1            = b_f16_k8 + 64;
+    const _Float16 * b2            = b_f16_k8 + 128;
+    const _Float16 * b3            = b_f16_k8 + 192;
+    size_t           kc_left       = gemm_k / 8;
+    // The vfwmadot accumulators (v16-v31) hold an internal 8x8-dot-tile pair
+    // layout -- the vpack unpack butterfly below only turns them into 16
+    // row-major N32 rows at the very end -- so an accumulate chunk must NOT
+    // preload its C seed into those registers: a row-major seed garbles
+    // straight through the butterfly, with an error that grows with the K
+    // already behind the seed.  (Dense never caught this: every correctness
+    // shape was single-chunk; multi-chunk split-N shapes only ever ran in
+    // llama-bench.)  Accumulate (and partial-M) calls instead run the kernel
+    // with zeroed accumulators into the local tile and add the seed back in
+    // the scalar epilogue below, which is layout-agnostic.
+    const bool       via_tile      = accumulate || count_m != 16;
+    float *          out           = via_tile ? tile : c_ptr;
+    const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
+
+    asm volatile(
+        "vsetvli t0, zero, e32, m8, tu, mu\n\t"
+        "vxor.vv v16, v16, v16\n\t"
+        "vxor.vv v24, v24, v24\n\t"
+        "vsetvli t0, zero, e16, m1, tu, mu\n\t"
+        "1:\n\t"
+        "vle16.v v0,  (%[a0])\n\t"
+        "vle16.v v1,  (%[a1])\n\t"
+        "vle16.v v8,  (%[b0])\n\t"
+        "vle16.v v9,  (%[b1])\n\t"
+        "vle16.v v10, (%[b2])\n\t"
+        "vle16.v v11, (%[b3])\n\t"
+        "vfwmadot v16, v0, v8\n\t"
+        "vfwmadot v18, v0, v9\n\t"
+        "vfwmadot v20, v0, v10\n\t"
+        "vfwmadot v22, v0, v11\n\t"
+        "vfwmadot v24, v1, v8\n\t"
+        "vfwmadot v26, v1, v9\n\t"
+        "vfwmadot v28, v1, v10\n\t"
+        "vfwmadot v30, v1, v11\n\t"
+        "addi %[a0], %[a0], 256\n\t"
+        "addi %[a1], %[a1], 256\n\t"
+        "addi %[b0], %[b0], 512\n\t"
+        "addi %[b1], %[b1], 512\n\t"
+        "addi %[b2], %[b2], 512\n\t"
+        "addi %[b3], %[b3], 512\n\t"
+        "addi %[kc], %[kc], -1\n\t"
+        "bnez %[kc], 1b\n\t"
+        // Official IME2 accumulator unpack sequence.  It transforms the
+        // eight 8x8 dot-product tiles into 16 row-major N32 vectors.
+        "vsetvli t0, zero, e32, m1, tu, mu\n\t"
+        "vpack.vv v0,  v16, v18, 2\n\t"
+        "vpack.vv v2,  v20, v22, 2\n\t"
+        "vpack.vv v4,  v17, v19, 2\n\t"
+        "vpack.vv v6,  v21, v23, 2\n\t"
+        "vpack.vv v8,  v24, v26, 2\n\t"
+        "vpack.vv v10, v28, v30, 2\n\t"
+        "vpack.vv v12, v25, v27, 2\n\t"
+        "vpack.vv v14, v29, v31, 2\n\t"
+        "vpack.vv v16, v0,  v2,  3\n\t"
+        "vpack.vv v18, v1,  v3,  3\n\t"
+        "vpack.vv v20, v4,  v6,  3\n\t"
+        "vpack.vv v22, v5,  v7,  3\n\t"
+        "vpack.vv v24, v8,  v10, 3\n\t"
+        "vpack.vv v26, v9,  v11, 3\n\t"
+        "vpack.vv v28, v12, v14, 3\n\t"
+        "vpack.vv v30, v13, v15, 3\n\t"
+        "vsetvli t0, %[count_n], e32, m1, tu, mu\n\t"
+        "vse32.v v16, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v17, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v18, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v19, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v20, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v21, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v22, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v23, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v24, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v25, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v26, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v27, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v28, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v29, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v30, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v31, (%[out])\n\t"
+        : [a0] "+r"(a0), [a1] "+r"(a1), [b0] "+r"(b0), [b1] "+r"(b1), [b2] "+r"(b2), [b3] "+r"(b3), [kc] "+r"(kc_left),
+          [out] "+r"(out)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes)
+        : "cc", "memory", "t0", "t1", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+          "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
+          "v29", "v30", "v31");
+
+    if (via_tile) {
+        for (size_t m = 0; m < count_m; ++m) {
+            for (size_t n = 0; n < count_n; ++n) {
+                c_ptr[m * ldc + n] = accumulate ? c_ptr[m * ldc + n] + tile[m * 32 + n] : tile[m * 32 + n];
+            }
+        }
+    }
 }
 
 }  // namespace ime2

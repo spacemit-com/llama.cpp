@@ -18,6 +18,8 @@
 #include "spine_mem_pool.h"
 #include "vec.h"
 
+#include "spe_kernels.h"
+
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -30,6 +32,7 @@
 #include <cstdio>  // for GGML_ASSERT
 #include <cstdlib>
 #include <cstring>
+#include <typeinfo>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -954,6 +957,14 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                        (int) NB_COLS, (int) INTER_SIZE);
         return ggml::cpu::riscv64_spacemit::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
+
+    void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256 && NB_COLS == 32) {
+            GGML_ASSERT(ggml::cpu::riscv64_spacemit::unpack_q4_0_32x256(t, data, data_size) == 0);
+        } else {
+            ggml::spacemit::tensor_traits_base::unpack(t, data, data_size);
+        }
+    }
 };
 
 class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
@@ -1453,6 +1464,822 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
     }
 };
 
+// Dense-only Q41 f16 experiment. Expert tensors retain the legacy traits.
+// Keep repack selection and allocation sizing behind the same gate.
+// GGML_SPACEMIT_Q41_F16 defaults to ON; setting it to 0 turns the path off.
+static bool q4_0_f16_repack_enabled(const ggml_tensor * cur) {
+#if defined(RISCV64_SPACEMIT_IME2)
+    if (!global_spine_env_info.use_ime2 || cur->ne[2] != 1 || cur->ne[3] != 1 || cur->ne[1] % 32 != 0) {
+        return false;
+    }
+    const char * env = getenv("GGML_SPACEMIT_Q41_F16");
+    return env == nullptr || atoi(env) != 0;
+#else
+    GGML_UNUSED(cur);
+    return false;
+#endif
+}
+
+// Auto routing table for the q4_0_f16 path, decided by the 192-cell
+// (K x gemm_m x gemm_n) x (split-M/K/N) perf sweep on k3-dev-008
+// (2026-09-30, /tmp results archived in codex-memory):
+//   K >= 2048                -> split-K  (won all 48 cells, +30-90% over 2nd)
+//   K <= 1024, M <= 256      -> split-N  (won all 16 cells at M=128)
+//   K <= 1024, M > 256       -> split-M  (won all 12 cells at M >= 512)
+// split-K degenerates at K=1024 because each worker only owns K/8=128
+// columns and the reduce dominates; split-N's per-worker whole-A pack kills
+// it once M grows past a few hundred rows.  The M=256 crossover between
+// split-N and split-M is interpolated (128 vs 512 measured), and decode
+// (M=1) never reaches this path anyway.
+constexpr size_t Q4_0_F16_SPLIT_K_MIN     = 2048;  // K at/above -> split-K
+constexpr size_t Q4_0_F16_SPLIT_N_M_MAX   = 256;   // small-M ceiling for split-N
+
+// Split-N schedule: workers own round-robin N32 tiles; each tile walks the
+// whole K in TCM-sized chunks -- B is Q41Block->f16 dequanted once per
+// (tile, chunk) and kept in TCM while M streams through the remaining A
+// budget in m_fit-row groups, and the f32 kernel's accumulate epilogue
+// streams C straight to the output, so there are no partials and no reduce
+// phase.  Takes the auto seat for K < 2048 && M <= Q4_0_F16_SPLIT_N_M_MAX
+// (won every sweep cell there, e.g. 1210 vs 797 GFLOPS at m=128,n=512,k=1024
+// against split-K).  At larger M the per-worker whole-A pack (nth-fold
+// duplicated A traffic) loses to split-M/K, and at M=1 (decode) it measured
+// 2.3x below split-K.  The cluster hybrid block below only ever sees
+// K >= 2048: at K < 2048 its partials + reduce + chunk handshake cost more
+// than they save (Qwen3-0.6B qkv/o/gateup K=1024 shapes measured -28..-33%
+// vs split-N, while the same shapes' only K>=2048 op, down_proj, gained +4%).
+static bool q4_0_f16_split_n(const size_t K, const size_t M) {
+    return K < Q4_0_F16_SPLIT_K_MIN && M <= Q4_0_F16_SPLIT_N_M_MAX;
+}
+
+// q4_0 weights repacked losslessly into spine-kernel's Q41Block<32,32,2>
+// (per-row scale bit-exact, shared zp=8, nibbles identical to q4_0 qs).
+// compute_forward ports the f16 split-K schedule: each worker owns one K
+// slice, A is f32->f16 pack_cast into TCM, B is Q41Block->f16 pack_cast into
+// TCM, the IME2 m16n32k8 kernel accumulates f16 partials in the workspace,
+// and spe_reducesum_mxn merges the slices into the f32 output.  The split-M
+// schedule (ported from llama.cpp-f16try's M-major probe) instead gives each
+// worker a round-robin M block, walks whole K through TCM-sized K chunks and
+// writes f32 straight to the output via the accumulate epilogue.  The
+// split-N schedule gives each worker round-robin N32 tiles; each tile
+// dequants B once (1x, like split-K) and streams the whole-K GEMM straight
+// to the f32 output with no partials and no reduce.  Auto routing is
+// prefill-only (decode stays on the legacy i8i4 kernel); within the f16
+// path the sweep table picks split-K / split-N / split-M / cluster
+// hybrid by shape.
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
+class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
+    static_assert(std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>>, "f16 traits expect a Q41Block weight layout");
+    static constexpr size_t F16_M_TILE = 16;
+    static constexpr size_t F16_N_TILE = 32;
+
+    // Per-block geometry: one BLOC_TYPE covers NB_COLS rows x INTER_SIZE
+    // elements of K.
+    static constexpr size_t KB = (size_t) INTER_SIZE;   // K elements per block
+    static constexpr size_t NB = (size_t) NB_COLS;      // rows per block
+    static constexpr size_t KB_BYTES   = sizeof(BLOC_TYPE);
+    static constexpr size_t ROW_PITCH  = KB_BYTES / NB;  // bytes per row per block
+
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+        const size_t N        = static_cast<size_t>(op->src[0]->ne[1]);
+        const size_t M        = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
+        const size_t M_pad    = (M + F16_M_TILE - 1) & ~size_t{ F16_M_TILE - 1 };
+        const size_t nc_count = (N + F16_N_TILE - 1) / F16_N_TILE;
+        // Split-K partials are f16 in [M/16][nc][16][nth][32]; round the base
+        // up to 64B at runtime, +64B slack covers the worst-case shift.
+        const size_t partial_size = M_pad * nc_count * static_cast<size_t>(n_threads) * F16_N_TILE * sizeof(_Float16);
+        // Cap covers the sweep grid's worst split-K cell (gemm_m=4096 x
+        // gemm_n=6144 -> 384 MiB); over-cap shapes would silently fall back
+        // to the legacy repack kernel with an undersized workspace.
+        constexpr size_t partial_cap = size_t{ 512 } << 20;
+        // Decode (M == 1) instead uses the Q41 i8i4 GEMV: the i8-quantized A
+        // row lives at [K/KB] x 38B in the workspace (see compute_forward).
+        const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
+        const size_t gemv_size = ((K + KB - 1) / KB) * 38;
+        size_t       need      = partial_size <= partial_cap ? partial_size + 64 : 0;
+        need                   = std::max(need, GGML_PAD(gemv_size, sizeof(int64_t)));
+        size                   = need;
+        return true;
+    }
+
+    bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
+        if (op->op != GGML_OP_MUL_MAT) {
+            return false;
+        }
+
+        const ggml_tensor * src0 = op->src[0];
+        const ggml_tensor * src1 = op->src[1];
+        ggml_tensor *       dst  = op;
+
+        // Batch-flattened M (same as forward_mul_mat's gemm_m): src1 may be
+        // 3-D, rows are contiguous with stride src1->nb[1] bytes.
+        const size_t K             = static_cast<size_t>(src1->ne[0]);
+        const size_t M             = static_cast<size_t>(src1->ne[1] * src1->ne[2] * src1->ne[3]);
+
+        const size_t N             = static_cast<size_t>(src0->ne[1]);
+        const size_t a_src_stride  = src1->nb[1];  // bytes
+        const size_t a_src_stride0 = src1->nb[0];  // bytes
+        GGML_ASSERT(a_src_stride0 == sizeof(float));
+        GGML_ASSERT(dst->nb[0] == sizeof(float));
+
+        const int ith = ctx.ith;
+        const int nth = ctx.nth;
+
+        // Shape tracer for the q4_0_f16 path: one line per MUL_MAT op per
+        // worker-0 invocation (prefill prints M=batch, decode M=1).  Guarded
+        // by a static env probe so the hot path stays branch-light.
+        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
+            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
+        }
+
+        const size_t out_row_stride = dst->nb[1];  // bytes
+
+        constexpr size_t m_tile = F16_M_TILE;
+        constexpr size_t n_tile = F16_N_TILE;
+        const size_t     mt_count = (M + m_tile - 1) / m_tile;
+        const size_t     nt_count = (N + n_tile - 1) / n_tile;
+
+        void *      tcm_buffer      = ctx.shared.data;
+        const int64_t tcm_buffer_size = ctx.shared.size;
+        if (tcm_buffer == nullptr || tcm_buffer_size <= 0) {
+            GGML_ABORT("q4_0_f16: no shared TCM buffer");
+        }
+        const size_t tcm_size = static_cast<size_t>(tcm_buffer_size);
+
+        // Hand-built march for the vendored spe dispatch getters (verbatim
+        // from spine-kernel, defined in ime2_kernels.cpp): ime2 pack_cast
+        // requires ime bit 1 + vector_info==128, rvv reducesum requires a
+        // nonzero rvv byte.  Matches spine_arch_info.cc's A100 descriptor.
+        SpineArchInfoDef march{};
+        march.fields.core_arch_id = SpineCoreArchID::CoreArchA100;
+        march.fields.matrix_info  = 128;
+        march.fields.vector_info  = 128;
+        march.fields.core_ext_info.fields.rvv = (1 << 0);
+        march.fields.core_ext_info.fields.ime = (1 << 1);
+
+        // A: f32 -> f16 [K/8][16][8]; B: Q41Block -> f16 [K/8][32][8];
+        // reduce: f16 partials -> f32.
+        const auto pack_func =
+            mlir::speir::spekernel::ime2::get_spe_pack_cast_function(march.value, typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8);
+        const auto q41_func = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
+            march.value, typeid(BLOC_TYPE), typeid(_spe_fp16_), NB, KB, NB, 8);
+        const auto reduce_func = mlir::speir::spekernel::rvv::get_spe_reducesum_mxn_function(
+            march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
+        if (!pack_func || !q41_func || !reduce_func) {
+            GGML_ABORT("q4_0_f16: spe dispatch getter returned null (pack=%d q41=%d reduce=%d)", pack_func ? 1 : 0,
+                       q41_func ? 1 : 0, reduce_func ? 1 : 0);
+        }
+
+        const auto * a_src = reinterpret_cast<const uint8_t *>(src1->data);
+        const auto * b_src = reinterpret_cast<const uint8_t *>(src0->data);
+        auto *       out   = reinterpret_cast<uint8_t *>(dst->data);
+
+        // Schedule dispatch: split-N (K < 2048 with M <= 256: one worker
+        // per N32 tile, whole K, straight f32 output, 1x B dequant, no
+        // reduce), split-M (K < 2048 with M > 256: workers own M blocks,
+        // whole K, no reduce, but per-block B dequant repeats mb_count-fold),
+        // cluster hybrid (K >= 2048: cluster-pair K slices with adaptive B
+        // slots, partials + tile-split reduce; per-thread split-K below is
+        // the infeasible-shape fallback and the down_proj route).
+
+        // Decode (M == 1): legacy i8i4 K32 GEMV over the Q41Block layout.
+        // A is i8-quantized once (K32 blocks split across workers, same
+        // contract as forward_mul_mat's gemm_m==1 branch) into the workspace,
+        // then each worker runs round-robin N32 tiles straight from DRAM --
+        // no TCM staging, no partials.  The Q41-adapted kernel
+        // (gemm_kernel_i8i4_m1_q41) differs from the legacy one only in the
+        // B field offsets/stride (data @ block+0, scale follows the data field
+        // blocks); A quantization (quantize_a_row_i8) is reused verbatim.
+        // Takes precedence over every f16 schedule so
+        // decode always stays on the i8i4 route (f16 GEMM is prefill-only).
+        if (M == 1 && K % KB == 0) {
+            constexpr size_t a_blk_len      = 32;
+            const size_t     a_blk_stride   = spacemit_kernels::q8_blk_size(a_blk_len, true);
+            const size_t     a_k_blks       = K / KB;
+            const size_t     k_blks         = K / KB;
+            const size_t     gemv_ws_needed = a_k_blks * a_blk_stride;
+            if (ctx.workspace_size >= gemv_ws_needed) {
+                auto * quant_a = reinterpret_cast<uint8_t *>(ctx.workspace);
+
+                int task_per_thread = spacemit_kernels::div_round_up((int) a_k_blks, nth);
+                int a_blk_start     = ith * task_per_thread;
+                int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
+                if (a_blk_start < a_blk_end) {
+                    spacemit_kernels::rvv::quantize_a_row_i8(
+                        a_blk_len, reinterpret_cast<const float *>(a_src) + a_blk_start * a_blk_len,
+                        (a_blk_end - a_blk_start) * a_blk_len, quant_a + a_blk_start * a_blk_stride);
+                }
+
+                ctx.sync();
+
+                // N32 tile pitch in the Q41 repack: one block covers
+                // NB rows x K32, so rows advance at ROW_PITCH bytes per row per K block.
+                const size_t b_row_stride = k_blks * ROW_PITCH;
+                constexpr size_t tile_cols = 32;
+                for (int64_t ni = (int64_t) ith * tile_cols; ni < (int64_t) N;
+                     ni += (int64_t) tile_cols * nth) {
+                    const int64_t nb_real = std::min((int64_t) N - ni, (int64_t) tile_cols);
+                    const uint8_t * b_row = b_src + ni * b_row_stride;
+                    auto *          c_row = reinterpret_cast<float *>(out) + ni;
+                    spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41(KB, quant_a, b_row, nullptr, c_row, 1,
+                                                                    (size_t) nb_real, k_blks, N);
+                }
+                return true;
+            }
+        }
+
+        if (q4_0_f16_split_n(K, M) && K % KB == 0) {
+            // A-resident variant: shrink the K chunk until the whole
+            // (padded) M rows of A plus one B tile fit TCM together, so A is
+            // packed once per chunk and reused by every N tile the worker
+            // owns while B tiles rotate through the remaining slot.  A pack
+            // and B dequant both stay 1x per worker; C goes straight to the
+            // f32 output with the accumulate epilogue across chunks.
+            const size_t m_pad  = (M + m_tile - 1) & ~size_t{ m_tile - 1 };
+            const size_t kb_res = (tcm_size / ((m_pad + n_tile) * sizeof(_Float16))) & ~size_t{ 31 };
+            const size_t kb_a   = std::min(K, kb_res);
+            if (kb_a >= 32 && (m_pad + n_tile) * kb_a * sizeof(_Float16) <= tcm_size) {
+                auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
+                auto * b_tile = a_tile + m_pad * kb_a;
+                const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+                const size_t m_tiles = (M + m_tile - 1) / m_tile;
+                for (size_t k0 = 0; k0 < K; k0 += kb_a) {
+                    const size_t kk = std::min(kb_a, K - k0);
+                    // f32 -> f16 [kk/8][16][8] for every M16 row group of
+                    // this chunk; the ime2 kernel zero-pads M < 16 rows.
+                    for (size_t mt = 0; mt < m_tiles; ++mt) {
+                        const size_t tm0 = mt * m_tile;
+                        pack_func((void *) (a_src + tm0 * a_src_stride),
+                                  static_cast<int64_t>(k0 * sizeof(float)),               // in_offset bytes
+                                  static_cast<int64_t>(a_src_stride),                       // in_stride bytes
+                                  (void *) (a_tile + mt * m_tile * kb_a), 0,                // out_offset
+                                  static_cast<int64_t>(kb_a * m_tile * sizeof(_Float16)),   // out_stride bytes
+                                  static_cast<int64_t>(std::min(m_tile, M - tm0)),          // mc
+                                  static_cast<int64_t>(kk),                                 // kc
+                                  1, static_cast<int64_t>(kk / 8));                         // dst_mc, dst_kc
+                    }
+                    for (size_t nt_i = (size_t) ith; nt_i < nt_count; nt_i += (size_t) nth) {
+                        const size_t n0 = nt_i * n_tile;
+                        const size_t nc = std::min(n_tile, N - n0);
+                        // Q41Block -> f16 dequant of this worker's N32 tile
+                        // for the chunk's K range; output [kk/8][32][8],
+                        // out_stride = dst_kc * 512B.
+                        q41_func((void *) (b_src + nt_i * b_row_stride + (k0 / KB) * KB_BYTES),
+                                 0,                                   // in_offset
+                                 static_cast<int64_t>(b_row_stride),   // in_stride bytes
+                                 (void *) b_tile, 0,
+                                 static_cast<int64_t>(kk / 8) * 512,   // out_stride bytes
+                                 1, static_cast<int64_t>(kk / KB),     // src_mc, src_kc
+                                 1, static_cast<int64_t>(kk / 8));     // dst_mc, dst_kc
+                        for (size_t mt = 0; mt < m_tiles; ++mt) {
+                            const size_t tm0    = mt * m_tile;
+                            float *     c_tile = reinterpret_cast<float *>(out + tm0 * out_row_stride) + n0;
+                            // C written straight to the f32 output;
+                            // accumulate seeds from C on k0 > 0 chunks.
+                            spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(
+                                kk, b_tile, a_tile + mt * m_tile * kb_a, c_tile,
+                                std::min(m_tile, M - tm0), nc, N, k0 != 0);
+                        }
+                    }
+                }
+                return true;
+            }
+            // Group-streaming fallback for very tall M (A alone cannot fit
+            // TCM even at kb = 32): per owned N tile, B is dequanted per
+            // (tile, chunk) and kept in TCM while M streams through the A
+            // slot in m_fit-row groups.  A is repacked once per owned tile
+            // -- the tall-M trade for keeping every B dequant at 1x.
+            const size_t bytes_per_k  = (m_tile + n_tile) * sizeof(_Float16);
+            const size_t kb           = std::min(K, (tcm_size / bytes_per_k) & ~size_t{ 31 });
+            const size_t b_tile_bytes = n_tile * kb * sizeof(_Float16);
+            const size_t a_budget     = tcm_size > b_tile_bytes ? tcm_size - b_tile_bytes : 0;
+            const size_t m_fit        = kb >= 32 ? (a_budget / (kb * sizeof(_Float16))) & ~size_t{ 15 } : 0;
+            if (m_fit >= m_tile) {
+                auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
+                auto * b_tile = a_tile + m_fit * kb;
+                const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+                for (size_t nt_i = (size_t) ith; nt_i < nt_count; nt_i += (size_t) nth) {
+                    const size_t n0 = nt_i * n_tile;
+                    const size_t nc = std::min(n_tile, N - n0);
+                    for (size_t k0 = 0; k0 < K; k0 += kb) {
+                        const size_t kk = std::min(kb, K - k0);
+                        // This worker's N32 tile of B for the chunk's K
+                        // range: Q41Block -> f16 [kk/8][32][8], dequanted
+                        // once per (tile, chunk) and kept in TCM across all
+                        // M groups below -- B work stays 1x regardless of
+                        // how many groups stream against it.
+                        q41_func((void *) (b_src + nt_i * b_row_stride + (k0 / KB) * KB_BYTES),
+                                 0,                                   // in_offset
+                                 static_cast<int64_t>(b_row_stride),   // in_stride bytes
+                                 (void *) b_tile, 0,
+                                 static_cast<int64_t>(kk / 8) * 512,   // out_stride bytes
+                                 1, static_cast<int64_t>(kk / KB),     // src_mc, src_kc
+                                 1, static_cast<int64_t>(kk / 8));     // dst_mc, dst_kc
+                        // M streams through the single A slot in m_fit-row
+                        // groups; each group is f32->f16 packed for this
+                        // chunk's K range and consumed immediately, so A is
+                        // repacked once per owned tile -- the tall-M trade
+                        // for keeping every B dequant at 1x.
+                        for (size_t m0 = 0; m0 < M; m0 += m_fit) {
+                            const size_t m_count = std::min(m_fit, M - m0);
+                            const size_t m_tiles = (m_count + m_tile - 1) / m_tile;
+                            for (size_t mt = 0; mt < m_tiles; ++mt) {
+                                const size_t tm0 = m0 + mt * m_tile;
+                                // f32 -> f16 [kk/8][16][8] into this chunk's
+                                // A slot; the ime2 kernel zero-pads M < 16
+                                // rows.
+                                pack_func((void *) (a_src + tm0 * a_src_stride),
+                                          static_cast<int64_t>(k0 * sizeof(float)),               // in_offset bytes
+                                          static_cast<int64_t>(a_src_stride),                       // in_stride bytes
+                                          (void *) (a_tile + mt * m_tile * kb), 0,                  // out_offset
+                                          static_cast<int64_t>(kb * m_tile * sizeof(_Float16)),     // out_stride bytes
+                                          static_cast<int64_t>(std::min(m_tile, M - tm0)),          // mc
+                                          static_cast<int64_t>(kk),                                 // kc
+                                          1, static_cast<int64_t>(kk / 8));                         // dst_mc, dst_kc
+                                float * c_tile = reinterpret_cast<float *>(out + tm0 * out_row_stride) + n0;
+                                // C written straight to the f32 output;
+                                // accumulate seeds from C on k0 > 0 chunks.
+                                spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(
+                                    kk, b_tile, a_tile + mt * m_tile * kb, c_tile,
+                                    std::min(m_tile, M - tm0), nc, N, k0 != 0);
+                            }
+                        }
+                    }
+                }
+                return true;
+            }
+        }
+
+        // Split-M schedule (ported from llama.cpp-f16try's M-major probe):
+        // workers own round-robin M blocks; each block walks the whole K in
+        // TCM-sized chunks -- A is f32->f16 packed per chunk and reused across
+        // every N tile, B is Q41Block->f16 dequanted per N32 tile per chunk,
+        // and the f32 kernel's accumulate epilogue streams C straight to the
+        // output, so there are no partials and no reduce phase.  Selected by
+        // the auto dispatch for K < 2048 with M > Q4_0_F16_SPLIT_N_M_MAX;
+        // at small M the mb_count clamp degenerates to nth-fold B dequant,
+        // which split-N handles instead.  Shapes whose TCM cannot hold one B
+        // tile beside an M16 slab fall through to split-K below.
+        if (K < Q4_0_F16_SPLIT_K_MIN && M > Q4_0_F16_SPLIT_N_M_MAX && K % KB == 0) {
+            const size_t bytes_per_k  = (m_tile + n_tile) * sizeof(_Float16);
+            const size_t kb           = std::min(K, (tcm_size / bytes_per_k) & ~size_t{ 31 });
+            const size_t b_tile_bytes = n_tile * kb * sizeof(_Float16);
+            const size_t a_budget     = tcm_size > b_tile_bytes ? tcm_size - b_tile_bytes : 0;
+            const size_t m_fit        = kb >= 32 ? (a_budget / (kb * sizeof(_Float16))) & ~size_t{ 15 } : 0;
+            if (m_fit >= m_tile) {
+                // Fewest blocks that fit (ceil(M/m_fit)), but never fewer than
+                // nth, so every worker owns at least one block and stays busy.
+                size_t mb_count = (M + m_fit - 1) / m_fit;
+                if (mb_count < (size_t) nth) {
+                    mb_count = (size_t) nth;
+                }
+                size_t m_block = 0;
+                do {
+                    // Round the per-block rows up to 16; if that overshoots M
+                    // the last block would be empty, so retry with fewer
+                    // blocks (keeps mb < M for every issued block).
+                    m_block = (((M + mb_count - 1) / mb_count) + 15) & ~size_t{ 15 };
+                    if ((mb_count - 1) * m_block < M) {
+                        break;
+                    }
+                    --mb_count;
+                } while (mb_count > 1);
+                if (m_block <= m_fit && m_block >= m_tile) {
+                    auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
+                    auto * b_tile = a_tile + m_block * kb;
+                    const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+                    for (size_t mb_i = (size_t) ith; mb_i < mb_count; mb_i += (size_t) nth) {
+                        const size_t mb      = mb_i * m_block;
+                        const size_t m_count = std::min(m_block, M - mb);
+                        const size_t m_tiles = (m_count + m_tile - 1) / m_tile;
+                        for (size_t k0 = 0; k0 < K; k0 += kb) {
+                            const size_t kk = std::min(kb, K - k0);
+                            for (size_t mt = 0; mt < m_tiles; ++mt) {
+                                const size_t tm0 = mb + mt * m_tile;
+                                // f32 -> f16 [kk/8][16][8] into this chunk's A
+                                // slot; the ime2 kernel zero-pads M < 16 rows.
+                                pack_func((void *) (a_src + tm0 * a_src_stride),
+                                          static_cast<int64_t>(k0 * sizeof(float)),               // in_offset bytes
+                                          static_cast<int64_t>(a_src_stride),                       // in_stride bytes
+                                          (void *) (a_tile + mt * m_tile * kb), 0,                  // out_offset
+                                          static_cast<int64_t>(kb * m_tile * sizeof(_Float16)),     // out_stride bytes
+                                          static_cast<int64_t>(std::min(m_tile, M - tm0)),          // mc
+                                          static_cast<int64_t>(kk),                                 // kc
+                                          1, static_cast<int64_t>(kk / 8));                         // dst_mc, dst_kc
+                            }
+                            for (size_t nt = 0; nt < nt_count; ++nt) {
+                                const size_t n0 = nt * n_tile;
+                                const size_t nc = std::min(n_tile, N - n0);
+                                // Q41Block -> f16 dequant of this chunk's K
+                                // range for the [n0, n0+32) rows: output
+                                // [kk/8][32][8], out_stride = dst_kc * 512B.
+                                q41_func((void *) (b_src + nt * b_row_stride + (k0 / KB) * KB_BYTES),
+                                         0,                                   // in_offset
+                                         static_cast<int64_t>(b_row_stride),   // in_stride bytes
+                                         (void *) b_tile, 0,
+                                         static_cast<int64_t>(kk / 8) * 512,   // out_stride bytes
+                                         1, static_cast<int64_t>(kk / KB),     // src_mc, src_kc
+                                         1, static_cast<int64_t>(kk / 8));     // dst_mc, dst_kc
+                                for (size_t mt = 0; mt < m_tiles; ++mt) {
+                                    const size_t tm0   = mb + mt * m_tile;
+                                    float *       c_tile = reinterpret_cast<float *>(out + tm0 * out_row_stride) + n0;
+                                    // C written straight to the f32 output;
+                                    // accumulate seeds from C on k0 > 0 chunks.
+                                    spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(
+                                        kk, b_tile, a_tile + mt * m_tile * kb, c_tile,
+                                        std::min(m_tile, M - tm0), nc, N, k0 != 0);
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
+        }
+
+        // Cluster-pair hybrid with adaptive B slots: K is cut into g =
+        // nth/2 slices, one per 2-core cluster (workers 2i and 2i+1 sit on
+        // one cluster whose two TCM blocks are mutually accessible at full
+        // speed).  Each thread packs half the M rows of its cluster's slice
+        // and dequants its own N32 tile per 64-column chunk; each thread
+        // runs its A against both its own and the sibling's B tile
+        // (cross-read straight from the sibling's TCM), writing to distinct
+        // partial slots of the cluster's slice.  packA/dequant/GEMM totals
+        // match split-K while partials and reduce traffic drop from nth to g
+        // slices.  Cross-thread ordering uses ready/done flags in TCM,
+        // exchanged at chunk granularity (~5us cross-core visibility).
+        // The second B slot costs n_tile rows of A in TCM, which can push a
+        // shape over a pass boundary and force an extra full-B re-dequant
+        // pass (K=9728: m_fit 48 -> 16, passes 2 -> 4; the 4B model
+        // regressed pp128 -5.8% / pp512 -11.8% from this), so the slot
+        // count is picked per shape: two slots only when that does not
+        // increase the M pass count and there is more than one N chunk to
+        // pipeline, one slot otherwise.  With one slot the in-loop refill
+        // overwrites the slot the sibling just read, so the done wait
+        // tightens to the full handshake (sib_done >= seq instead of
+        // seq-1).  Shapes with K < 2048 never reach this block: the
+        // split-N / split-M auto seats above claim them first (see
+        // q4_0_f16_split_n), so this block only handles the K >= 2048
+        // region where the cluster pair beats split-K.
+        if ((nth % 2) == 0 && nth <= 16 && K % KB == 0) {
+            const size_t g  = (size_t) nth / 2;
+            const size_t ks = K / g;
+            const size_t b_slot = n_tile * ks;                    // f16 per B slot
+            const size_t n_chunk = n_tile * 2;                    // 64 columns per cluster chunk
+            const size_t chunks  = (N + n_chunk - 1) / n_chunk;
+            const auto m_fit_for = [&](size_t slots) {
+                const size_t b_bytes  = slots * b_slot * sizeof(_Float16);
+                const size_t a_budget = tcm_size > b_bytes + 64 ? tcm_size - b_bytes - 64 : 0;
+                return (a_budget / (ks * sizeof(_Float16))) & ~size_t{ 15 };
+            };
+            const auto n_passes = [&](size_t m_fit) {
+                const size_t m_cap = m_fit * 2;                   // cluster M rows per pass
+                return (M + m_cap - 1) / m_cap;
+            };
+            const size_t m_fit1 = m_fit_for(1);
+            const size_t m_fit2 = m_fit_for(2);
+            const size_t slots =
+                chunks > 1 && m_fit2 >= m_tile && n_passes(m_fit2) == n_passes(m_fit1) ? 2 : 1;
+            const size_t m_fit = slots == 2 ? m_fit2 : m_fit1;
+            // Shape routing to the per-thread split-K below.
+            // Two gates, both required:
+            // 1. Cluster A-budget collapse: m_fit1 < 128 (one thread cannot
+            //    hold a 128-row batch).  Outside this region the cluster wins
+            //    even at an M-pass deficit -- the halved partials (g vs nth
+            //    slices) and chunk-rotated B access dominate the extra
+            //    re-dequant (grid-sweep measured at K=4096, m_fit1=144:
+            //    gm=1024 4 vs 3 passes +3..12%, gm=4096 15 vs 12 -2..+8%;
+            //    K=3072 gm=4096 10 vs 9 +7..15%; K=2048 gm=4096 7 vs 6
+            //    +12..20%) -- so the pass comparison must not run there.
+            //    Inside it (K=6144: m_fit1=80, slots collapse to 1; down_proj
+            //    K=9728: 48) every extra M pass re-dequants all of B with no
+            //    overlap and the deficit bites (K=6144 gm>=512 measured
+            //    -3..-15% vs split-K).
+            // 2. Split-K needs strictly fewer M passes at this shape; at
+            //    equal passes the cluster keeps its partials advantage
+            //    (small M: 1 pass either way -> stay clustered).
+            bool route_split_k = false;
+            if (m_fit1 < 128 && K % (KB * (size_t) nth) == 0) {
+                const size_t ksg  = (size_t) K / (size_t) nth;
+                const size_t bg   = n_tile * ksg * sizeof(_Float16);
+                const size_t mfg  = tcm_size > bg
+                                        ? ((tcm_size - bg) / (ksg * sizeof(_Float16))) & ~size_t{ 15 }
+                                        : 0;
+                if (mfg >= m_tile) {
+                    const size_t mbg = std::min(std::max(M, m_tile), mfg);
+                    route_split_k    = (M + mbg - 1) / mbg < n_passes(m_fit);
+                }
+            }
+            // Per-thread TCM: [m_fit x ks A][slots x 32 x ks B][64B flags].
+            const size_t slice_stride = mt_count * nt_count * m_tile * n_tile;
+            if (!route_split_k && K % (KB * g) == 0 && m_fit >= m_tile &&
+                g * slice_stride * sizeof(_Float16) + 128 <= ctx.workspace_size) {
+                const size_t group    = (size_t) ith / 2;
+                const size_t intra    = (size_t) ith % 2;
+                const size_t sib      = (size_t) ith ^ 1;
+                const size_t slice_k0 = group * ks;
+                auto * partials_h = reinterpret_cast<_Float16 *>(
+                    (reinterpret_cast<uintptr_t>(ctx.workspace) + 63) & ~uintptr_t{ 63 });
+                uint64_t * bases = reinterpret_cast<uint64_t *>(partials_h + g * slice_stride);
+                auto * a_blk = reinterpret_cast<_Float16 *>(tcm_buffer);
+                auto * b_blk = a_blk + m_fit * ks;             // slot 0; slot 1 at +b_slot
+                volatile uint64_t * f_ready =
+                    reinterpret_cast<volatile uint64_t *>(reinterpret_cast<uint8_t *>(tcm_buffer) + tcm_size - 64);
+                volatile uint64_t * f_done = f_ready + 1;
+
+                bases[ith] = (uint64_t) tcm_buffer;
+                *f_ready   = 0;
+                *f_done    = 0;
+                ctx.sync();
+                const auto * sib_base = reinterpret_cast<const uint8_t *>(bases[sib]);
+                const auto * sib_b_blk =
+                    reinterpret_cast<const _Float16 *>(sib_base + m_fit * ks * sizeof(_Float16));
+                volatile uint64_t * sib_ready =
+                    reinterpret_cast<volatile uint64_t *>(const_cast<uint8_t *>(sib_base) + tcm_size - 64);
+                volatile uint64_t * sib_done = sib_ready + 1;
+
+                const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+                const size_t m_cap   = m_fit * 2;                    // cluster M rows per pass
+
+                // Dequant this thread's N32 tile of visit position pos into
+                // B slot pos%slots.  Visit order (j+group)%chunks is shared
+                // by both threads of the cluster, so the slot index matches.
+                auto dequant_chunk = [&](size_t pos) {
+                    const size_t chunk = (pos + group) % chunks;
+                    const size_t nt    = (chunk * n_chunk) / n_tile + intra;
+                    if (nt >= nt_count) {
+                        return;
+                    }
+                    q41_func((void *) (b_src + nt * b_row_stride +
+                                           (slice_k0 / KB) * KB_BYTES),
+                             0,                                            // in_offset
+                             static_cast<int64_t>(b_row_stride),            // in_stride bytes
+                             (void *) (b_blk + (pos % slots) * b_slot), 0,
+                             static_cast<int64_t>((ks / 8) * 512),          // out_stride bytes
+                             1, static_cast<int64_t>(ks / KB),              // src_mc, src_kc
+                             1, static_cast<int64_t>(ks / 8));              // dst_mc, dst_kc
+                };
+
+                uint64_t seq = 0;   // global visit-position counter, monotonically increasing
+                for (size_t mb = 0; mb < M; mb += m_cap) {
+                    const size_t rows   = std::min(m_cap, M - mb);
+                    // Split this pass's rows between the two threads,
+                    // rounded to M16 so pack tiles stay whole.
+                    size_t       r0     = std::min(std::min(((rows + 31) / 32) * 16, rows), m_fit);
+                    const size_t row0   = mb + (intra == 0 ? 0 : r0);
+                    const size_t rows_t = intra == 0 ? r0 : rows - r0;
+                    const size_t m_tiles = (rows_t + m_tile - 1) / m_tile;
+                    // Prologue: position 0 into slot 0 and publish it before
+                    // packA so a lagging sibling is unblocked as early as
+                    // possible.  Protected by the previous pass's tail wait.
+                    dequant_chunk(0);
+                    __sync_synchronize();
+                    *f_ready = seq + 1;
+                    for (size_t mt = 0; mt < m_tiles; ++mt) {
+                        const size_t tm0 = row0 + mt * m_tile;
+                        pack_func((void *) (a_src + tm0 * a_src_stride),
+                                  static_cast<int64_t>(slice_k0 * sizeof(float)),          // in_offset bytes
+                                  static_cast<int64_t>(a_src_stride),                      // in_stride bytes
+                                  (void *) (a_blk + mt * m_tile * ks), 0,                  // out_offset
+                                  static_cast<int64_t>(ks * m_tile * sizeof(_Float16)),    // out_stride bytes
+                                  static_cast<int64_t>(std::min(m_tile, rows_t - mt * m_tile)), // mc
+                                  static_cast<int64_t>(ks),                                // kc
+                                  1, static_cast<int64_t>(ks / 8));                        // dst_mc, dst_kc
+                    }
+                    for (size_t j = 0; j < chunks; ++j) {
+                        const size_t chunk = (j + group) % chunks;
+                        const size_t n0    = chunk * n_chunk;
+                        const size_t nt    = n0 / n_tile + intra;       // own tile this chunk
+                        const size_t nt_s  = n0 / n_tile + (1 - intra); // sibling's tile
+                        ++seq;
+                        // Local half: own A x own B (slot j%slots, packed by
+                        // the prologue or the previous iteration's refill).
+                        if (nt < nt_count) {
+                            const size_t nc = std::min(n_tile, N - nt * n_tile);
+                            for (size_t mt = 0; mt < m_tiles; ++mt) {
+                                const size_t tm0 = row0 + mt * m_tile;
+                                _Float16 *     c_blk =
+                                    partials_h + ((tm0 / m_tile) * nt_count + nt) * m_tile * g * n_tile +
+                                    group * n_tile;
+                                spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot(
+                                    ks, b_blk + (j % slots) * b_slot, a_blk + mt * m_tile * ks, c_blk,
+                                    std::min(m_tile, rows_t - mt * m_tile), nc, g * n_tile, false);
+                            }
+                        }
+                        // Cross half: own A x sibling's B (its slot j%slots).
+                        while (*sib_ready < seq) ;
+                        __sync_synchronize();
+                        if (nt_s < nt_count) {
+                            const size_t nc = std::min(n_tile, N - nt_s * n_tile);
+                            for (size_t mt = 0; mt < m_tiles; ++mt) {
+                                const size_t tm0 = row0 + mt * m_tile;
+                                _Float16 *     c_blk =
+                                    partials_h + ((tm0 / m_tile) * nt_count + nt_s) * m_tile * g * n_tile +
+                                    group * n_tile;
+                                spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot(
+                                    ks, sib_b_blk + (j % slots) * b_slot, a_blk + mt * m_tile * ks, c_blk,
+                                    std::min(m_tile, rows_t - mt * m_tile), nc, g * n_tile, false);
+                            }
+                        }
+                        __sync_synchronize();
+                        *f_done = seq;
+                        // Refill the slot the next position needs.  With two
+                        // slots that slot last served position seq-1 (reader
+                        // confirmed done >= seq-1); with one slot it just
+                        // served position seq (full handshake).
+                        if (j + 1 < chunks) {
+                            while (*sib_done < seq - (slots - 1)) ;
+                            dequant_chunk(j + 1);
+                            __sync_synchronize();
+                            *f_ready = seq + 1;
+                        }
+                    }
+                    // Full handshake: the next pass's prologue overwrites
+                    // slot 0, whose last reader finished at done == seq.
+                    while (*sib_done < seq) ;
+                }
+
+                // Reduce: tile-split block-cyclic
+                // across ALL nth workers over the g slices.
+                ctx.sync();
+                constexpr size_t reduce_chunk = 4;  // tiles per chunk
+                const size_t     tile_count   = mt_count * nt_count;
+                const size_t     n_rchunks    = (tile_count + reduce_chunk - 1) / reduce_chunk;
+                for (size_t c = (size_t) ith; c < n_rchunks; c += (size_t) nth) {
+                    const size_t t0 = c * reduce_chunk;
+                    const size_t t1 = std::min(tile_count, t0 + reduce_chunk);
+                    for (size_t ti = t0; ti < t1; ++ti) {
+                        const size_t     mt      = ti / nt_count;
+                        const size_t     nt      = ti % nt_count;
+                        const _Float16 * tile    = partials_h + ti * m_tile * g * n_tile;
+                        const size_t     count_m = std::min(m_tile, M - mt * m_tile);
+                        const size_t     count_n = std::min(n_tile, N - nt * n_tile);
+                        auto *           out_tile =
+                            reinterpret_cast<float *>(out + (mt * m_tile) * out_row_stride) + nt * n_tile;
+                        reduce_func((void *) tile, 0, 0, 0,
+                                    (void *) out_tile, 0,
+                                    static_cast<int64_t>(out_row_stride),  // out row stride bytes
+                                    1, 1, static_cast<int64_t>(g),         // src_mc, src_nc, nth
+                                    static_cast<int64_t>(count_m), static_cast<int64_t>(count_n));
+                    }
+                }
+                return true;
+            }
+        }
+
+        // Pick the K-slice count: prefer one slice per worker, fall back
+        // until slices start on a Q41 32-element block boundary (the B
+        // dequant indexes whole blocks), the [M16 tiles * ks] A block
+        // plus the [N32 * ks] B tile fit TCM and the partials fit the
+        // workspace.
+        size_t s_count = 0;
+        size_t ks      = 0;
+        for (size_t s = static_cast<size_t>(nth); s >= 1; --s) {
+            if (K % (KB * s) != 0) {
+                continue;
+            }
+            const size_t cand_ks  = K / s;
+            const size_t b_bytes  = n_tile * cand_ks * sizeof(_Float16);
+            const size_t a_budget = tcm_size > b_bytes ? tcm_size - b_bytes : 0;
+            const size_t m_fit    = (a_budget / (cand_ks * sizeof(_Float16))) & ~size_t{ 15 };
+            if (m_fit < m_tile) {
+                continue;
+            }
+            const size_t slice_stride = mt_count * nt_count * m_tile * n_tile;
+            const size_t partial_size = s * slice_stride * sizeof(_Float16);
+            if (partial_size + 64 > ctx.workspace_size) {
+                continue;
+            }
+            s_count = s;
+            ks      = cand_ks;
+            break;
+        }
+        if (s_count == 0) {
+            GGML_ABORT("q4_0_f16: no K-slice count fits TCM/workspace (K=%zu nth=%d tcm=%zu wsize=%zu)", K, nth,
+                       tcm_size, ctx.workspace_size);
+        }
+
+        const size_t a_budget = tcm_size - n_tile * ks * sizeof(_Float16);
+        const size_t m_fit    = (a_budget / (ks * sizeof(_Float16))) & ~size_t{ 15 };
+        const size_t m_block  = std::min(std::max(M, m_tile), m_fit);
+        const size_t nc_count = nt_count;
+
+        // Round the workspace base up to 64B: the f16f16f16 kernel's 32-f16
+        // row stores must each land in a single DDR bank.
+        auto * partials =
+            reinterpret_cast<_Float16 *>((reinterpret_cast<uintptr_t>(ctx.workspace) + 63) & ~uintptr_t{ 63 });
+        auto * a_blk    = reinterpret_cast<_Float16 *>(tcm_buffer);
+        auto * b_blk    = a_blk + m_block * ks;
+        const size_t slice_k0 = static_cast<size_t>(ith) * ks;
+
+        // GEMM phase: only workers owning a K slice participate; the rest
+        // fall through to the sync.
+        if (static_cast<size_t>(ith) < s_count) {
+            const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+            for (size_t m0 = 0; m0 < M; m0 += m_block) {
+                const size_t m_count = std::min(m_block, M - m0);
+                const size_t m_tiles = (m_count + m_tile - 1) / m_tile;
+                for (size_t mt = 0; mt < m_tiles; ++mt) {
+                    const size_t tm0 = m0 + mt * m_tile;
+                    // f32 -> f16 [ks/8][16][8]; the ime2 kernel zero-pads
+                    // M < 16 rows.
+                    pack_func((void *) (a_src + tm0 * a_src_stride),
+                              static_cast<int64_t>(slice_k0 * sizeof(float)),          // in_offset bytes
+                              static_cast<int64_t>(a_src_stride),                      // in_stride bytes
+                              (void *) (a_blk + mt * m_tile * ks), 0,                  // out_offset
+                              static_cast<int64_t>(ks * m_tile * sizeof(_Float16)),    // out_stride bytes
+                              static_cast<int64_t>(std::min(m_tile, M - tm0)),         // mc
+                              static_cast<int64_t>(ks),                                // kc
+                              1, static_cast<int64_t>(ks / 8));                        // dst_mc, dst_kc
+                }
+                // Diagonal skew: worker s rotates its N-tile traversal by s so
+                // lockstep workers write tiles spread along a diagonal of the
+                // [mb][nc] grid instead of converging on one tile block.
+                const size_t skew = static_cast<size_t>(ith);
+                for (size_t j = 0; j < nc_count; ++j) {
+                    const size_t nt = (j + skew) % nc_count;
+                    const size_t n0 = nt * n_tile;
+                    const size_t nc = std::min(n_tile, N - n0);
+                    // Q41Block -> f16 dequant of this worker's K slice for
+                    // the [n0, n0+32) rows; IME2 and scalar kernels share the
+                    // contract dst_mc=src_mc, dst_kc=4*src_kc, out_stride =
+                    // dst_kc * 512B tile; output [ks/8][32][8].
+                    q41_func((void *) (b_src + nt * b_row_stride + (slice_k0 / KB) * KB_BYTES),
+                             0,                                            // in_offset
+                             static_cast<int64_t>(b_row_stride),            // in_stride bytes
+                             (void *) b_blk, 0,
+                             static_cast<int64_t>(ks / 8) * 512,            // out_stride bytes
+                             1, static_cast<int64_t>(ks / KB),              // src_mc, src_kc
+                             1, static_cast<int64_t>(ks / 8));              // dst_mc, dst_kc
+                    for (size_t i = 0; i < m_tiles; ++i) {
+                        const size_t mt  = (i + skew) % m_tiles;
+                        const size_t tm0 = m0 + mt * m_tile;
+                        // [M/16][nc][16][s_count][32] f16 partials: row r of
+                        // slice ith at r*64B*s_count + ith*64B, one DDR bank
+                        // per row store; ldc = s_count*32 f16 rows.
+                        _Float16 * c_blk = partials +
+                                           ((tm0 / m_tile) * nc_count + nt) * m_tile * s_count * n_tile +
+                                           static_cast<size_t>(ith) * n_tile;
+                        spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot(
+                            ks, b_blk, a_blk + mt * m_tile * ks, c_blk, std::min(m_tile, M - tm0), nc,
+                            s_count * n_tile, false);
+                    }
+                }
+            }
+        }
+
+        ctx.sync();
+
+        // Tile split reduce, block-cyclic across the K-slice workers: at any
+        // instant the workers' chunks are adjacent, so the combined stream
+        // over partials is one sequential sweep instead of eight strided
+        // streams aliasing the DDR bank hash.
+        constexpr size_t reduce_chunk = 4;  // tiles per chunk (32KB)
+        const size_t     tile_count   = mt_count * nt_count;
+        const size_t     n_chunks     = (tile_count + reduce_chunk - 1) / reduce_chunk;
+        if (static_cast<size_t>(ith) < s_count) {
+            for (size_t c = static_cast<size_t>(ith); c < n_chunks; c += s_count) {
+                const size_t t0 = c * reduce_chunk;
+                const size_t t1 = std::min(tile_count, t0 + reduce_chunk);
+                for (size_t t = t0; t < t1; ++t) {
+                    const size_t      mt      = t / nt_count;
+                    const size_t      nt      = t % nt_count;
+                    const _Float16 *  tile    = partials + t * m_tile * s_count * n_tile;
+                    const size_t      count_m = std::min(m_tile, M - mt * m_tile);
+                    const size_t      count_n = std::min(n_tile, N - nt * n_tile);
+                    auto *            out_tile = reinterpret_cast<float *>(out + (mt * m_tile) * out_row_stride) +
+                                                nt * n_tile;
+                    // rvv reducesum_mxn expects src rows at 64B*nth stride
+                    // (one 32-f16 row per worker), which is exactly the
+                    // partials layout above.
+                    reduce_func((void *) tile, 0, 0, 0,
+                                (void *) out_tile, 0,
+                                static_cast<int64_t>(out_row_stride),  // out row stride bytes
+                                1, 1, static_cast<int64_t>(s_count),   // src_mc, src_nc, nth
+                                static_cast<int64_t>(count_m), static_cast<int64_t>(count_n));  // dst_mc, dst_nc
+                }
+            }
+        }
+
+        return true;
+    }
+
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        GGML_LOG_DEBUG("%s: repack tensor %s (type %s) with q4_0_q41block_f16\n", __func__, t->name, ggml_type_name(t->type));
+        // The BLOC_TYPE layout is only produced from q4_0 weights today;
+        // other source types would add their own repack here.
+        return ggml::cpu::riscv64_spacemit::repack_q4_0_to_q41(t, data, data_size);
+    }
+
+    void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
+        GGML_LOG_DEBUG("%s: unpack tensor %s from q4_0_q41block_f16\n", __func__, t->name);
+        auto ok = ggml::cpu::riscv64_spacemit::unpack_q41_to_q4_0(t, data, data_size);
+        GGML_ASSERT(ok == 0);
+    }
+};
+
 // Impl By IME1
 static const tensor_traits<block_q4_0, 32, 16>  q4_0_16x32_q8_0;
 static const tensor_traits<block_q4_1, 32, 16>  q4_1_16x32_q8_0;
@@ -1470,6 +2297,8 @@ static const tensor_traits<block_q8_0, 32, 32>  q8_0_32x32_q8_0;
 static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
+static const tensor_traits<block_q5_0, 32, 32>  q5_0_32x32_q8_0;
+static const tensor_traits_f16<Q41Block<32, 32, 2>, 32, 32> q4_0_f16_impl;
 
 // Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path
 class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
@@ -1507,6 +2336,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q4_0:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
+                if (ggml::cpu::riscv64_spacemit::q4_0_f16_repack_enabled(cur)) {
+                    return &ggml::cpu::riscv64_spacemit::q4_0_f16_impl;
+                }
+
                 if (cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
                     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q4_0_32x256_q8_0;
@@ -1700,6 +2533,13 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             } else {
                 nbytes = remap_block_nbytes(sizeof(block_q5_0), sizeof(spacemit_kernels::nrow_block_q5_0<1>));
             }
+            break;
+        case GGML_TYPE_Q4_0:
+            // Gated f16 path stores Q41Block<32,32,2> (608B) per 32 rows x K32
+            // window = 19 bytes per row per K32 block, padded to 32 rows.
+            nbytes = ggml::cpu::riscv64_spacemit::q4_0_f16_repack_enabled(tensor)
+                         ? remap_block_nbytes(sizeof(block_q4_0), 19, 32)
+                         : add_strided_nbytes(row_nbytes, 1, 1);
             break;
         default:
             nbytes = add_strided_nbytes(row_nbytes, 1, 1);
@@ -2050,6 +2890,15 @@ int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data,
     }
     memcpy(tensor->data, data, size);
     return 0;
+}
+
+void ggml_riscv64_spacemit_unpack_tensor(const ggml_tensor * tensor, void * data, size_t size) {
+    auto traits = (const ggml::spacemit::tensor_traits_base *) tensor->extra;
+    if (traits) {
+        traits->unpack(tensor, data, size);
+        return;
+    }
+    memcpy(data, tensor->data, size);
 }
 
 bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t * size) {

@@ -1818,4 +1818,142 @@ template <> int repack<block_q5_K, 32, 32>(ggml_tensor * t, const void * data, s
     return repack_q5_k_to_q5_1_32_bl(t, 32, data, data_size);
 }
 
+int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+
+    static_assert(sizeof(Q41Block<32, 32, 2>) == 608, "Q41Block layout changed");
+
+    const int64_t ne00 = t->ne[0];  // K
+    const int64_t ne01 = t->ne[1];  // N (rows per expert image)
+    if (ne00 % 32 != 0 || ne01 % 32 != 0) {
+        return -1;
+    }
+
+    const int64_t kblocks = ne00 / 32;
+    // Flat row count covers the 3-D MoE case (MUL_MAT_ID src0
+    // [K, N, n_expert]): every expert image starts at a row multiple of 32
+    // (ne01 % 32 == 0), so walking all ggml_nrows rows in one loop stacks
+    // per-expert 2-D images contiguously -- exactly the layout nbytes
+    // reserves via the dim-2 stride term.
+    const int64_t nrows = ggml_nrows(t);
+
+    // destination is (nrows/32)*kblocks blocks of 608B; the backend's
+    // ggml_spacemit_nbytes reserves exactly this when the repack-type gate
+    // selected this path.
+    if (data_size != static_cast<size_t>(nrows) * kblocks * sizeof(block_q4_0)) {
+        return -1;
+    }
+
+    auto                dst = reinterpret_cast<Q41Block<32, 32, 2> *>(t->data);
+    const block_q4_0 * src = reinterpret_cast<const block_q4_0 *>(data);
+
+    // layout: [ne01/32][ne00/32] blocks of 608B; one block holds one K32
+    // window across 32 rows (scale per row bit-exact from q4_0.d, shared zp=8,
+    // nibbles shuffled from q4_0 split-half order to Q41 interleaved order)
+    for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
+        for (int64_t j = 0; j < kblocks; j++) {
+            Q41Block<32, 32, 2> & blk = dst[(n0 / 32) * kblocks + j];
+            memset(blk.zp, 0, sizeof(blk.zp));
+            blk.zp[0] = 8;
+            for (int i = 0; i < 32; i++) {
+                const block_q4_0 & b = src[(n0 + i) * kblocks + j];
+                // bit-exact f16 copy of the q4_0 per-(row,K32) scale
+                memcpy(&blk.scale[i], &b.d, sizeof(ggml_half));
+                // ggml q4_0 packs byte p as element p (low nibble) | element
+                // p+16 (high nibble) -- a split-half layout.  Q41Block's scalar
+                // dequant expects byte p as element 2p (low) | element 2p+1
+                // (high) -- an interleaved layout.  Unpack the 32 elements and
+                // re-pack them in Q41's order (NOT a byte copy).
+                uint8_t e[32];
+                for (int p = 0; p < 16; p++) {
+                    e[p]      = static_cast<uint8_t>(b.qs[p] & 0x0F);
+                    e[p + 16] = static_cast<uint8_t>((b.qs[p] >> 4) & 0x0F);
+                }
+                uint8_t * q41row = reinterpret_cast<uint8_t *>(blk.data) + i * 16;
+                for (int p = 0; p < 16; p++) {
+                    q41row[p] = static_cast<uint8_t>((e[2 * p] & 0x0F) | ((e[2 * p + 1] & 0x0F) << 4));
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int unpack_q4_0_32x256(const ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+    const int64_t rows = ggml_nrows(t);
+    const int64_t blocks = t->ne[0] / QK4_0;
+    if (t->ne[0] % 256 != 0 || t->ne[1] % 32 != 0 ||
+        data_size != static_cast<size_t>(rows * blocks) * sizeof(block_q4_0)) {
+        return -1;
+    }
+    const auto * src = static_cast<const block_q4_0x32x256 *>(t->data);
+    auto * dst = static_cast<block_q4_0 *>(data);
+    for (int64_t r0 = 0; r0 < rows; r0 += 32) {
+        for (int64_t k0 = 0; k0 < blocks; k0 += 8, ++src) {
+            for (int j = 0; j < 8; ++j) {
+                const auto & packed = src->blocks[j];
+                for (int r = 0; r < 32; ++r) {
+                    auto & out = dst[(r0 + r) * blocks + k0 + j];
+                    out.d = packed.d[r];
+                    for (int p = 0; p < 8; ++p) {
+                        const uint8_t lo = packed.qs[r * 16 + p];
+                        const uint8_t hi = packed.qs[r * 16 + 8 + p];
+                        out.qs[2 * p] = (lo & 0x0f) | ((hi & 0x0f) << 4);
+                        out.qs[2 * p + 1] = (lo >> 4) | (hi & 0xf0);
+                    }
+                }
+            }
+        }
+    }
+    return 0;
+}
+
+int unpack_q41_to_q4_0(const ggml_tensor * t, void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+
+    static_assert(sizeof(Q41Block<32, 32, 2>) == 608, "Q41Block layout changed");
+
+    const int64_t ne00 = t->ne[0];  // K
+    const int64_t ne01 = t->ne[1];  // N (rows per expert image)
+    if (ne00 % 32 != 0 || ne01 % 32 != 0) {
+        return -1;
+    }
+
+    const int64_t kblocks = ne00 / 32;
+    // 3-D mirror of repack_q4_0_to_q41: flat over ggml_nrows.
+    const int64_t nrows = ggml_nrows(t);
+
+    if (data_size != static_cast<size_t>(nrows) * kblocks * sizeof(block_q4_0)) {
+        return -1;
+    }
+
+    const Q41Block<32, 32, 2> * src = reinterpret_cast<const Q41Block<32, 32, 2> *>(t->data);
+    block_q4_0 *                dst = reinterpret_cast<block_q4_0 *>(data);
+
+    // exact inverse of repack_q4_0_to_q41 (bit-exact per-(row,K32) scale copy,
+    // nibble order Q41 interleaved -> q4_0 split-half)
+    for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
+        for (int64_t j = 0; j < kblocks; j++) {
+            const Q41Block<32, 32, 2> & blk = src[(n0 / 32) * kblocks + j];
+            for (int i = 0; i < 32; i++) {
+                block_q4_0 & b = dst[(n0 + i) * kblocks + j];
+                memcpy(&b.d, &blk.scale[i], sizeof(ggml_half));
+                const uint8_t * q41row = reinterpret_cast<const uint8_t *>(blk.data) + i * 16;
+                uint8_t         e[32];
+                for (int p = 0; p < 16; p++) {
+                    e[2 * p]     = static_cast<uint8_t>(q41row[p] & 0x0F);
+                    e[2 * p + 1] = static_cast<uint8_t>((q41row[p] >> 4) & 0x0F);
+                }
+                for (int p = 0; p < 16; p++) {
+                    b.qs[p] = static_cast<uint8_t>((e[p] & 0x0F) | ((e[p + 16] & 0x0F) << 4));
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
 }  // namespace ggml::cpu::riscv64_spacemit

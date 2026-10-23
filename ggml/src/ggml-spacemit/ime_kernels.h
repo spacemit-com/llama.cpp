@@ -126,6 +126,20 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
                            size_t          k_blks,
                            size_t          ldc);
 
+// M1 i8i4 GEMV over spine-kernel's Q41Block<32,32,2> weight layout (the
+// q4_0_f16 repack): B data sits at block+0 and the per-row fp16 scales at
+// block+544 (608B blocks, 19B per-row pitch) instead of the legacy
+// block_q4_0x32 [scale@+0 | data@+64] (576B, 18B pitch).  zp=8 is implicit.
+size_t gemm_kernel_i8i4_m1_q41(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc);
+
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                const uint8_t ** quant_a_ptr,
                                const uint8_t *  quant_b_data,
@@ -185,5 +199,31 @@ size_t moe_m2_gemm_kernel_i8i5(size_t           blk_len,
                                size_t           count_n,
                                size_t           k_blks,
                                size_t           ldc);
+// f16 GEMM inner-kernel wrapper around spine-kernel's _spe_hpgemm_impl_m16n32k8_none.
+// a/b are the native [K/8][M16|N32][K8] f16 layouts, gemm_k is the K extent,
+// ldc counts f16 rows of the output tile.
+void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate);
+
+// f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
+// M-split schedule (whole K loop inside one call, C written straight to the
+// f32 output).  a/b are the same native [K/8][M16|N32][K8] f16 layouts;
+// accumulate=true seeds the accumulators from c_ptr's rows first, ldc counts
+// f32 rows of the output tile.
+void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        float *          c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate = false);
+
 }  // namespace ime2
 }  // namespace spacemit_kernels
