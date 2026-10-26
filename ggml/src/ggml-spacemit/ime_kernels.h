@@ -126,6 +126,46 @@ size_t gemm_kernel_i8i4_hp(size_t          blk_len,
                            size_t          k_blks,
                            size_t          ldc);
 
+size_t gemm_kernel_i8i4_hp_al(size_t          blk_len,
+                              const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              const uint8_t * quant_b_zp,
+                              float *         c_ptr,
+                              size_t          count_m,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc);
+
+void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
+                            const uint8_t * quant_a_ptr,
+                            const uint8_t * quant_b_data,
+                            const uint8_t * quant_b_zp,
+                            float *         c_ptr,
+                            size_t          count_m,
+                            size_t          count_n,
+                            size_t          k_blks,
+                            size_t          ldc);
+
+void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
+                               const uint8_t * quant_a_ptr,
+                               const uint8_t * quant_b_data,
+                               const uint8_t * quant_b_zp,
+                               float *         c_ptr,
+                               size_t          count_m,
+                               size_t          count_n,
+                               size_t          k_blks,
+                               size_t          ldc);
+
+void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
+                              const uint8_t * quant_a_ptr,
+                              const uint8_t * quant_b_data,
+                              const uint8_t * quant_b_zp,
+                              float *         c_ptr,
+                              size_t          count_m,
+                              size_t          count_n,
+                              size_t          k_blks,
+                              size_t          ldc);
+
 size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                const uint8_t ** quant_a_ptr,
                                const uint8_t *  quant_b_data,
@@ -137,6 +177,26 @@ size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
                                size_t           ldc);
 
 size_t gemm_kernel_i8i8(size_t          blk_len,
+                        const uint8_t * quant_a_ptr,
+                        const uint8_t * quant_b_data,
+                        const uint8_t * quant_b_zp,
+                        float *         c_ptr,
+                        size_t          count_m,
+                        size_t          count_n,
+                        size_t          k_blks,
+                        size_t          ldc);
+
+size_t gemm_kernel_i8i8_pre(size_t          blk_len,
+                        const uint8_t * quant_a_ptr,
+                        const uint8_t * quant_b_data,
+                        const uint8_t * quant_b_zp,
+                        float *         c_ptr,
+                        size_t          count_m,
+                        size_t          count_n,
+                        size_t          k_blks,
+                        size_t          ldc);
+
+size_t gemm_kernel_i8i8_pre_al(size_t          blk_len,
                         const uint8_t * quant_a_ptr,
                         const uint8_t * quant_b_data,
                         const uint8_t * quant_b_zp,

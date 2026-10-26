@@ -33,6 +33,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 // clang-format off
 #if defined(__riscv)
@@ -110,9 +111,37 @@ template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     }
 }
 
-template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
-class tensor_traits : public ggml::spacemit::tensor_traits_base {
-    bool work_size(int /* n_threads */, const ggml_tensor * op, size_t & size) const override {
+static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nbw1) {
+    const int64_t n_rows = op->src[2]->ne[0] * op->src[2]->ne[1];
+    const int64_t n_as   = op->src[0]->ne[2];
+    size_t        size   = 64;
+    size += GGML_PAD(n_rows * nbw1, 64) + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1);
+    size += GGML_PAD(n_as * sizeof(int64_t), 64);
+    size += GGML_PAD((n_rows / 4 + 1 + n_as) * 3 * sizeof(int32_t) + sizeof(int64_t), 64);
+    size += (size_t) n_threads * GGML_PAD((8 * op->src[1]->ne[0] + 8 * op->src[0]->ne[1]) * sizeof(float), 64);
+    return size;
+}
+
+template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
+    static bool hp_aligned() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    static bool q8_pre() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+
+    static bool a_aligned() { return q8_pre(); }
+
+    bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
             case GGML_OP_MUL_MAT:
                 {
@@ -123,7 +152,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
-                               spacemit_kernels::q8_blk_size(QK4_0, true);
+                               (q8_pre() ? spacemit_kernels::q8_m4al_row_blk_size :
+                                           spacemit_kernels::q8_blk_size(QK4_0, true));
                     } else if constexpr (INTER_SIZE == 256) {
                         size = spacemit_kernels::div_round_up(src1_nelements, 256) *
                                spacemit_kernels::q8_hp_blk_size(256, true, true);
@@ -132,6 +162,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     }
 
                     size = GGML_PAD(size, sizeof(int64_t));
+                    if (a_aligned()) {
+                        size = GGML_PAD(size, spacemit_kernels::q8_hp_al_align) + spacemit_kernels::q8_hp_al_align;
+                    }
 
                     return true;
                 }
@@ -162,6 +195,17 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                     size = GGML_PAD(size, sizeof(int64_t));
 
+                    if constexpr (INTER_SIZE == 256 && !std::is_same_v<BLOC_TYPE, block_q2_K> &&
+                                  !std::is_same_v<BLOC_TYPE, block_q3_K>) {
+                        const size_t nbw1 = spacemit_kernels::div_round_up(op->src[1]->ne[0], 256) *
+                                            (hp_aligned() ? spacemit_kernels::q8_hp_al_row_blk_size :
+                                                            spacemit_kernels::q8_hp_blk_size(256, true, true));
+                        size += mmid_m4_work_size(n_threads, op, nbw1);
+                        if (hp_aligned()) {
+                            size += spacemit_kernels::q8_hp_al_align;
+                        }
+                    }
+
                     return true;
                 }
             default:
@@ -186,7 +230,14 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        return forward_mul_mat(ctx, op);
+                        forward_mul_mat(ctx, op);
+                        return true;
+                    case GGML_TYPE_F32:
+                        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                            forward_mul_mat(ctx, op);
+                            return true;
+                        }
+                        return false;
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT");
                         return false;
@@ -205,7 +256,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
                         //case GGML_TYPE_MXFP4:
-                        return forward_mul_mat_id(ctx, op);
+                        forward_mul_mat_id(ctx, op);
+                        return true;
                     default:
                         // GGML_ABORT("fatal error: unsupported type for src0 in MUL_MAT_ID");
                         return false;
@@ -218,7 +270,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         return false;
     }
 
-    bool forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
+    void forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -257,6 +309,11 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i8_pre_al;
+                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_al;
+                    block_stride_a     = spacemit_kernels::q8_m4al_row_blk_size;
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {
@@ -324,9 +381,13 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         }
 
         uintptr_t ws_ptr = reinterpret_cast<uintptr_t>(ctx.workspace);
+        if (a_aligned()) {
+            const int64_t ws_align = spacemit_kernels::q8_hp_al_align;
+            ws_ptr                = (ws_ptr + ws_align - 1) & ~(uintptr_t) (ws_align - 1);
+        }
 
         void *        tcm_buffer      = ctx.shared.data;
-        const int64_t tcm_buffer_size = ctx.shared.size;
+        const int64_t tcm_buffer_size = (int64_t) ctx.shared.size;
 
         auto * quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
@@ -340,16 +401,18 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
 
         GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
         spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
 
         if (gemm_m == 1) {
+            const int64_t blk_stride_1row =
+                q8_pre() ? (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true) : block_stride_a;
             int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
             int a_blk_start     = ith * task_per_thread;
             int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
             if (a_blk_start < a_blk_end) {
                 quantize_a_row_i8(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
-                                  quant_a_buffer + a_blk_start * block_stride_a);
+                                  quant_a_buffer + a_blk_start * blk_stride_1row);
             }
         } else {
             int task_per_thread = spacemit_kernels::div_round_up(row_blks, nth);
@@ -438,7 +501,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         uint8_t *     b_row_zp = block_type_has_zp<BLOC_TYPE>() ? b_row : nullptr;
                         gemm_kernel(b_blk_len, a_row, b_row, b_row_zp, output + ni, 1, nb_real, b_k_blks, gemm_n);
                     }
-                    return true;
+                    return;
                 }
             }
 
@@ -554,10 +617,9 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 }
             }
         }
-        return true;
     }
 
-    bool forward_mul_mat_id(ggml::spacemit::context & ctx, ggml_tensor * op) const {
+    void forward_mul_mat_id(ggml::spacemit::context & ctx, ggml_tensor * op) const {
         constexpr size_t a_blk_len = INTER_SIZE;
         constexpr size_t b_blk_len = INTER_SIZE;
 
@@ -582,7 +644,8 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
         spacemit_kernels::quantize_a_row_def           quantize_a_row_i8;
         spacemit_kernels::gemm_kernel_quantize_def     gemm_kernel;
-        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2;
+        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2 = nullptr;
+        spacemit_kernels::quantize_a_row_def           quantize_a_4row_i8 = nullptr;
         bool                                           set_kernel_impl = false;
         size_t                                         block_stride_a  = spacemit_kernels::q8_blk_size(QK4_0);
 
@@ -594,13 +657,21 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
                 gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
                 set_kernel_impl = true;
+                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                    gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i8_pre;
+                }
             } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
                                  std::is_same_v<BLOC_TYPE, block_q4_K>) {
                 if constexpr (INTER_SIZE == 256) {
                     gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i4_hp;
                     quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8_hp;
                     block_stride_a    = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
-                    set_kernel_impl   = true;
+                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
+                    if (hp_aligned()) {
+                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
+                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
+                    }
+                    set_kernel_impl = true;
                 } else {
                     gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
                     moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i4;
@@ -657,14 +728,19 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         const uintptr_t ws_ptr         = reinterpret_cast<uintptr_t>(ctx.workspace);
         auto *          quant_a_buffer = reinterpret_cast<uint8_t *>(ws_ptr);
 
-        if (ne11 == 1) {
+        bool pad8_all = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            pad8_all = ids->ne[1] > 1 && quantize_a_4row_i8 != nullptr && ne01 % 32 == 0 && hp_aligned();
+        }
+
+        if (!pad8_all && ne11 == 1) {
             for (int64_t ii = ith; ii < ne12 * a_k_blks; ii += nth) {
                 int64_t i12       = ii / a_k_blks;
                 int64_t ak_blk_id = ii % a_k_blks;
                 quantize_a_row_i8(a_blk_len, (float *) ((char *) src1->data + i12 * nb12) + ak_blk_id * a_blk_len,
                                   a_blk_len, quant_a_buffer + i12 * nbw2 + ak_blk_id * block_stride_a);
             }
-        } else {
+        } else if (!pad8_all) {
             for (int64_t ii = ith; ii < ne12 * ne11; ii += nth) {
                 int64_t i12 = ii / ne11;
                 int64_t i11 = ii % ne11;
@@ -680,6 +756,33 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         int32_t *          valid_act_count         = (int32_t *) (valid_ep_count + 1);
         int64_t *          valid_matrix_row_counts = (int64_t *) (valid_act_count + 1);
         mmid_row_mapping * matrix_rows             = (mmid_row_mapping *) (valid_matrix_row_counts + n_as);
+
+        const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
+        bool use_m8 = false;
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+            use_m8 = use_m4 && hp_aligned();
+        }
+        const size_t m8_grp_bytes = a_k_blks * spacemit_kernels::q8_hp_m8_blk_size;
+        const int64_t n_rows_all = (int64_t) n_ids * ids->ne[1];
+        auto align64 = [](uintptr_t p) { return (p + 63) & ~(uintptr_t) 63; };
+        const size_t nbw1_m4 = hp_aligned() ? a_k_blks * spacemit_kernels::q8_hp_al_row_blk_size : nbw1;
+        uintptr_t m4_ptr     = align64(reinterpret_cast<uintptr_t>(matrix_rows + n_as * ne12));
+        if (hp_aligned()) {
+            m4_ptr = (m4_ptr + spacemit_kernels::q8_hp_al_align - 1) & ~(uintptr_t) (spacemit_kernels::q8_hp_al_align - 1);
+        }
+        uint8_t * m4_quant         = reinterpret_cast<uint8_t *>(m4_ptr);
+        m4_ptr = align64(m4_ptr + n_rows_all * nbw1_m4 + n_as * (spacemit_kernels::q8_hp_al_align + 8 * nbw1_m4));
+        int64_t * m4_expert_offset = reinterpret_cast<int64_t *>(m4_ptr);
+        m4_ptr                     = align64(m4_ptr + n_as * sizeof(int64_t));
+        int64_t * m4_n_groups      = reinterpret_cast<int64_t *>(m4_ptr);
+        int32_t * m4_groups        = reinterpret_cast<int32_t *>(m4_n_groups + 1);
+        m4_ptr = align64(m4_ptr + sizeof(int64_t) + (n_rows_all / 4 + 1 + n_as) * 3 * sizeof(int32_t));
+        const size_t m4_scratch_sz = GGML_PAD((8 * ne10 + 8 * ne01) * sizeof(float), 64);
+        float *      m4_a_f32      = reinterpret_cast<float *>(m4_ptr + ith * m4_scratch_sz);
+        float *      m4_c_tmp      = m4_a_f32 + 8 * ne10;
+        if (use_m4 && ith == 0) {
+            GGML_ASSERT(m4_ptr + nth * m4_scratch_sz <= reinterpret_cast<uintptr_t>(ctx.workspace) + ctx.workspace_size);
+        }
 
         if (ith == 0) {
             // initialize matrix_row_counts
@@ -711,25 +814,85 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
             }
             valid_ep_count[0]  = valid_ep_count_t;
             valid_act_count[0] = valid_act_count_t;
+
+            if (use_m4) {
+                int64_t n_groups = 0;
+                int64_t offset   = 0;
+                for (int cur_a = 0; cur_a < n_as; ++cur_a) {
+                    const int64_t cne1 = matrix_row_counts[cur_a];
+                    offset = (offset + spacemit_kernels::q8_hp_al_align - 1) & ~(int64_t) (spacemit_kernels::q8_hp_al_align - 1);
+                    m4_expert_offset[cur_a] = offset;
+                    int64_t r = 0;
+                    for (; use_m8 && r + 8 <= cne1; r += 8) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 8;
+                        n_groups++;
+                        offset += m8_grp_bytes;
+                    }
+                    if (pad8_all && r < cne1) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = (int32_t) (cne1 - r);
+                        n_groups++;
+                        offset += m8_grp_bytes;
+                        r = cne1;
+                    }
+                    for (; r + 4 <= cne1; r += 4) {
+                        m4_groups[3 * n_groups + 0] = cur_a;
+                        m4_groups[3 * n_groups + 1] = (int32_t) r;
+                        m4_groups[3 * n_groups + 2] = 4;
+                        n_groups++;
+                        offset += 4 * nbw1_m4;
+                    }
+                }
+                m4_n_groups[0] = n_groups;
+            }
+
         }
 
+        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
+
+        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
+        GGML_ASSERT(barrier_idx < static_cast<int64_t>(spine_init_barrier_count));
+        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
+
         ctx.sync();
+
+        if (use_m4 && m4_n_groups[0] > 0) {
+            const int64_t n_groups = m4_n_groups[0];
+            for (int64_t gi = ith; gi < n_groups; gi += nth) {
+                const int     cur_a = m4_groups[3 * gi + 0];
+                const int64_t r0    = m4_groups[3 * gi + 1];
+                const int     nr    = m4_groups[3 * gi + 2];
+                for (int r = 0; r < nr; ++r) {
+                    const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, r0 + r);
+                    const float * src = (const float *) ((const char *) src1->data + (rm.i1 % ne11) * nb11 + rm.i2 * nb12);
+                    memcpy(m4_a_f32 + r * ne10, src, ne10 * sizeof(float));
+                }
+                const int64_t n8  = use_m8 ? std::min<int64_t>(r0, (matrix_row_counts[cur_a] / 8) * 8) / 8 : 0;
+                uint8_t *     out = m4_quant + m4_expert_offset[cur_a] + n8 * m8_grp_bytes + (r0 - n8 * 8) * nbw1_m4;
+                if (nr < 8 && pad8_all) {
+                    memset(m4_a_f32 + nr * ne10, 0, (8 - nr) * ne10 * sizeof(float));
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else if (nr == 8) {
+                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                } else {
+                    quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
+                }
+            }
+            ctx.sync();
+        }
 
         const size_t row_stride_b      = b_k_blks * get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         const size_t expert_b_stride   = ne01 * row_stride_b;
         const size_t per_nb_cols_wsize = NB_COLS * row_stride_b;
 
-        const int64_t barrier_idx = static_cast<int64_t>(ith / 2);
-
-        GGML_ASSERT(global_spine_env_info.init_barrier != nullptr);
-        GGML_ASSERT(barrier_idx < spine_init_barrier_count);
-        spine_barrier_t * cur_barrier = &global_spine_env_info.init_barrier[barrier_idx];
-
         std::array<const uint8_t *, 2> src_workspaces;
         std::array<float *, 2>         dst_workspaces;
 
-        auto *     tcm_buffer      = ctx.shared.data;
-        const auto tcm_buffer_size = ctx.shared.size;
+        const int64_t tcm_buffer_size = (int64_t) ctx.shared.size;
+        void *        tcm_buffer      = ctx.shared.data;
 
         const auto valid_ep_count_t  = valid_ep_count[0];
         const auto valid_act_count_t = valid_act_count[0];
@@ -740,7 +903,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
         int ith_es = ith % nth_es;
         int ith_n  = (ith / nth_es) % nth_n;
 
-        if (valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
+        if (!pad8_all && valid_ep_count_t % nth == 0 && tcm_buffer != nullptr && valid_ep_count_t == n_as &&
             valid_act_count_t == n_as && per_nb_cols_wsize <= tcm_buffer_size) {
             const bool has_pair = ((ith & 1) != 0) || (ith + 1 < nth);
 
@@ -792,6 +955,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                     if (has_pair && ith % 2 != 0) {
                         spine_barrier_wait(cur_barrier);
                     }
+
                     gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
 
                     if (has_pair && ith % 2 == 0) {
@@ -831,6 +995,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                 size_t extra_tcm_buffer_size = tcm_buffer_size;
                 void * extra_tcm_buffer      = tcm_buffer;
+
                 if (tcm_buffer != nullptr && (src1_cur_end - src1_cur_start) >= 4 &&
                     (src0_cur_end - src0_cur_start) * row_stride_b <= tcm_buffer_size) {
                     spacemit_kernels::rvv::memcpy1d(tcm_buffer, src0_cur,
@@ -843,6 +1008,42 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                 }
 
                 int ir1 = src1_cur_start;
+
+                const int64_t n_cols = src0_cur_end - src0_cur_start;
+                if (pad8_all) {
+                    GGML_ASSERT(use_m8 && n_cols % 32 == 0);
+                }
+                if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all)) {
+                    const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
+                    for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        for (int r = 0; r < 8; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                        }
+                    }
+                    if (pad8_all && ir1 < src1_cur_end) {
+                        const int nr = (int) (src1_cur_end - ir1);
+                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
+                                                                       n_cols, b_k_blks, n_cols);
+                        for (int r = 0; r < nr; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                        }
+                        ir1 = src1_cur_end;
+                    }
+                    for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
+                        gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
+                        for (int r = 0; r < 4; ++r) {
+                            const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
+                            float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
+                            memcpy(dst_row, m4_c_tmp + r * n_cols, n_cols * sizeof(float));
+                        }
+                    }
+                }
 
                 if (extra_tcm_buffer_size >= nbw1 && extra_tcm_buffer != nullptr) {
                     int64_t quant_a_tile_size = extra_tcm_buffer_size / nbw1;
@@ -864,6 +1065,7 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                             spacemit_kernels::rvv::memcpy1d(quant_a_tile_buffer, src1_col, nbw1);
                             quant_a_tile_buffer = quant_a_tile_buffer + nbw1;
                         }
+
 
                         quant_a_tile_buffer = reinterpret_cast<uint8_t *>(extra_tcm_buffer);
                         iir1                = ir1;
@@ -891,12 +1093,12 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
                         for (; iir1 < (ir1 + quant_a_tile_size); iir1++, quant_a_tile_buffer += nbw1) {
                             mmid_row_mapping row_mapping_0 = MMID_MATRIX_ROW(cur_a, iir1);
 
-                            gemm_kernel(
-                                b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp,
-                                (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
-                                    src0_cur_start,
-                                1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            float * y = (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
+                                        src0_cur_start;
+                            gemm_kernel(b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp, y, 1,
+                                        src0_cur_end - src0_cur_start, b_k_blks, ne01);
                         }
+
 
                         ir1 += quant_a_tile_size;
                     } while (ir1 < src1_cur_end);
@@ -938,15 +1140,15 @@ class tensor_traits : public ggml::spacemit::tensor_traits_base {
 
                         auto * src1_col = quant_a_buffer + (i11 * nbw1 + i12 * nbw2);
 
-                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp,
-                                    (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start, 1,
-                                    src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                        float * y = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
+                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp, y, 1, src0_cur_end - src0_cur_start,
+                                    b_k_blks, ne01);
                     }
                 }
             }
         }
+
 #undef MMID_MATRIX_ROW
-        return true;
     }
 
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
@@ -1479,6 +1681,14 @@ class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
 };
 
 static const tensor_traits_q5_0_as_q8_0 q5_0_as_q8_0_32x32;
+
+class tensor_traits_f32_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
+    int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
+        return repack_f32_to_q8_0_32(t, data, data_size);
+    }
+};
+
+static const tensor_traits_f32_as_q8_0 f32_as_q8_0_32x32;
 // Impl By RVV
 static const tensor_traits_common               rvv_impl;
 
@@ -1613,6 +1823,19 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
                 if (cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
                     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q5_0_as_q8_0_32x32;
+                }
+#endif
+            }
+            break;
+        case GGML_TYPE_F32:
+            {
+#if defined(RISCV64_SPACEMIT_IME2)
+                const size_t nl = strlen(cur->name);
+                if (strstr(cur->name, "ffn_gate_inp") != nullptr && strstr(cur->name, "shexp") == nullptr &&
+                    nl > 7 && strcmp(cur->name + nl - 7, ".weight") == 0 && ggml_n_dims(cur) == 2 &&
+                    cur->ne[1] % 32 == 0 && cur->ne[0] % QK8_0 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::f32_as_q8_0_32x32;
                 }
 #endif
             }

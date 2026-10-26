@@ -39,7 +39,20 @@ constexpr size_t q8k_blk_size(size_t blk_len) {
 
 using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uint8_t *)>;
 
+constexpr size_t q8_hp_m4al_blk_size = 1216;
+constexpr size_t q8_hp_al_row_blk_size = q8_hp_m4al_blk_size / 4;
+constexpr size_t q8_hp_al_align        = 128;
+
+constexpr size_t q8_hp_m8_blk_size = 2176;
+
+constexpr size_t q8_m4al_blk_size     = 192;
+constexpr size_t q8_m4al_row_blk_size = q8_m4al_blk_size / 4;
+
 namespace rvv {
+void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+
 void memcpy1d(void * dst, const void * src, int64_t size);
 
 void memcpy2d(void * dst, int64_t dst_stride, const void * src, int64_t src_stride, int64_t tile_rows, int64_t size);
