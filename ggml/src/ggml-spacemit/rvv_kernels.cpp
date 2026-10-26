@@ -3717,8 +3717,8 @@ static __attribute__((noinline)) void gdn_recurrent_transposed(float *       sta
                                                             float         scale,
                                                             float *       out,
                                                             int64_t       d) {
-    for (int64_t j = 0; j < d; j += 64) {
-        const size_t vl = __riscv_vsetvl_e32m2(64);
+    for (int64_t j = 0; j < d;) {
+        const size_t vl = __riscv_vsetvl_e32m2(d - j);
         auto         k0 = __riscv_vfmv_v_f_f32m2(0.0f, vl);
         auto         k1 = k0, k2 = k0, k3 = k0, q0 = k0, q1 = k0, q2 = k0, q3 = k0;
         for (int64_t i = 0; i < d; i += 4) {
@@ -3765,6 +3765,61 @@ static __attribute__((noinline)) void gdn_recurrent_transposed(float *       sta
             __riscv_vse32_v_f32m2(state + (i + 2) * d + j, s2, vl);
             __riscv_vse32_v_f32m2(state + (i + 3) * d + j, s3, vl);
         }
+        j += vl;
+    }
+}
+
+// Decode with a full m4 row: load the next two independent rows before updating this pair.
+static __attribute__((noinline)) void gdn_recurrent_rows_lookahead(float *       dst,
+                                                                const float * src,
+                                                                const float * k,
+                                                                const float * q,
+                                                                const float * v,
+                                                                float         decay,
+                                                                float         beta,
+                                                                float         kq,
+                                                                float         scale,
+                                                                int64_t       d,
+                                                                float *       out) {
+    const size_t vl = __riscv_vsetvl_e32m4(d);
+    const auto kv = __riscv_vle32_v_f32m4(k, vl);
+    const auto qv = __riscv_vle32_v_f32m4(q, vl);
+    auto s0 = __riscv_vle32_v_f32m4(src, vl);
+    auto s1 = __riscv_vle32_v_f32m4(src + d, vl);
+    for (int64_t j = 0; j < d; j += 2) {
+        auto next0 = s0;
+        auto next1 = s1;
+        if (j + 2 < d) {
+            next0 = __riscv_vle32_v_f32m4(src + (j + 2) * d, vl);
+            next1 = __riscv_vle32_v_f32m4(src + (j + 3) * d, vl);
+            // Keep both loads before the arithmetic below in generated code.
+            asm volatile("" : "+vr"(next0), "+vr"(next1));
+        }
+        s0 = __riscv_vfmul_vf_f32m4(s0, decay, vl);
+        s1 = __riscv_vfmul_vf_f32m4(s1, decay, vl);
+        const auto zero = __riscv_vfmv_v_f_f32m1(0.0f, 1);
+        const auto pk0 = __riscv_vfmul_vv_f32m4(s0, kv, vl);
+        const auto pk1 = __riscv_vfmul_vv_f32m4(s1, kv, vl);
+        const auto sk0 = __riscv_vfredusum_vs_f32m4_f32m1(pk0, zero, vl);
+        const auto sk1 = __riscv_vfredusum_vs_f32m4_f32m1(pk1, zero, vl);
+        const auto pq0 = __riscv_vfmul_vv_f32m4(s0, qv, vl);
+        const auto pq1 = __riscv_vfmul_vv_f32m4(s1, qv, vl);
+        const auto sq0 = __riscv_vfredusum_vs_f32m4_f32m1(pq0, zero, vl);
+        const auto sq1 = __riscv_vfredusum_vs_f32m4_f32m1(pq1, zero, vl);
+        const float delta0 = (v[j] - __riscv_vfmv_f_s_f32m1_f32(sk0)) * beta;
+        const float delta1 = (v[j + 1] - __riscv_vfmv_f_s_f32m1_f32(sk1)) * beta;
+        s0 = __riscv_vfmacc_vf_f32m4(s0, delta0, kv, vl);
+        s1 = __riscv_vfmacc_vf_f32m4(s1, delta1, kv, vl);
+        __riscv_vse32_v_f32m4(dst + j * d, s0, vl);
+        __riscv_vse32_v_f32m4(dst + (j + 1) * d, s1, vl);
+        const float y0 = (__riscv_vfmv_f_s_f32m1_f32(sq0) + delta0 * kq) * scale;
+        const float y1 = (__riscv_vfmv_f_s_f32m1_f32(sq1) + delta1 * kq) * scale;
+        out[j] = y0;
+        out[j + 1] = y1;
+        if (j + 2 < d) {
+            s0 = next0;
+            s1 = next1;
+        }
     }
 }
 
@@ -3802,14 +3857,15 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const uintptr_t shared_begin = reinterpret_cast<uintptr_t>(ctx.shared.data);
     const size_t tcm_offset = align_up(shared_begin, 128) - shared_begin;
     const size_t tcm_bytes = (S_v * S_v + 3 * S_v) * sizeof(float);
-    const bool transposed = K == 1 && !kda && n_tokens >= 16 && (S_v == 64 || S_v == 128) &&
-                            __riscv_vlenb() == 128 && ctx.shared.data &&
+    const bool transposed = K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
+                            S_v >= (int64_t) __riscv_vsetvlmax_e32m2() &&
+                            S_v <= (int64_t) __riscv_vsetvlmax_e32m4() && ctx.shared.data &&
                             tcm_offset <= ctx.shared.size && tcm_bytes <= ctx.shared.size - tcm_offset;
     float * tcm_state = transposed ? reinterpret_cast<float *>(shared_begin + tcm_offset) : nullptr;
     float * staged    = transposed ? tcm_state + S_v * S_v : nullptr;
 
     // prefill: chunkwise form (the token recurrence below handles the remaining cases)
-    if (!transposed && K == 1 && !kda && n_tokens >= 16 && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
+    if (!transposed && K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
         src_q->type == GGML_TYPE_F32 && src_k->type == GGML_TYPE_F32 && src_v->type == GGML_TYPE_F32 &&
         src_g->type == GGML_TYPE_F32 && src_beta->type == GGML_TYPE_F32 && ggml_is_contiguous_rows(src_q) &&
         ggml_is_contiguous_rows(src_k) && ggml_is_contiguous_rows(src_v) && ggml_is_contiguous(src_g) &&
@@ -3838,8 +3894,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     // KDA needs the per-column decay vector for every state row; the fused
     // row update consumes it as a vector, so only this small buffer remains
     // of the reference implementation's scratch space.
-    float kda_decay[512];
-    GGML_ASSERT(S_v <= (int64_t) (sizeof(kda_decay) / sizeof(kda_decay[0])));
+    std::vector<float> kda_decay(kda && fused ? (size_t) S_v : 0);
     // K > 1 (chunked prefill snapshots) evolves a private working copy.
     std::vector<float> state_work((fused && K > 1) ? (size_t) (S_v * S_v) : 0);
     // Two-pass scratch: per-row delta and attention sums, plus its own K > 1
@@ -3909,11 +3964,14 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
                     decay_scalar = expf(g[0]);
                 }
 
-                if (S_v <= (int64_t) __riscv_vsetvlmax_e32m4()) {
+                if (n_tokens == 1 && K == 1 && !kda && S_v % 2 == 0 &&
+                    S_v == (int64_t) __riscv_vsetvlmax_e32m4()) {
+                    gdn_recurrent_rows_lookahead(s_out, s_cur, k, q, v, decay_scalar, beta, kq, scale, S_v, attn_data);
+                } else if (S_v <= (int64_t) __riscv_vsetvlmax_e32m4()) {
                     const size_t vl = __riscv_vsetvl_e32m4(S_v);
                     const vfloat32m4_t kv = __riscv_vle32_v_f32m4(k, vl);
                     const vfloat32m4_t qv = __riscv_vle32_v_f32m4(q, vl);
-                    const vfloat32m4_t dv = kda ? __riscv_vle32_v_f32m4(kda_decay, vl)
+                    const vfloat32m4_t dv = kda ? __riscv_vle32_v_f32m4(kda_decay.data(), vl)
                                               : __riscv_vfmv_v_f_f32m4(decay_scalar, vl);
                     for (int64_t j = 0; j < S_v; ++j) {
                         attn_data[j] = rvv_gdn_fused_row_f32(s_out + j * S_v, s_cur + j * S_v,
@@ -3923,7 +3981,7 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
                     const size_t vl = __riscv_vsetvl_e32m8(S_v);
                     const vfloat32m8_t kv = __riscv_vle32_v_f32m8(k, vl);
                     const vfloat32m8_t qv = __riscv_vle32_v_f32m8(q, vl);
-                    const vfloat32m8_t dv = kda ? __riscv_vle32_v_f32m8(kda_decay, vl)
+                    const vfloat32m8_t dv = kda ? __riscv_vle32_v_f32m8(kda_decay.data(), vl)
                                               : __riscv_vfmv_v_f_f32m8(decay_scalar, vl);
                     for (int64_t j = 0; j < S_v; ++j) {
                         attn_data[j] = rvv_gdn_fused_row_f32(s_out + j * S_v, s_cur + j * S_v,
