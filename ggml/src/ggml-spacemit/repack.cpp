@@ -6,7 +6,9 @@
 #include "ggml-common.h"
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
+#include "ggml-quants.h"
 #include "ime_kernels.h"
+#include "rvv_kernels.h"
 
 #include <algorithm>
 #include <cassert>
@@ -1315,8 +1317,7 @@ static int repack_q8_0_to_q8_0_32_bl(ggml_tensor *              t,
                                      int                        interleave_block,
                                      const void * GGML_RESTRICT data,
                                      size_t                     data_size) {
-    // Q5_0 tensors arrive here already converted to Q8_0 rows (repack_q5_0_to_q8_0_32)
-    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q5_0);
+    GGML_ASSERT(t->type == GGML_TYPE_Q8_0 || t->type == GGML_TYPE_Q5_0 || t->type == GGML_TYPE_F32);
     GGML_ASSERT(interleave_block == 32);
 
     constexpr int nrows_interleaved = 32;
@@ -1736,10 +1737,22 @@ template <> int repack<block_q4_0, 32, 32>(ggml_tensor * t, const void * data, s
 
 template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
+    int ret = repack_q4_0_to_q4_0_256_32_bl_ref(t, 32, data, data_size);
 #else
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
+    if (ret == 0 && ggml_n_dims(t) == 3) {
+        block_q4_0x32x256 * dst = (block_q4_0x32x256 *) t->data;
+        const int64_t       n   = ggml_nrows(t) / 32 * (t->ne[0] / 256);
+        for (int64_t i = 0; i < n; i++) {
+            for (auto & blk : dst[i].blocks) {
+                for (auto & q : blk.qs) {
+                    q ^= 0x88;
+                }
+            }
+        }
+    }
+    return ret;
 }
 
 template <> int repack<block_q4_1, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1770,6 +1783,29 @@ template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, s
 #endif
 }
 
+static void q8_0x32_prearrange(ggml_tensor * t) {
+    block_q8_0x32 * blk = (block_q8_0x32 *) t->data;
+    const int64_t   n   = (ggml_nrows(t) + 31) / 32 * (t->ne[0] / QK8_0);
+    static_assert(sizeof(blk->qs) == 4 * 256, "q8_0x32 data is four 256B register pairs");
+    for (int64_t i = 0; i < n; i++) {
+        for (int p = 0; p < 4; p++) {
+            uint8_t * pair = blk[i].qs + p * 256;
+            uint8_t   tmp[256];
+            for (int o = 0; o < 16; o++) {
+                memcpy(tmp + o * 16, pair + ((o % 8) * 2 + o / 8) * 16, 16);
+            }
+            memcpy(pair, tmp, sizeof(tmp));
+        }
+    }
+}
+
+static int q8_0x32_finish(ggml_tensor * t, int ret) {
+    if (ret == 0) {
+        q8_0x32_prearrange(t);
+    }
+    return ret;
+}
+
 // Q5_0 -> Q8_0 at load time, exact: Q5_0 value d * (q - 16) with q in [0, 31] is Q8_0 with the same d and
 // qs = q - 16. The result is repacked like a Q8_0 tensor and runs on the Q8_0 IME kernels.
 int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1791,12 +1827,25 @@ int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size)
             q8[i].qs[j + QK5_0 / 2] = (int8_t) (((src[i].qs[j] >> 4) | xh_1) - 16);
         }
     }
-    return repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0));
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
+}
+
+int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_F32);
+    GGML_ASSERT(t->ne[0] % QK8_0 == 0);
+    const int64_t nrows = ggml_nrows(t);
+    GGML_ASSERT(data_size == (size_t) nrows * t->ne[0] * sizeof(float));
+    const int64_t           nb = t->ne[0] / QK8_0;
+    std::vector<block_q8_0> q8(nrows * nb);
+    for (int64_t r = 0; r < nrows; r++) {
+        quantize_row_q8_0_ref((const float *) data + r * t->ne[0], q8.data() + r * nb, t->ne[0]);
+    }
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
 
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size);
+    return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size));
 #else
     return repack_q8_0_to_q8_0_32_bl(t, 32, data, data_size);
 #endif
