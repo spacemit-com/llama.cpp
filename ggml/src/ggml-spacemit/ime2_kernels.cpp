@@ -3795,10 +3795,25 @@ void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
                                size_t          k_blks,
                                size_t          ldc) {
     constexpr size_t NB_COLS                = 32;
-    constexpr size_t K_SUBBLKS_PER_SUPERBLK = 8;
-    constexpr size_t b_superblk_stride      = (NB_COLS * sizeof(_Float16) + 16 * NB_COLS) * K_SUBBLKS_PER_SUPERBLK;
+    constexpr size_t K_SUBBLKS_PER_SUPERBLK  = 8;
+    constexpr size_t k_subblk_len            = 32;
+    constexpr size_t b_scale_bytes           = NB_COLS * sizeof(_Float16);
+    constexpr size_t b_subblk_payload        = 16 * NB_COLS;
+    constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
+    constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
+    constexpr size_t a_data_bytes            = 8 * 4 * 32;  // 8 K32 subblocks x 4 rows x 32 B data lanes
+    constexpr size_t a_scale_bytes           = 8 * 4 * sizeof(_Float16);  // per-subblock 4 row scales
+    constexpr size_t a_sum_bytes             = 4 * 8 * sizeof(_Float16);  // 4 rows x 8 subblock a-sums
+    constexpr size_t a_scale_avg_bytes       = 4 * sizeof(_Float16);
+    // t2 walks the subblock scales starting at the scale area (a_data_bytes,
+    // +16 per K32 subblock); the group's 4 average scales follow the a_sum
+    // trailer at the end of the group.
+    constexpr size_t a_scale_off             = a_data_bytes;
+    constexpr size_t a_sum_off               = a_scale_off + a_scale_bytes;
+    constexpr size_t a_scale_avg_off         = a_sum_off + a_sum_bytes - a_scale_off;
     static_assert(b_superblk_stride == 4608, "B superblock layout");
     static_assert(q8_hp_m4al_blk_size == 1216, "A superblock layout");
+    static_assert(a_sum_off == 1088 && a_scale_avg_off == 128, "m4al A group offsets");
 
     GGML_ASSERT(blk_len == 256);
     GGML_ASSERT(count_m >= 4);
@@ -3823,8 +3838,8 @@ void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
 
             ".align 4                                 \n\t"
             "_HPAL_BLK%=:                             \n\t"
-            "addi           t2, t6, 1024              \n\t"
-            "flh            fa1, 128(t2)              \n\t"
+            "addi           t2, t6, %[A_SCALE_OFF]       \n\t"
+            "flh            fa1, %[A_SCALE_AVG_OFF](t2) \n\t"
             "vsetvli        t0, x0, e32, m1           \n\t"
             "vmv.v.i        v18, 0                    \n\t"
             "vmv.v.i        v19, 0                    \n\t"
@@ -3884,7 +3899,7 @@ void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
             "vse32.v        v31, (t2)                 \n\t"
             :
             : [A] "r"(quant_a_ptr), [B] "r"(b_tile), [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks),
-              [HP16] "f"(hp_scale_16)
+              [HP16] "f"(hp_scale_16), [A_SCALE_OFF] "i"(a_scale_off), [A_SCALE_AVG_OFF] "i"(a_scale_avg_off)
             : "t0", "t2", "t3", "t4", "t5", "t6", "s5", "fa0", "fa1", "fa2", "fa3", "fa4", "v0", "v1", "v2", "v3",
               "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18",
               "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
@@ -3935,8 +3950,15 @@ void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
                             size_t          count_n,
                             size_t          k_blks,
                             size_t          ldc) {
-    constexpr size_t NB_COLS           = 32;
-    constexpr size_t b_superblk_stride = (NB_COLS * sizeof(_Float16) + 16 * NB_COLS) * 8;
+    constexpr size_t NB_COLS                = 32;
+    constexpr size_t K_SUBBLKS_PER_SUPERBLK = 8;
+    constexpr size_t b_scale_bytes          = NB_COLS * sizeof(_Float16);
+    constexpr size_t b_subblk_payload       = 16 * NB_COLS;
+    constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
+    constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
+    constexpr size_t a_scale_off            = 8 * 8 * 32;  // 8 K32 subblocks x 8 rows x 32 B data lanes
+    static_assert(a_scale_off == 2048, "m8 A group scale offset");
+    // scale[8] (the group's average scale) is at t2 + 16 once t2 = t6 + a_scale_off.
     static_assert(b_superblk_stride == 4608, "B superblock layout");
     static_assert(q8_hp_m8_blk_size == 2176, "A superblock layout");
 
@@ -3962,9 +3984,9 @@ void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
             "vmv.v.i        v14, 0                    \n\t"
             ".align 4                                 \n\t"
             "_HPM8_BLK%=:                             \n\t"
-            "addi           t2, t6, 2047              \n\t"
+            "addi           t2, t6, %[A_SCALE_OFF] - 1   \n\t"  // t2 = t6 + 2048, split to keep the offset in imm range
             "addi           t2, t2, 1                 \n\t"
-            "flh            fa1, 16(t2)               \n\t"
+            "flh            fa1, 16(t2)               \n\t"  // 16 = scale[8], the group's average scale
             "vsetvli        t0, x0, e16, m1           \n\t"
             "vmv.v.i        v16, 0                    \n\t"
             "vmv.v.i        v17, 0                    \n\t"
@@ -4015,7 +4037,8 @@ void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
             "addi           t3, %[ACC], 768           \n\t"
             "vse32.v        v14, (t3)                 \n\t"
             :
-            : [A] "r"(quant_a_ptr), [B] "r"(b_tile), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [ACC] "r"(&acc[0][0])
+            : [A] "r"(quant_a_ptr), [B] "r"(b_tile), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [ACC] "r"(&acc[0][0]),
+              [A_SCALE_OFF] "i"(a_scale_off)
             : "t0", "t2", "t3", "t4", "t5", "t6", "s5", "fa0", "fa1", "fa2", "v0", "v1", "v2", "v3", "v4", "v5",
               "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20",
               "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "memory");
@@ -4042,8 +4065,19 @@ void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
                               size_t          count_n,
                               size_t          k_blks,
                               size_t          ldc) {
-    constexpr size_t NB_COLS           = 32;
-    constexpr size_t b_superblk_stride = (NB_COLS * sizeof(_Float16) + 16 * NB_COLS) * 8;
+    constexpr size_t NB_COLS                = 32;
+    constexpr size_t K_SUBBLKS_PER_SUPERBLK = 8;
+    constexpr size_t k_subblk_len           = 32;
+    constexpr size_t b_scale_bytes          = NB_COLS * sizeof(_Float16);
+    constexpr size_t b_subblk_payload       = 16 * NB_COLS;
+    constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
+    constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
+    // A is a single natural-layout hp row: per K256 block, 8 x [f16 scale +
+    // 32 B payload] then 8 f16 a-sums, then the row's average scale.
+    constexpr size_t a_sum_off               = K_SUBBLKS_PER_SUPERBLK * (sizeof(_Float16) + k_subblk_len);
+    constexpr size_t a_scale_avg_off         = a_sum_off + K_SUBBLKS_PER_SUPERBLK * sizeof(_Float16);
+    static_assert(b_superblk_stride == 4608, "B superblock layout");
+    static_assert(a_sum_off == 272 && a_scale_avg_off == 288, "natural-layout single-row A offsets");
 
     GGML_ASSERT(blk_len == 256);
     GGML_ASSERT(quant_b_zp == nullptr);
@@ -4065,7 +4099,7 @@ void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
             ".align 4                               \n\t"
             "BLK_LOOP%=:                            \n\t"
             "li             t5, 8                   \n\t"
-            "flh            ft1, 288(%[A])          \n\t"
+            "flh            ft1, %[A_SCALE_AVG_OFF](%[A])          \n\t"
 
             "vsetvli        t0, x0, e16, m1         \n\t"
             "vxor.vv        v16, v18, v18           \n\t"
@@ -4124,7 +4158,7 @@ void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
             "vsetvli        t0, x0, e32, m1         \n\t"
             "vse32.v        v31, (%[DST])           \n\t"
             : [A] "+r"(a_data), [B] "+r"(b_data)
-            : [DST] "r"(dst_c), [BK] "r"(k_blks)
+            : [DST] "r"(dst_c), [BK] "r"(k_blks), [A_SCALE_AVG_OFF] "i"(a_scale_avg_off)
             : "t0", "t4", "t5", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
               "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
               "v29", "v30", "v31", "fa0", "ft0", "ft1", "memory");

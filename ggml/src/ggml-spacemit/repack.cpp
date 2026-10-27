@@ -1742,6 +1742,11 @@ template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, 
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
     if (ret == 0 && ggml_n_dims(t) == 3) {
+        // Signed-nibble twist for expert (3-dim) tensors, consumed by the
+        // m8/m4_al/m1_s kernels: q4_0 nibbles hold u4 = q + 8, so qs ^ 0x88
+        // flips both nibbles to u4 ^ 8 and the kernels' vmadot.hp /
+        // vmadotus.hp pairs accumulate the i4 dot product without a separate
+        // zero-point correction. Dense MUL_MAT keeps the original layout.
         block_q4_0x32x256 * dst = (block_q4_0x32x256 *) t->data;
         const int64_t       n   = ggml_nrows(t) / 32 * (t->ne[0] / 256);
         for (int64_t i = 0; i < n; i++) {

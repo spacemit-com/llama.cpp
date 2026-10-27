@@ -5209,7 +5209,7 @@ void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, 
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_m4al_blk_size) {
         float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
         int16_t * a_sum_ptr   = reinterpret_cast<int16_t *>(quant_a_ptr + sizeof(float) * 4);
-        int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + 64);
+        int8_t *  quant_a_blk = reinterpret_cast<int8_t *>(quant_a_ptr + q8_m4al_hdr_size);
 
         for (size_t mi = 0; mi < 4; mi++) {
             size_t       vl      = __riscv_vsetvl_e32m1(blk_len);
@@ -5320,13 +5320,14 @@ void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_
 void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
+    constexpr size_t a_scale_off  = 8 * 8 * k_subblk_len;  // scale[8] right after 8 data lanes of the first K32 subblock
     GGML_ASSERT(blk_len == 256);
 
     const float stable_factor = 0.1f;
     float       scale_temp[subblk_count];
 
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_hp_m8_blk_size) {
-        _Float16 * scale_ptr = reinterpret_cast<_Float16 *>(quant_a_ptr + 2048);
+        _Float16 * scale_ptr = reinterpret_cast<_Float16 *>(quant_a_ptr + a_scale_off);
         float      scale_avg = 0.0f;
 
         for (size_t kk = 0; kk < subblk_count; ++kk) {
