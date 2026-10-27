@@ -33,12 +33,6 @@ template <int N> struct nrow_block_q3_k {
     uint16_t scales16[N];
 };
 
-template <int N> struct nrow_block_mxfp4 {
-    uint8_t e[N];
-    uint8_t qh[4 * N];
-    uint8_t qs[16 * N];
-};
-
 template <int N> struct __attribute__((packed)) nrow_block_q5_1 {
     uint16_t scales16[N];
     uint8_t  zp[N];
@@ -62,31 +56,120 @@ template <int N> struct __attribute__((packed)) nrow_block_q5_0 {
 
 static_assert(sizeof(nrow_block_q5_0<1>) == 22, "wrong nrow_block_q5_0 block size/padding");
 
-using gemm_kernel_quantize_def = std::function<
-    size_t(size_t, const uint8_t *, const uint8_t *, const uint8_t *, float *, size_t, size_t, size_t, size_t)>;
+// Matmul interface suite.
+//
+// Entry names carry the interface facts only: the A/B payload bit widths at
+// the interface boundary (i8i4 = int8 A payload x 4-bit B payload, both
+// widened value-identically inside the kernel; i8i5 = 4-bit low + 1-bit high
+// B mask merged inside; i8i2k/i8i3k = 2/3-bit k-quant B) and the repacked B
+// granule (k32 = N32xK32 blocks, k256 = N32xK256 superblocks).  Layout
+// details below that (B byte order, A scale/sum placement) are properties of
+// the pack ops that produced the buffers, not of the entry name.
+//
+//   a_pack         how the A rows handed to an entry were packed, relative to
+//                 the entry's family: r1/r4/r8 = row-block width, r4_al = the
+//                 family's 4-row group layout in its aligned (SoA + alignment
+//                 padding) form.  The caller passes the a_pack matching the
+//                 pack op it used; the entry picks its leaf kernel from it.
+//
+//   family entry   gemm_<widths>_<granule>(a_pack, ..., count_m, ...) — takes
+//                  count_m A rows, returns the row count consumed.
+//
+//   rows entry     gemm_<widths>_<granule>_rows(a_pack, ..., const uint8_t **
+//                  a, ..., float ** c, ...) — routed rows arrive as a pointer
+//                  array because each row lands in its own destination row.
+//
+//   leaf kernel    gemm_kernel_<family>_m<N> — one concrete register-blocking
+//                  per row count; internal to ime2_kernels.cpp.  A leaf takes
+//                  only the buffers, count_n, k_blks and (for m > 1) ldc: the
+//                  row count, block length and zp presence are implied by the
+//                  entry that dispatches to it.
+//
+// A pack ops (rvv / ime1): quantize_a_<bits>_r<rows>[_<layout>] — e.g.
+// quantize_a_i8_r4_hp packs 4 rows into the k256 hp family group layout.
+// B repack ops: repack_<src>_<dst>_<granule> (repack.cpp).
+enum class a_pack : int {
+    r1,     // one row per call, natural row layout
+    r4,     // 4-row group, the family's natural group layout
+    r8,     // 8-row group (k256 hp aligned family only)
+    r4_al,  // 4-row group, aligned (SoA) layout
+};
 
-using moe_gemm_kernel_quantize_def = std::function<
-    size_t(size_t, const uint8_t **, const uint8_t *, const uint8_t *, float **, size_t, size_t, size_t, size_t)>;
+using gemm_kernel_quantize_def = std::function<
+    size_t(a_pack, size_t, const uint8_t *, const uint8_t *, const uint8_t *, float *, size_t, size_t, size_t, size_t)>;
+
+using gemm_rows_def = std::function<
+    size_t(a_pack, size_t, const uint8_t **, const uint8_t *, const uint8_t *, float **, size_t, size_t, size_t, size_t)>;
 
 namespace ime1 {
-size_t gemm_kernel_i8i4(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
+size_t gemm_i8i4_k32(a_pack          ap,
+                     size_t          blk_len,
+                     const uint8_t * quant_a_ptr,
+                     const uint8_t * quant_b_data,
+                     const uint8_t * quant_b_zp,
+                     float *         c_ptr,
+                     size_t          count_m,
+                     size_t          count_n,
+                     size_t          k_blks,
+                     size_t          ldc);
 
-void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r1(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 }  // namespace ime1
 
 namespace ime2 {
-size_t gemm_kernel_i8i2k(size_t          blk_len,
+size_t gemm_i8i2k_k256(a_pack          ap,
+                       size_t          blk_len,
+                       const uint8_t * quant_a_ptr,
+                       const uint8_t * quant_b_data,
+                       const uint8_t * quant_b_zp,
+                       float *         c_ptr,
+                       size_t          count_m,
+                       size_t          count_n,
+                       size_t          k_blks,
+                       size_t          ldc);
+
+size_t gemm_i8i3k_k256(a_pack          ap,
+                       size_t          blk_len,
+                       const uint8_t * quant_a_ptr,
+                       const uint8_t * quant_b_data,
+                       const uint8_t * quant_b_zp,
+                       float *         c_ptr,
+                       size_t          count_m,
+                       size_t          count_n,
+                       size_t          k_blks,
+                       size_t          ldc);
+
+size_t gemm_i8i4_k32(a_pack          ap,
+                     size_t          blk_len,
+                     const uint8_t * quant_a_ptr,
+                     const uint8_t * quant_b_data,
+                     const uint8_t * quant_b_zp,
+                     float *         c_ptr,
+                     size_t          count_m,
+                     size_t          count_n,
+                     size_t          k_blks,
+                     size_t          ldc);
+
+size_t gemm_i8i4_k256(a_pack          ap,
+                      size_t          blk_len,
+                      const uint8_t * quant_a_ptr,
+                      const uint8_t * quant_b_data,
+                      const uint8_t * quant_b_zp,
+                      float *         c_ptr,
+                      size_t          count_m,
+                      size_t          count_n,
+                      size_t          k_blks,
+                      size_t          ldc);
+
+// Q4_0 fast path: N32xK256 superblock B in the offset-nibble encoding
+// (repack twists qs ^ 0x88 for 3-dim expert tensors), so the vmadot/vmadotus
+// pair folds the zero-point correction into the i4 dot product and skips it
+// as a separate term.  Serves the MoE r8/r4_al/r1 A groups.
+size_t gemm_i8i4_k256_q40fast(a_pack          ap,
+                         size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
                          const uint8_t * quant_b_zp,
@@ -96,7 +179,13 @@ size_t gemm_kernel_i8i2k(size_t          blk_len,
                          size_t          k_blks,
                          size_t          ldc);
 
-size_t gemm_kernel_i8i3k(size_t          blk_len,
+// Q4_1 / Q4_K fast path: N32xK256 superblock B in the bare-nibble encoding
+// with a dedicated zero-point area (repacked from Q4_1 or Q4_K), so the
+// vmadotsu/vmadotu dot pair runs on natural unsigned B nibbles and the
+// zero-point correction is applied as an explicit term.  Serves the MoE
+// r4_al/r1 A groups.
+size_t gemm_i8i4_k256_zp(a_pack          ap,
+                         size_t          blk_len,
                          const uint8_t * quant_a_ptr,
                          const uint8_t * quant_b_data,
                          const uint8_t * quant_b_zp,
@@ -106,144 +195,48 @@ size_t gemm_kernel_i8i3k(size_t          blk_len,
                          size_t          k_blks,
                          size_t          ldc);
 
-size_t gemm_kernel_i8i4(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
+size_t gemm_i8i8_k32(a_pack          ap,
+                     size_t          blk_len,
+                     const uint8_t * quant_a_ptr,
+                     const uint8_t * quant_b_data,
+                     const uint8_t * quant_b_zp,
+                     float *         c_ptr,
+                     size_t          count_m,
+                     size_t          count_n,
+                     size_t          k_blks,
+                     size_t          ldc);
 
-size_t gemm_kernel_i8i4_hp(size_t          blk_len,
-                           const uint8_t * quant_a_ptr,
-                           const uint8_t * quant_b_data,
-                           const uint8_t * quant_b_zp,
-                           float *         c_ptr,
-                           size_t          count_m,
-                           size_t          count_n,
-                           size_t          k_blks,
-                           size_t          ldc);
+size_t gemm_i8i5_k32(a_pack          ap,
+                     size_t          blk_len,
+                     const uint8_t * quant_a_ptr,
+                     const uint8_t * quant_b_data,
+                     const uint8_t * quant_b_zp,
+                     float *         c_ptr,
+                     size_t          count_m,
+                     size_t          count_n,
+                     size_t          k_blks,
+                     size_t          ldc);
 
-size_t gemm_kernel_i8i4_hp_al(size_t          blk_len,
-                              const uint8_t * quant_a_ptr,
-                              const uint8_t * quant_b_data,
-                              const uint8_t * quant_b_zp,
-                              float *         c_ptr,
-                              size_t          count_m,
-                              size_t          count_n,
-                              size_t          k_blks,
-                              size_t          ldc);
+size_t gemm_i8i4_k32_rows(a_pack           ap,
+                         size_t           blk_len,
+                         const uint8_t ** quant_a_ptr,
+                         const uint8_t *  quant_b_data,
+                         const uint8_t *  quant_b_zp,
+                         float **         c_ptr,
+                         size_t           count_m,
+                         size_t           count_n,
+                         size_t           k_blks,
+                         size_t           ldc);
 
-void gemm_kernel_i8i4_hp_m8(size_t          blk_len,
-                            const uint8_t * quant_a_ptr,
-                            const uint8_t * quant_b_data,
-                            const uint8_t * quant_b_zp,
-                            float *         c_ptr,
-                            size_t          count_m,
-                            size_t          count_n,
-                            size_t          k_blks,
-                            size_t          ldc);
-
-void gemm_kernel_i8i4_hp_m4_al(size_t          blk_len,
-                               const uint8_t * quant_a_ptr,
-                               const uint8_t * quant_b_data,
-                               const uint8_t * quant_b_zp,
-                               float *         c_ptr,
-                               size_t          count_m,
-                               size_t          count_n,
-                               size_t          k_blks,
-                               size_t          ldc);
-
-void gemm_kernel_i8i4_hp_m1_s(size_t          blk_len,
-                              const uint8_t * quant_a_ptr,
-                              const uint8_t * quant_b_data,
-                              const uint8_t * quant_b_zp,
-                              float *         c_ptr,
-                              size_t          count_m,
-                              size_t          count_n,
-                              size_t          k_blks,
-                              size_t          ldc);
-
-size_t moe_m2_gemm_kernel_i8i4(size_t           blk_len,
-                               const uint8_t ** quant_a_ptr,
-                               const uint8_t *  quant_b_data,
-                               const uint8_t *  quant_b_zp,
-                               float **         c_ptr,
-                               size_t           count_m,
-                               size_t           count_n,
-                               size_t           k_blks,
-                               size_t           ldc);
-
-size_t gemm_kernel_i8i8(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
-
-size_t gemm_kernel_i8i8_pre(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
-
-size_t gemm_kernel_i8i8_pre_al(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
-
-size_t gemm_kernel_i8mxfp4(size_t          blk_len,
-                           const uint8_t * quant_a_ptr,
-                           const uint8_t * quant_b_data,
-                           const uint8_t * quant_b_zp,
-                           float *         c_ptr,
-                           size_t          count_m,
-                           size_t          count_n,
-                           size_t          k_blks,
-                           size_t          ldc);
-
-size_t moe_m2_gemm_kernel_i8mxfp4(size_t           blk_len,
-                                  const uint8_t ** quant_a_ptr,
-                                  const uint8_t *  quant_b_data,
-                                  const uint8_t *  quant_b_zp,
-                                  float **         c_ptr,
-                                  size_t           count_m,
-                                  size_t           count_n,
-                                  size_t           k_blks,
-                                  size_t           ldc);
-
-size_t gemm_kernel_i8i5(size_t          blk_len,
-                        const uint8_t * quant_a_ptr,
-                        const uint8_t * quant_b_data,
-                        const uint8_t * quant_b_zp,
-                        float *         c_ptr,
-                        size_t          count_m,
-                        size_t          count_n,
-                        size_t          k_blks,
-                        size_t          ldc);
-
-size_t moe_m2_gemm_kernel_i8i5(size_t           blk_len,
-                               const uint8_t ** quant_a_ptr,
-                               const uint8_t *  quant_b_data,
-                               const uint8_t *  quant_b_zp,
-                               float **         c_ptr,
-                               size_t           count_m,
-                               size_t           count_n,
-                               size_t           k_blks,
-                               size_t           ldc);
+size_t gemm_i8i5_k32_rows(a_pack           ap,
+                         size_t           blk_len,
+                         const uint8_t ** quant_a_ptr,
+                         const uint8_t *  quant_b_data,
+                         const uint8_t *  quant_b_zp,
+                         float **         c_ptr,
+                         size_t           count_m,
+                         size_t           count_n,
+                         size_t           k_blks,
+                         size_t           ldc);
 }  // namespace ime2
 }  // namespace spacemit_kernels

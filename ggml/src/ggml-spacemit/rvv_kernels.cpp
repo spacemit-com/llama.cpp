@@ -2100,7 +2100,7 @@ void quantize_a_nrow_i8k_ref(size_t blk_len, const float * a_ptr, size_t count_k
     }
 }
 
-void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r1(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 32);
     int64_t a_blk_stride = q8_blk_size(blk_len, true);
     size_t  vlenb        = __riscv_vlenb();
@@ -2168,7 +2168,7 @@ void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint
     }
 }
 
-void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r4(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 32);
     int64_t a_blk_stride        = q8_blk_size(blk_len, true);
     int64_t a_nrow_block_stride = a_blk_stride * 4;
@@ -2241,7 +2241,7 @@ void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uin
     }
 }
 
-void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r1_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     GGML_ASSERT(blk_len == 256);
 
@@ -2352,7 +2352,7 @@ void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, u
     }
 }
 
-void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r4_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     GGML_ASSERT(blk_len == 256);
 
@@ -2557,7 +2557,7 @@ void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, 
     }
 }
 
-void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r1_k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 256);
     constexpr int64_t a_blk_stride = q8k_blk_size(256);
     constexpr int64_t a_sum_size   = 256 / 16;
@@ -2648,7 +2648,7 @@ void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uin
     }
 }
 
-void quantize_a_4row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r4_k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 256);
     constexpr int64_t a_blk_stride        = q8k_blk_size(256);
     constexpr int64_t a_nrow_block_stride = a_blk_stride * 4;
@@ -5204,7 +5204,7 @@ template void forward_concat<int16_t>(ggml::spacemit::context & ctx, ggml_tensor
 
 namespace spacemit_kernels::rvv {
 
-void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r4_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     GGML_ASSERT(blk_len == 32 && __riscv_vlenb() == 128);
     for (size_t k = 0; k < count_k; k += blk_len, quant_a_ptr += q8_m4al_blk_size) {
         float *   scale_a_ptr = reinterpret_cast<float *>(quant_a_ptr);
@@ -5237,7 +5237,7 @@ void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, 
     }
 }
 
-void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
     constexpr size_t data_bytes   = subblk_count * 4 * k_subblk_len;
@@ -5307,7 +5307,7 @@ void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_
             for (size_t r = 0; r < 4; ++r) {
                 memcpy(a_blk + r * 256, a_ptr + r * count_k + k, 256 * sizeof(float));
             }
-            quantize_a_4row_i8_hp(blk_len, a_blk, 256, tmp);
+            quantize_a_i8_r4_hp(blk_len, a_blk, 256, tmp);
             for (size_t kk = 0; kk < subblk_count; ++kk) {
                 memcpy(quant_a_ptr + kk * 128, tmp + kk * old_subblk + 8, 128);
                 memcpy(quant_a_ptr + data_bytes + kk * 8, tmp + kk * old_subblk, 8);
@@ -5317,7 +5317,7 @@ void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_
     }
 }
 
-void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
+void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
     constexpr size_t a_scale_off  = 8 * 8 * k_subblk_len;  // scale[8] right after 8 data lanes of the first K32 subblock

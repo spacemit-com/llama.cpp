@@ -64,9 +64,9 @@ constexpr size_t q8_m4al_row_blk_size = q8_m4al_blk_size / 4;
 static_assert(q8_m4al_hdr_size == 64 && q8_m4al_blk_size == 192, "i8i8 group layout");
 
 namespace rvv {
-void quantize_a_4row_i8_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
-void quantize_a_4row_i8_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
-void quantize_a_8row_i8_hp_m8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 void memcpy1d(void * dst, const void * src, int64_t size);
 
@@ -149,17 +149,17 @@ template <typename T> void forward_repeat_nrows(ggml::spacemit::context & ctx, g
 
 template <typename T> void forward_repeat_dim1(ggml::spacemit::context & ctx, ggml_tensor * op);
 
-void quantize_a_row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r1(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_4row_i8(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r1_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_4row_i8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r1_k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
-void quantize_a_4row_i8k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
+void quantize_a_i8_r4_k(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr);
 
 }  // namespace rvv
 

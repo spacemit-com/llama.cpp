@@ -694,6 +694,97 @@ static int repack_q4_0_to_q4_1_256_32_bl_ref(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
+// Q4_K -> bare-nibble + zp superblock: each 256-wide Q4_K block holds 8
+// 32-element sub-blocks with per-sub-block (d*sc_j, dmin*m_j) scales.  The
+// sub-block quant is stored as a native block_q4_1 with the negated-min
+// convention (m = -dmin*m_j), so the shared mid = -nearbyint(m/d) clamp
+// yields exactly the Q4_K zero point m1/d1, and the writeout matches the
+// Q4_1 superblock byte-for-byte (d[i] fp16 scale, zps[j*32+i], lo-nibble
+// plane first / hi-nibble plane second per 16 B row).
+static int repack_q4_k_to_q4_1_256_32_bl_ref(ggml_tensor *              t,
+                                             int                        interleave_block,
+                                             const void * GGML_RESTRICT data,
+                                             size_t                     data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_K);
+    GGML_ASSERT(interleave_block == 32);
+    GGML_ASSERT(QK_K / QK4_1 == 8);
+
+    constexpr int nrows_interleaved = 32;
+
+    block_q4_1x32x256 * dst = (block_q4_1x32x256 *) t->data;
+    const block_q4_K *  src = (const block_q4_K *) data;
+    block_q4_1          dst_tmp[32];
+    int                 nrow    = ggml_nrows(t);
+    int                 nblocks = t->ne[0] / QK_K;
+
+    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_K != 0) {
+        return -1;
+    }
+
+    for (int b = 0; b < nrow; b += nrows_interleaved) {
+        for (int64_t x = 0; x < nblocks; x++) {
+            for (int j = 0; j < 8; j++) {
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    uint8_t     sc, m;
+                    const float d = GGML_FP16_TO_FP32(src[x + i * nblocks].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+                    const float min =
+                        GGML_FP16_TO_FP32(src[x + i * nblocks].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.dmin);
+                    get_scale_min_k4(j, src[x + i * nblocks].scales, &sc, &m);
+                    const float d1 = d * sc;
+                    const float m1 = min * m;
+
+                    dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d = GGML_FP32_TO_FP16(d1);
+                    dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m = GGML_FP32_TO_FP16(-m1);
+                    // src -> [b0, b32] [b1, b33] ... [b31, b63]
+                    // dst -> [b0, b16] [b1, b17] ... [b15, b31] [b32, b48] [b33, b49] ... [b47, b63]
+                    const uint8_t * q = src[x + i * nblocks].qs + (j / 2) * QK4_1;
+                    if (j % 2 == 0) {
+                        for (int ii = 0; ii < 16; ii++) {
+                            dst_tmp[i].qs[ii] = (q[ii] & 0x0F) | ((q[ii + 16] & 0x0F) << 4);
+                        }
+                    } else {
+                        for (int ii = 0; ii < 16; ii++) {
+                            dst_tmp[i].qs[ii] = ((q[ii] & 0xF0) >> 4) | (q[ii + 16] & 0xF0);
+                        }
+                    }
+                }
+
+                block_q4_0x32 * dst_block = &dst->blocks[j];
+                uint8_t *       dst_zp    = dst->zps + j * nrows_interleaved;
+
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    float d   = GGML_FP16_TO_FP32(dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d);
+                    float m   = GGML_FP16_TO_FP32(dst_tmp[i].GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m);
+                    float mid = -std::nearbyintf(m / d);
+                    mid       = std::min(15.0f, std::max(0.0f, mid));
+
+                    dst_block->d[i] = GGML_FP32_TO_FP16(d);
+                    dst_zp[i]       = static_cast<uint8_t>(mid);
+                }
+
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    for (int k = 0; k < QK4_1 / 4; k++) {
+                        dst_block->qs[i * QK4_1 / 2 + k] =
+                            (dst_tmp[i].qs[k * 2] & 0x0F) | ((dst_tmp[i].qs[k * 2 + 1] & 0x0F) << 4);
+                    }
+                }
+
+                for (int i = 0; i < nrows_interleaved; i++) {
+                    for (int k = 0; k < QK4_1 / 4; k++) {
+                        dst_block->qs[i * QK4_1 / 2 + QK4_1 / 4 + k] =
+                            ((dst_tmp[i].qs[k * 2] & 0xF0) >> 4) | (dst_tmp[i].qs[k * 2 + 1] & 0xF0);
+                    }
+                }
+            }
+            dst++;
+        }
+        src += nrows_interleaved * nblocks;
+    }
+    return 0;
+
+    GGML_UNUSED(data_size);
+}
+
 // RVV optimized version of repack_q4_0_to_q4_0_32_bl
 // Eliminates the intermediate dst_tmp buffer and vectorizes nibble repack.
 static int repack_q4_0_to_q4_0_32_bl(ggml_tensor *              t,
@@ -1382,91 +1473,6 @@ static int repack_q8_0_to_q8_0_32_bl(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
-static void convert_mxfp4_to_5bit(const block_mxfp4 & src, spacemit_kernels::nrow_block_mxfp4<1> & dst) {
-    dst.e[0] = src.e;
-
-    // Decode all 32 mxfp4 values to signed integers via kvalues_mxfp4
-    int8_t vals[32];
-    for (int j = 0; j < QK_MXFP4 / 2; j++) {
-        vals[j]                = kvalues_mxfp4[src.qs[j] & 0xF];
-        vals[j + QK_MXFP4 / 2] = kvalues_mxfp4[src.qs[j] >> 4];
-    }
-
-    // vals [b0, b1, b2, b3, ..., b30, b31]
-    // Pack abs into qs with reorder: [b0,b1]..[b14,b15]..[b30,b31]
-    for (int j = 0; j < QK_MXFP4 / 2; j++) {
-        uint8_t lo0 = static_cast<uint8_t>(std::abs(vals[j * 2]));
-        uint8_t lo1 = static_cast<uint8_t>(std::abs(vals[j * 2 + 1]));
-        dst.qs[j]   = (lo0 & 0x0F) | ((lo1 & 0x0F) << 4);
-    }
-
-    // Pack sign bits into qh[4] (32 bits total, 1 bit per weight)
-    // reorder: [0,1,2,...,15,16,17,...,31] after the qs reorder above
-    uint32_t sign_bits = 0;
-    for (int j = 0; j < 32; j++) {
-        if (vals[j] < 0) {
-            sign_bits |= (1u << j);
-        }
-    }
-    memcpy(dst.qh, &sign_bits, 4);
-}
-
-static spacemit_kernels::nrow_block_mxfp4<32> make_block_mxfp4x32(spacemit_kernels::nrow_block_mxfp4<1> * in,
-                                                                  unsigned int blck_size_interleave) {
-    spacemit_kernels::nrow_block_mxfp4<32> out;
-    GGML_ASSERT(QK_MXFP4 / blck_size_interleave == 1);
-    GGML_UNUSED(blck_size_interleave);
-
-    for (int i = 0; i < 32; i++) {
-        out.e[i] = in[i].e[0];
-    }
-
-    // qs: copy per-row 16 bytes
-    for (int i = 0; i < 32; i++) {
-        memcpy(out.qs + i * 16, in[i].qs, 16);
-    }
-
-    // qh: copy per-row 4 bytes
-    for (int i = 0; i < 32; i++) {
-        memcpy(out.qh + i * 4, in[i].qh, 4);
-    }
-
-    return out;
-}
-
-static int repack_mxfp4_to_mxfp4_32_bl(ggml_tensor *              t,
-                                       int                        interleave_block,
-                                       const void * GGML_RESTRICT data,
-                                       size_t                     data_size) {
-    GGML_ASSERT(t->type == GGML_TYPE_MXFP4);
-    GGML_ASSERT(interleave_block == 32);
-
-    constexpr int nrows_interleaved = 32;
-
-    spacemit_kernels::nrow_block_mxfp4<32> * dst = (spacemit_kernels::nrow_block_mxfp4<32> *) t->data;
-    const block_mxfp4 *                      src = (const block_mxfp4 *) data;
-    spacemit_kernels::nrow_block_mxfp4<1>    dst_tmp[32];
-    int                                      nrow    = ggml_nrows(t);
-    int                                      nblocks = t->ne[0] / QK_MXFP4;
-
-    GGML_ASSERT(data_size == nrow * nblocks * sizeof(block_mxfp4));
-
-    if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_MXFP4 != 0) {
-        return -1;
-    }
-
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        for (int64_t x = 0; x < nblocks; x++) {
-            for (int i = 0; i < nrows_interleaved; i++) {
-                convert_mxfp4_to_5bit(src[x + i * nblocks], dst_tmp[i]);
-            }
-            *dst++ = make_block_mxfp4x32(dst_tmp, interleave_block);
-        }
-        src += nrows_interleaved * nblocks;
-    }
-    return 0;
-}
-
 static spacemit_kernels::nrow_block_q5_1<32> make_block_q5_1x32(spacemit_kernels::nrow_block_q5_1<1> * in,
                                                                 unsigned int blck_size_interleave) {
     spacemit_kernels::nrow_block_q5_1<32> out;
@@ -1705,6 +1711,30 @@ static int repack_q5_k_to_q5_1_32_bl(ggml_tensor *              t,
 
 namespace ggml::cpu::riscv64_spacemit {
 
+static void q8_0x32_lane_arrange(ggml_tensor * t) {
+    block_q8_0x32 * blk = (block_q8_0x32 *) t->data;
+    const int64_t   n   = (ggml_nrows(t) + 31) / 32 * (t->ne[0] / QK8_0);
+    static_assert(sizeof(blk->qs) == 4 * 256, "q8_0x32 data is four 256B register pairs");
+    for (int64_t i = 0; i < n; i++) {
+        for (int p = 0; p < 4; p++) {
+            uint8_t * pair = blk[i].qs + p * 256;
+            uint8_t   tmp[256];
+            for (int o = 0; o < 16; o++) {
+                memcpy(tmp + o * 16, pair + ((o % 8) * 2 + o / 8) * 16, 16);
+            }
+            memcpy(pair, tmp, sizeof(tmp));
+        }
+    }
+}
+
+static int q8_0x32_finish(ggml_tensor * t, int ret) {
+    if (ret == 0) {
+        q8_0x32_lane_arrange(t);
+    }
+    return ret;
+}
+
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
 
 template <> int repack<block_q4_0, 32, 16>(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1776,40 +1806,22 @@ template <> int repack<block_q4_1, 256, 32>(ggml_tensor * t, const void * data, 
 #endif
 }
 
+template <> int repack<block_q4_K, 256, 32>(ggml_tensor * t, const void * data, size_t data_size) {
+    return repack_q4_k_to_q4_1_256_32_bl_ref(t, 32, data, data_size);
+}
+
 template <> int repack<block_q4_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
     return repack_q4_k_to_q4_1_32_bl(t, 32, data, data_size);
 }
 
 template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
-    return repack_q6_k_to_q8_0_32_bl_ref(t, 32, data, data_size);
+    return q8_0x32_finish(t, repack_q6_k_to_q8_0_32_bl_ref(t, 32, data, data_size));
 #else
     return repack_q6_k_to_q8_0_32_bl(t, 32, data, data_size);
 #endif
 }
 
-static void q8_0x32_prearrange(ggml_tensor * t) {
-    block_q8_0x32 * blk = (block_q8_0x32 *) t->data;
-    const int64_t   n   = (ggml_nrows(t) + 31) / 32 * (t->ne[0] / QK8_0);
-    static_assert(sizeof(blk->qs) == 4 * 256, "q8_0x32 data is four 256B register pairs");
-    for (int64_t i = 0; i < n; i++) {
-        for (int p = 0; p < 4; p++) {
-            uint8_t * pair = blk[i].qs + p * 256;
-            uint8_t   tmp[256];
-            for (int o = 0; o < 16; o++) {
-                memcpy(tmp + o * 16, pair + ((o % 8) * 2 + o / 8) * 16, 16);
-            }
-            memcpy(pair, tmp, sizeof(tmp));
-        }
-    }
-}
-
-static int q8_0x32_finish(ggml_tensor * t, int ret) {
-    if (ret == 0) {
-        q8_0x32_prearrange(t);
-    }
-    return ret;
-}
 
 // Q5_0 -> Q8_0 at load time, exact: Q5_0 value d * (q - 16) with q in [0, 31] is Q8_0 with the same d and
 // qs = q - 16. The result is repacked like a Q8_0 tensor and runs on the Q8_0 IME kernels.
@@ -1854,10 +1866,6 @@ template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, s
 #else
     return repack_q8_0_to_q8_0_32_bl(t, 32, data, data_size);
 #endif
-}
-
-template <> int repack<block_mxfp4, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
-    return repack_mxfp4_to_mxfp4_32_bl(t, 32, data, data_size);
 }
 
 template <> int repack<block_q5_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {

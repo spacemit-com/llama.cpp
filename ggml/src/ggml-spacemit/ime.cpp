@@ -84,8 +84,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
         return sizeof(spacemit_kernels::nrow_block_q2_k<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q3_K>) {
         return sizeof(spacemit_kernels::nrow_block_q3_k<1>);
-    } else if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4>) {
-        return sizeof(spacemit_kernels::nrow_block_mxfp4<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K>) {
         return sizeof(spacemit_kernels::nrow_block_q5_1<1>);
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_0>) {
@@ -99,7 +97,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> constexpr siz
 template <typename BLOC_TYPE> constexpr bool block_type_has_zp() {
     if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0> ||
                   std::is_same_v<BLOC_TYPE, block_q3_K> || std::is_same_v<BLOC_TYPE, block_q4_0> ||
-                  std::is_same_v<BLOC_TYPE, block_mxfp4> || std::is_same_v<BLOC_TYPE, block_q5_0>) {
+                  std::is_same_v<BLOC_TYPE, block_q5_0>) {
         return false;
     } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_1> || std::is_same_v<BLOC_TYPE, block_q4_K> ||
                          std::is_same_v<BLOC_TYPE, block_q2_K> || std::is_same_v<BLOC_TYPE, block_q5_1> ||
@@ -124,22 +122,146 @@ static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nb
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
     static bool hp_aligned() {
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
+        if constexpr ((std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
+                       std::is_same_v<BLOC_TYPE, block_q4_K>) &&
+                      INTER_SIZE == 256) {
             return true;
         } else {
             return false;
         }
     }
 
-    static bool q8_pre() {
-        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+    // True when the family's dense A buffer mixes 4-row al groups (48 B/row,
+    // q8_m4al_row_blk_size) with 38 B natural r1 tail rows.
+    static bool q8_al_layout() {
+        if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0> || std::is_same_v<BLOC_TYPE, block_q6_K>) {
             return true;
         } else {
             return false;
         }
     }
 
-    static bool a_aligned() { return q8_pre(); }
+    static bool a_aligned() { return q8_al_layout(); }
+
+    // One resolve table for both dense MUL_MAT and MoE MUL_MAT_ID: every
+    // (BLOC_TYPE, INTER_SIZE) family picks its gemm entries, A pack ops and
+    // row strides from the same place.  ime2 is preferred, ime1 the fallback.
+    // The two paths only diverge for q4_0 N32xK256: dense keeps the natural
+    // nibble B encoding, MoE reads the sign-nibble encoding (the repack
+    // twists qs ^ 0x88 for 3-dim expert tensors) with the aligned A layout.
+    struct gemm_path {
+        spacemit_kernels::gemm_kernel_quantize_def kernel;        // nullptr: no impl
+        spacemit_kernels::quantize_a_row_def      quantize_a_r1;  // single-row pack op
+        spacemit_kernels::quantize_a_row_def      quantize_a_r4;  // nullptr: no 4-row group packing
+        spacemit_kernels::a_pack                  ap_r4;         // a_pack of the r4 group layout
+        size_t                                    row_stride;     // per-row stride of r1 rows in the quant buffer
+        size_t                                    row_stride_r4;  // per-row stride inside r4 groups (>= row_stride)
+
+        gemm_path() = default;
+
+        gemm_path(spacemit_kernels::gemm_kernel_quantize_def k, spacemit_kernels::quantize_a_row_def r1,
+                  spacemit_kernels::quantize_a_row_def r4, spacemit_kernels::a_pack ap, size_t rs, size_t rs4) :
+            kernel(std::move(k)), quantize_a_r1(std::move(r1)), quantize_a_r4(std::move(r4)), ap_r4(ap),
+            row_stride(rs), row_stride_r4(rs4) {}
+    };
+
+    struct gemm_resolve {
+        gemm_path dense;
+        gemm_path moe;                                   // row_stride: r1 rows in quant_a_buffer
+        spacemit_kernels::gemm_rows_def gemm_rows = nullptr;  // pointer-array (routed-row) entry
+        bool                           ok         = false;
+    };
+
+    static gemm_resolve resolve_gemm(size_t blk_len) {
+        gemm_resolve r;
+
+#if defined(RISCV64_SPACEMIT_IME2)
+        if (!r.ok && global_spine_env_info.use_ime2) {
+            using spacemit_kernels::a_pack;
+            const auto std_r1  = spacemit_kernels::rvv::quantize_a_i8_r1;
+            const auto std_r4  = spacemit_kernels::rvv::quantize_a_i8_r4;
+            const size_t std_row = spacemit_kernels::q8_blk_size(blk_len, true);
+
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
+                // Q8_0 B: q8_0x32 lane layout; A rows share the row
+                // block layout, 4-row groups use the aligned group layout.
+                const size_t al_row = spacemit_kernels::q8_m4al_row_blk_size;
+                r.dense = gemm_path( spacemit_kernels::ime2::gemm_i8i8_k32, std_r1,
+                            spacemit_kernels::rvv::quantize_a_i8_r4_al, a_pack::r4_al, std_row, al_row );
+                // MoE runs Q8_0 experts row-wise only (m1 tail).
+                r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i8_k32, std_r1, nullptr, a_pack::r1, std_row, std_row );
+                r.ok  = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K>) {
+                // Q6_K repacks to q8_0 N32xK32: same entry and
+                // pack ops as Q8_0.
+                r.dense = gemm_path( spacemit_kernels::ime2::gemm_i8i8_k32, std_r1,
+                            spacemit_kernels::rvv::quantize_a_i8_r4_al, a_pack::r4_al, std_row,
+                            spacemit_kernels::q8_m4al_row_blk_size );
+                r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i8_k32, std_r1, nullptr, a_pack::r1, std_row, std_row );
+                r.ok  = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
+                                 std::is_same_v<BLOC_TYPE, block_q4_K>) {
+                if constexpr (INTER_SIZE == 256) {
+                    const auto hp_r1   = spacemit_kernels::rvv::quantize_a_i8_r1_hp;
+                    const auto hp_r4   = spacemit_kernels::rvv::quantize_a_i8_r4_hp;
+                    const size_t hp_row = spacemit_kernels::q8_hp_blk_size(blk_len, true, true);
+                    r.dense = gemm_path( spacemit_kernels::ime2::gemm_i8i4_k256, hp_r1, hp_r4, a_pack::r4, hp_row, hp_row );
+                    if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0>) {
+                        // Q4_0 experts: sign-nibble B + aligned A groups.
+                        r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i4_k256_q40fast, hp_r1,
+                                  spacemit_kernels::rvv::quantize_a_i8_r4_hp_al, a_pack::r4_al, hp_row,
+                                  spacemit_kernels::q8_hp_al_row_blk_size );
+                    } else {
+                        // Q4_1 / Q4_K experts: bare-nibble B with the
+                        // zero-point area + aligned A groups.
+                        r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i4_k256_zp, hp_r1,
+                                  spacemit_kernels::rvv::quantize_a_i8_r4_hp_al, a_pack::r4_al, hp_row,
+                                  spacemit_kernels::q8_hp_al_row_blk_size );
+                    }
+                    r.ok = true;
+                } else {
+                    r.dense = gemm_path( spacemit_kernels::ime2::gemm_i8i4_k32, std_r1, std_r4, a_pack::r4, std_row, std_row );
+                    r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i4_k32, std_r1, nullptr, a_pack::r1, std_row, std_row );
+                    r.gemm_rows = spacemit_kernels::ime2::gemm_i8i4_k32_rows;
+                    r.ok    = true;
+                }
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q2_K> || std::is_same_v<BLOC_TYPE, block_q3_K>) {
+                const auto k_r1 = spacemit_kernels::rvv::quantize_a_i8_r1_k;
+                const auto k_r4 = spacemit_kernels::rvv::quantize_a_i8_r4_k;
+                const size_t k_row = spacemit_kernels::q8k_blk_size(blk_len);
+                const auto kernel = std::is_same_v<BLOC_TYPE, block_q2_K> ?
+                                        spacemit_kernels::ime2::gemm_i8i2k_k256 :
+                                        spacemit_kernels::ime2::gemm_i8i3k_k256;
+                r.dense = gemm_path( kernel, k_r1, k_r4, a_pack::r4, k_row, k_row );
+                r.moe = gemm_path( kernel, k_r1, nullptr, a_pack::r1, k_row, k_row );
+                r.ok    = true;
+            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K> ||
+                                 std::is_same_v<BLOC_TYPE, block_q5_0>) {
+                r.dense = gemm_path( spacemit_kernels::ime2::gemm_i8i5_k32, std_r1, std_r4, a_pack::r4, std_row, std_row );
+                r.moe = gemm_path( spacemit_kernels::ime2::gemm_i8i5_k32, std_r1, nullptr, a_pack::r1, std_row, std_row );
+                r.gemm_rows = spacemit_kernels::ime2::gemm_i8i5_k32_rows;
+                r.ok    = true;
+            }
+        }
+#endif
+
+#if defined(RISCV64_SPACEMIT_IME1)
+        if (!r.ok && global_spine_env_info.use_ime1) {
+            using spacemit_kernels::a_pack;
+            const auto i1_r1 = spacemit_kernels::ime1::quantize_a_i8_r1;
+            const auto i1_r4 = spacemit_kernels::ime1::quantize_a_i8_r4;
+            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
+                          std::is_same_v<BLOC_TYPE, block_q4_K>) {
+                const size_t i1_row = spacemit_kernels::q8_blk_size(blk_len);
+                r.dense = gemm_path( spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, i1_r4, a_pack::r4, i1_row, i1_row );
+                r.moe = gemm_path( spacemit_kernels::ime1::gemm_i8i4_k32, i1_r1, nullptr, a_pack::r1, i1_row, i1_row );
+                r.ok    = true;
+            }
+        }
+#endif
+
+        return r;
+    }
 
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         switch (op->op) {
@@ -152,7 +274,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                             spacemit_kernels::div_round_up(src1_nelements, QK_K) * spacemit_kernels::q8k_blk_size(QK_K);
                     } else if constexpr (INTER_SIZE == QK4_0) {
                         size = spacemit_kernels::div_round_up(src1_nelements, QK4_0) *
-                               (q8_pre() ? spacemit_kernels::q8_m4al_row_blk_size :
+                               (q8_al_layout() ? spacemit_kernels::q8_m4al_row_blk_size :
                                            spacemit_kernels::q8_blk_size(QK4_0, true));
                     } else if constexpr (INTER_SIZE == 256) {
                         size = spacemit_kernels::div_round_up(src1_nelements, 256) *
@@ -229,7 +351,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
-                        //case GGML_TYPE_MXFP4:
                         forward_mul_mat(ctx, op);
                         return true;
                     case GGML_TYPE_F32:
@@ -255,7 +376,6 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     case GGML_TYPE_Q5_0:
                     case GGML_TYPE_Q5_1:
                     case GGML_TYPE_Q5_K:
-                        //case GGML_TYPE_MXFP4:
                         forward_mul_mat_id(ctx, op);
                         return true;
                     default:
@@ -293,82 +413,19 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         const int64_t gemm_k = ne10;
         const int64_t gemm_n = ne01;
 
-        spacemit_kernels::quantize_a_row_def       quantize_a_row_i8;
-        spacemit_kernels::quantize_a_row_def       quantize_a_4row_i8;
-        spacemit_kernels::gemm_kernel_quantize_def gemm_kernel;
-        bool                                       set_kernel_impl = false;
-
-        int64_t block_stride_a = spacemit_kernels::q8_blk_size(a_blk_len);
-
-#if defined(RISCV64_SPACEMIT_IME2)
-        if (!set_kernel_impl && (global_spine_env_info.use_ime2)) {
-            quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8;
-            quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
-            block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
-
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
-                set_kernel_impl = true;
-                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i8_pre_al;
-                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_al;
-                    block_stride_a     = spacemit_kernels::q8_m4al_row_blk_size;
-                }
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
-                                 std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                if constexpr (INTER_SIZE == 256) {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4_hp;
-                    quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8_hp;
-                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
-                    block_stride_a     = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
-                    set_kernel_impl    = true;
-                } else {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
-                    quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8;
-                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8;
-                    block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
-                    set_kernel_impl    = true;
-                }
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q2_K>) {
-                quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8k;
-                quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8k;
-                block_stride_a     = spacemit_kernels::q8k_blk_size(a_blk_len);
-
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i2k;
-                set_kernel_impl = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q3_K>) {
-                quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8k;
-                quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8k;
-                block_stride_a     = spacemit_kernels::q8k_blk_size(a_blk_len);
-
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i3k;
-                set_kernel_impl = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4>) {
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8mxfp4;
-                set_kernel_impl = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K> ||
-                                 std::is_same_v<BLOC_TYPE, block_q5_0>) {
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i5;
-                set_kernel_impl = true;
-            }
-        }
-#endif
-
-#if defined(RISCV64_SPACEMIT_IME1)
-        if (!set_kernel_impl && (global_spine_env_info.use_ime1)) {
-            quantize_a_row_i8  = spacemit_kernels::ime1::quantize_a_row_i8;
-            quantize_a_4row_i8 = spacemit_kernels::ime1::quantize_a_4row_i8;
-
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
-                          std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                gemm_kernel     = spacemit_kernels::ime1::gemm_kernel_i8i4;
-                set_kernel_impl = true;
-            }
-        }
-#endif
-        if (!set_kernel_impl) {
+        const gemm_resolve res = resolve_gemm(a_blk_len);
+        if (!res.ok) {
             GGML_ABORT("no kernel implementation found for the block type");
         }
+        const auto gemm_kernel      = res.dense.kernel;
+        const auto quantize_a_i8_r1 = res.dense.quantize_a_r1;
+        const auto quantize_a_i8_r4 = res.dense.quantize_a_r4;
+        const auto a_pack_r4         = res.dense.ap_r4;
+
+        // Dense packs full 4-row groups when it can and falls back to single
+        // rows for the tail, so the quant buffer is indexed with the wider of
+        // the two per-row strides.
+        const int64_t block_stride_a = res.dense.quantize_a_r4 ? res.dense.row_stride_r4 : res.dense.row_stride;
 
         const int64_t a_k_blks = spacemit_kernels::div_round_up(gemm_k, a_blk_len);
         const int64_t b_k_blks = spacemit_kernels::div_round_up(gemm_k, b_blk_len);
@@ -406,12 +463,12 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         if (gemm_m == 1) {
             const int64_t blk_stride_1row =
-                q8_pre() ? (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true) : block_stride_a;
+                q8_al_layout() ? (int64_t) spacemit_kernels::q8_blk_size(a_blk_len, true) : block_stride_a;
             int task_per_thread = spacemit_kernels::div_round_up(a_k_blks, nth);
             int a_blk_start     = ith * task_per_thread;
             int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
             if (a_blk_start < a_blk_end) {
-                quantize_a_row_i8(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
+                quantize_a_i8_r1(a_blk_len, feature + a_blk_start * a_blk_len, (a_blk_end - a_blk_start) * a_blk_len,
                                   quant_a_buffer + a_blk_start * blk_stride_1row);
             }
         } else {
@@ -422,15 +479,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 int m_idx             = m_row_blk * row_align;
                 int rows_tobe_handled = (gemm_m - m_idx) > row_align ? row_align : (gemm_m - m_idx);
 
-                if (rows_tobe_handled == row_align && quantize_a_4row_i8 != nullptr) {
+                if (rows_tobe_handled == row_align && quantize_a_i8_r4 != nullptr) {
                     const float * a_row_ptr       = feature + m_idx * gemm_k;
                     auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
-                    quantize_a_4row_i8(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
+                    quantize_a_i8_r4(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
                 } else {
                     while (rows_tobe_handled) {
                         const float * a_row_ptr       = feature + m_idx * gemm_k;
                         auto *        quant_a_row_ptr = quant_a_buffer + m_idx * row_stride_a;
-                        quantize_a_row_i8(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
+                        quantize_a_i8_r1(a_blk_len, a_row_ptr, gemm_k, quant_a_row_ptr);
                         rows_tobe_handled -= 1;
                         m_idx += 1;
                     }
@@ -470,7 +527,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     int32_t rows_remaining = m_row_real;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(b_blk_len, a_row_ptr, b_col, b_col_zp, c_blk, rows_remaining,
+                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                                        b_blk_len, a_row_ptr, b_col, b_col_zp, c_blk, rows_remaining,
                                                         n_blk_real, b_k_blks, gemm_n);
 
                         c_blk += rows_handled * gemm_n;
@@ -499,7 +557,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         const int64_t nb_real  = std::min(gemm_n - ni, tile_cols);
                         uint8_t *     b_row    = reinterpret_cast<uint8_t *>(w_data) + ni * row_stride_b;
                         uint8_t *     b_row_zp = block_type_has_zp<BLOC_TYPE>() ? b_row : nullptr;
-                        gemm_kernel(b_blk_len, a_row, b_row, b_row_zp, output + ni, 1, nb_real, b_k_blks, gemm_n);
+                        gemm_kernel(spacemit_kernels::a_pack::r1, b_blk_len, a_row, b_row, b_row_zp, output + ni, 1,
+                                    nb_real, b_k_blks, gemm_n);
                     }
                     return;
                 }
@@ -548,7 +607,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     auto *  a_row_cur      = a_row;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
+                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                                        b_blk_len, a_row_cur, b_col, b_col_zp, c_blk, rows_remaining,
                                                         nb_real, b_k_blks, gemm_n);
 
                         c_blk += rows_handled * gemm_n;
@@ -606,7 +666,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     uint8_t * b_col_zp_cur = b_col_zp;
 
                     while (rows_remaining > 0) {
-                        auto rows_handled = gemm_kernel(b_blk_len, a_row, b_col_cur, b_col_zp_cur, c_blk,
+                        auto rows_handled = gemm_kernel(rows_remaining >= 4 ? a_pack_r4 : spacemit_kernels::a_pack::r1,
+                                                        b_blk_len, a_row, b_col_cur, b_col_zp_cur, c_blk,
                                                         rows_remaining, n_blk_real, b_k_blks, gemm_n);
 
                         c_blk += rows_handled * gemm_n;
@@ -642,80 +703,18 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
             int32_t i2;
         };
 
-        spacemit_kernels::quantize_a_row_def           quantize_a_row_i8;
-        spacemit_kernels::gemm_kernel_quantize_def     gemm_kernel;
-        spacemit_kernels::moe_gemm_kernel_quantize_def moe_gemm_kernel_m2 = nullptr;
-        spacemit_kernels::quantize_a_row_def           quantize_a_4row_i8 = nullptr;
-        bool                                           set_kernel_impl = false;
-        size_t                                         block_stride_a  = spacemit_kernels::q8_blk_size(QK4_0);
-
-#if defined(RISCV64_SPACEMIT_IME2)
-        if (!set_kernel_impl && (global_spine_env_info.use_ime2)) {
-            quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8;
-            block_stride_a    = spacemit_kernels::q8_blk_size(QK4_0, true);
-
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q6_K> || std::is_same_v<BLOC_TYPE, block_q8_0>) {
-                gemm_kernel     = spacemit_kernels::ime2::gemm_kernel_i8i8;
-                set_kernel_impl = true;
-                if constexpr (std::is_same_v<BLOC_TYPE, block_q8_0>) {
-                    gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i8_pre;
-                }
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
-                                 std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                if constexpr (INTER_SIZE == 256) {
-                    gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i4_hp;
-                    quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8_hp;
-                    block_stride_a    = spacemit_kernels::q8_hp_blk_size(a_blk_len, true, true);
-                    quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp;
-                    if (hp_aligned()) {
-                        gemm_kernel = spacemit_kernels::ime2::gemm_kernel_i8i4_hp_al;
-                        quantize_a_4row_i8 = spacemit_kernels::rvv::quantize_a_4row_i8_hp_al;
-                    }
-                    set_kernel_impl = true;
-                } else {
-                    gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i4;
-                    moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i4;
-                    quantize_a_row_i8  = spacemit_kernels::rvv::quantize_a_row_i8;
-                    block_stride_a     = spacemit_kernels::q8_blk_size(a_blk_len, true);
-                    set_kernel_impl    = true;
-                }
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q2_K>) {
-                quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8k;
-                block_stride_a    = spacemit_kernels::q8k_blk_size(a_blk_len);
-                gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i2k;
-                set_kernel_impl   = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q3_K>) {
-                quantize_a_row_i8 = spacemit_kernels::rvv::quantize_a_row_i8k;
-                block_stride_a    = spacemit_kernels::q8k_blk_size(a_blk_len);
-                gemm_kernel       = spacemit_kernels::ime2::gemm_kernel_i8i3k;
-                set_kernel_impl   = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_mxfp4>) {
-                gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8mxfp4;
-                moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8mxfp4;
-                set_kernel_impl    = true;
-            } else if constexpr (std::is_same_v<BLOC_TYPE, block_q5_1> || std::is_same_v<BLOC_TYPE, block_q5_K> ||
-                                 std::is_same_v<BLOC_TYPE, block_q5_0>) {
-                gemm_kernel        = spacemit_kernels::ime2::gemm_kernel_i8i5;
-                moe_gemm_kernel_m2 = spacemit_kernels::ime2::moe_m2_gemm_kernel_i8i5;
-                set_kernel_impl    = true;
-            }
-        }
-#endif
-
-#if defined(RISCV64_SPACEMIT_IME1)
-        if (!set_kernel_impl && (global_spine_env_info.use_ime1)) {
-            quantize_a_row_i8 = spacemit_kernels::ime1::quantize_a_row_i8;
-
-            if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> || std::is_same_v<BLOC_TYPE, block_q4_1> ||
-                          std::is_same_v<BLOC_TYPE, block_q4_K>) {
-                gemm_kernel     = spacemit_kernels::ime1::gemm_kernel_i8i4;
-                set_kernel_impl = true;
-            }
-        }
-#endif
-        if (!set_kernel_impl) {
+        const gemm_resolve res = resolve_gemm(a_blk_len);
+        if (!res.ok) {
             GGML_ABORT("no kernel implementation found for the block type");
         }
+        const auto gemm_kernel        = res.moe.kernel;
+        const auto gemm_rows_kernel_m2 = res.gemm_rows;
+        const auto quantize_a_i8_r1   = res.moe.quantize_a_r1;
+        const auto quantize_a_i8_r4   = res.moe.quantize_a_r4;
+        const auto a_pack_r4          = res.moe.ap_r4;
+        const auto a_pack_r8          = spacemit_kernels::a_pack::r8;
+
+        const size_t block_stride_a = res.moe.row_stride;
 
         const size_t a_k_blks = spacemit_kernels::div_round_up(ne10, a_blk_len);
         const size_t b_k_blks = spacemit_kernels::div_round_up(ne10, b_blk_len);
@@ -730,21 +729,21 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
         bool pad8_all = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
-            pad8_all = ids->ne[1] > 1 && quantize_a_4row_i8 != nullptr && ne01 % 32 == 0 && hp_aligned();
+            pad8_all = ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr && ne01 % 32 == 0 && hp_aligned();
         }
 
         if (!pad8_all && ne11 == 1) {
             for (int64_t ii = ith; ii < ne12 * a_k_blks; ii += nth) {
                 int64_t i12       = ii / a_k_blks;
                 int64_t ak_blk_id = ii % a_k_blks;
-                quantize_a_row_i8(a_blk_len, (float *) ((char *) src1->data + i12 * nb12) + ak_blk_id * a_blk_len,
+                quantize_a_i8_r1(a_blk_len, (float *) ((char *) src1->data + i12 * nb12) + ak_blk_id * a_blk_len,
                                   a_blk_len, quant_a_buffer + i12 * nbw2 + ak_blk_id * block_stride_a);
             }
         } else if (!pad8_all) {
             for (int64_t ii = ith; ii < ne12 * ne11; ii += nth) {
                 int64_t i12 = ii / ne11;
                 int64_t i11 = ii % ne11;
-                quantize_a_row_i8(a_blk_len, (float *) ((char *) src1->data + i12 * nb12 + i11 * nb11), ne10,
+                quantize_a_i8_r1(a_blk_len, (float *) ((char *) src1->data + i12 * nb12 + i11 * nb11), ne10,
                                   quant_a_buffer + i12 * nbw2 + i11 * nbw1);
             }
         }
@@ -757,7 +756,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
         int64_t *          valid_matrix_row_counts = (int64_t *) (valid_act_count + 1);
         mmid_row_mapping * matrix_rows             = (mmid_row_mapping *) (valid_matrix_row_counts + n_as);
 
-        const bool use_m4  = quantize_a_4row_i8 != nullptr && ne01 % 32 == 0;
+        const bool use_m4  = quantize_a_i8_r4 != nullptr && ne01 % 32 == 0;
         bool use_m8 = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
             use_m8 = use_m4 && hp_aligned();
@@ -874,11 +873,11 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 uint8_t *     out = m4_quant + m4_expert_offset[cur_a] + n8 * m8_grp_bytes + (r0 - n8 * 8) * nbw1_m4;
                 if (nr < 8 && pad8_all) {
                     memset(m4_a_f32 + nr * ne10, 0, (8 - nr) * ne10 * sizeof(float));
-                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                    spacemit_kernels::rvv::quantize_a_i8_r8_hp(a_blk_len, m4_a_f32, ne10, out);
                 } else if (nr == 8) {
-                    spacemit_kernels::rvv::quantize_a_8row_i8_hp_m8(a_blk_len, m4_a_f32, ne10, out);
+                    spacemit_kernels::rvv::quantize_a_i8_r8_hp(a_blk_len, m4_a_f32, ne10, out);
                 } else {
-                    quantize_a_4row_i8(a_blk_len, m4_a_f32, ne10, out);
+                    quantize_a_i8_r4(a_blk_len, m4_a_f32, ne10, out);
                 }
             }
             ctx.sync();
@@ -956,7 +955,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         spine_barrier_wait(cur_barrier);
                     }
 
-                    gemm_kernel(b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1, nb_real, b_k_blks, ne01);
+                    gemm_kernel(spacemit_kernels::a_pack::r1, b_blk_len, a_row, b_col, b_col_zp, c_blk + ni, 1,
+                                nb_real, b_k_blks, ne01);
 
                     if (has_pair && ith % 2 == 0) {
                         spine_barrier_wait(cur_barrier);
@@ -1016,8 +1016,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                 if (use_m4 && n_cols % 32 == 0 && (cne1 >= 4 || pad8_all)) {
                     const uint8_t * a_grp = m4_quant + m4_expert_offset[cur_a];
                     for (; use_m8 && ir1 + 8 <= src1_cur_end; ir1 += 8, a_grp += m8_grp_bytes) {
-                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
-                                                                       n_cols, b_k_blks, n_cols);
+                        gemm_kernel(a_pack_r8, b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8, n_cols, b_k_blks,
+                                    n_cols);
                         for (int r = 0; r < 8; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
@@ -1026,8 +1026,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                     }
                     if (pad8_all && ir1 < src1_cur_end) {
                         const int nr = (int) (src1_cur_end - ir1);
-                        spacemit_kernels::ime2::gemm_kernel_i8i4_hp_m8(b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8,
-                                                                       n_cols, b_k_blks, n_cols);
+                        gemm_kernel(a_pack_r8, b_blk_len, a_grp, src0_cur, nullptr, m4_c_tmp, 8, n_cols, b_k_blks,
+                                    n_cols);
                         for (int r = 0; r < nr; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
@@ -1036,7 +1036,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         ir1 = src1_cur_end;
                     }
                     for (; ir1 + 4 <= src1_cur_end; ir1 += 4, a_grp += 4 * nbw1_m4) {
-                        gemm_kernel(b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks, n_cols);
+                        gemm_kernel(a_pack_r4, b_blk_len, a_grp, src0_cur, b_col_zp, m4_c_tmp, 4, n_cols, b_k_blks,
+                                    n_cols);
                         for (int r = 0; r < 4; ++r) {
                             const mmid_row_mapping rm = MMID_MATRIX_ROW(cur_a, ir1 + r);
                             float * dst_row = (float *) ((char *) dst->data + (rm.i1 * nb1 + rm.i2 * nb2)) + src0_cur_start;
@@ -1070,7 +1071,7 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         quant_a_tile_buffer = reinterpret_cast<uint8_t *>(extra_tcm_buffer);
                         iir1                = ir1;
 
-                        if (moe_gemm_kernel_m2 != nullptr) {
+                        if (gemm_rows_kernel_m2 != nullptr) {
                             for (; iir1 < (ir1 + quant_a_tile_size - 1); iir1 += 2, quant_a_tile_buffer += 2 * nbw1) {
                                 mmid_row_mapping row_mapping_0 = MMID_MATRIX_ROW(cur_a, iir1);
                                 mmid_row_mapping row_mapping_1 = MMID_MATRIX_ROW(cur_a, iir1 + 1);
@@ -1084,9 +1085,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                                 dst_workspaces[1] = (float *) ((char *) dst->data +
                                                                ((row_mapping_1.i1) * nb1 + (row_mapping_1.i2) * nb2)) +
                                                     src0_cur_start;
-                                moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
-                                                   dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks,
-                                                   ne01);
+                                gemm_rows_kernel_m2(spacemit_kernels::a_pack::r1, b_blk_len, src_workspaces.data(),
+                                                   src0_cur, b_col_zp, dst_workspaces.data(), 1,
+                                                   src0_cur_end - src0_cur_start, b_k_blks, ne01);
                             }
                         }
 
@@ -1095,15 +1096,15 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
 
                             float * y = (float *) ((char *) dst->data + (row_mapping_0.i1 * nb1 + row_mapping_0.i2 * nb2)) +
                                         src0_cur_start;
-                            gemm_kernel(b_blk_len, quant_a_tile_buffer, src0_cur, b_col_zp, y, 1,
-                                        src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            gemm_kernel(spacemit_kernels::a_pack::r1, b_blk_len, quant_a_tile_buffer, src0_cur,
+                                        b_col_zp, y, 1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
                         }
 
 
                         ir1 += quant_a_tile_size;
                     } while (ir1 < src1_cur_end);
                 } else {
-                    if (moe_gemm_kernel_m2 != nullptr) {
+                    if (gemm_rows_kernel_m2 != nullptr) {
                         for (; ir1 < src1_cur_end - 1; ir1 += 2) {
                             for (int iir1 = 0; iir1 < 2; ++iir1) {
                                 mmid_row_mapping row_mapping = MMID_MATRIX_ROW(cur_a, ir1 + iir1);
@@ -1122,8 +1123,9 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                                     (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
                             }
 
-                            moe_gemm_kernel_m2(b_blk_len, src_workspaces.data(), src0_cur, b_col_zp,
-                                               dst_workspaces.data(), 1, src0_cur_end - src0_cur_start, b_k_blks, ne01);
+                            gemm_rows_kernel_m2(spacemit_kernels::a_pack::r1, b_blk_len, src_workspaces.data(),
+                                               src0_cur, b_col_zp, dst_workspaces.data(), 1,
+                                               src0_cur_end - src0_cur_start, b_k_blks, ne01);
                         }
                     }
 
@@ -1141,8 +1143,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_
                         auto * src1_col = quant_a_buffer + (i11 * nbw1 + i12 * nbw2);
 
                         float * y = (float *) ((char *) dst->data + (i1 * nb1 + i2 * nb2)) + src0_cur_start;
-                        gemm_kernel(b_blk_len, src1_col, src0_cur, b_col_zp, y, 1, src0_cur_end - src0_cur_start,
-                                    b_k_blks, ne01);
+                        gemm_kernel(spacemit_kernels::a_pack::r1, b_blk_len, src1_col, src0_cur, b_col_zp, y, 1,
+                                    src0_cur_end - src0_cur_start, b_k_blks, ne01);
                     }
                 }
             }
@@ -1666,10 +1668,10 @@ static const tensor_traits<block_q4_0, 32, 32>  q4_0_32x32_q8_0;
 static const tensor_traits<block_q4_1, 32, 32>  q4_1_32x32_q8_0;
 static const tensor_traits<block_q4_0, 256, 32> q4_0_32x256_q8_0;
 static const tensor_traits<block_q4_1, 256, 32> q4_1_32x256_q8_0;
+static const tensor_traits<block_q4_K, 256, 32> q4_k_32x256_q8_0;
 static const tensor_traits<block_q4_K, 32, 32>  q4_k_32x32_q8_0;
 static const tensor_traits<block_q6_K, 32, 32>  q6_k_32x32_q8_0;
 static const tensor_traits<block_q8_0, 32, 32>  q8_0_32x32_q8_0;
-static const tensor_traits<block_mxfp4, 32, 32> mxfp4_32x32_q8_0;
 static const tensor_traits<block_q5_K, 32, 32>  q5_k_32x32_q8_0;
 static const tensor_traits<block_q5_1, 32, 32>  q5_1_32x32_q8_0;
 
@@ -1737,11 +1739,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q4_1:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
-                // TODO
-                // if (cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
-                //     (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                //     return &ggml::cpu::riscv64_spacemit::q4_1_32x256_q8_0;
-                // }
+                // Q4_1 k256 serves MoE expert tensors (3-dim) with the
+                // bare-nibble + zp-area B encoding and aligned A groups.
+                // Dense Q4_1 stays on the k32 path: the dense k256
+                // registration is not wired up (dense goes to the f16 path).
+                if (cur->ne[2] > 1 && cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::q4_1_32x256_q8_0;
+                }
 
                 if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q4_1_32x32_q8_0;
@@ -1758,6 +1763,14 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
         case GGML_TYPE_Q4_K:
             {
 #if defined(RISCV64_SPACEMIT_IME2)
+                // Q4_K k256 serves MoE expert tensors (3-dim) with the
+                // bare-nibble + zp-area B encoding and aligned A groups.
+                // Dense Q4_K stays on the k32 path (dense goes to f16 later).
+                if (cur->ne[2] > 1 && cur->ne[1] % 32 == 0 && cur->ne[0] % 256 == 0 &&
+                    (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
+                    return &ggml::cpu::riscv64_spacemit::q4_k_32x256_q8_0;
+                }
+
                 if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q4_k_32x32_q8_0;
                 }
@@ -1785,16 +1798,6 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
                     return &ggml::cpu::riscv64_spacemit::q8_0_32x32_q8_0;
                 }
-#endif
-            }
-            break;
-        case GGML_TYPE_MXFP4:
-            {
-#if defined(RISCV64_SPACEMIT_IME2)
-                // TODO
-                // if (cur->ne[1] % 32 == 0 && (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                //     return &ggml::cpu::riscv64_spacemit::mxfp4_32x32_q8_0;
-                // }
 #endif
             }
             break;
@@ -1907,9 +1910,6 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             break;
         case GGML_TYPE_Q3_K:
             nbytes = remap_block_nbytes(sizeof(block_q3_K), sizeof(spacemit_kernels::nrow_block_q3_k<1>));
-            break;
-        case GGML_TYPE_MXFP4:
-            nbytes = remap_block_nbytes(sizeof(block_mxfp4), sizeof(spacemit_kernels::nrow_block_mxfp4<1>));
             break;
         case GGML_TYPE_Q5_K:
             nbytes = remap_block_nbytes(sizeof(block_q5_K), sizeof(spacemit_kernels::nrow_block_q5_1<1>) * 8);
