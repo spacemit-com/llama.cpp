@@ -2,6 +2,7 @@
 #include "ggml.h"
 #include "ime_kernels.h"
 #include "rvv_kernels.h"
+#include "spe_kernels.h"
 #include "string.h"
 
 #include <algorithm>
@@ -1945,141 +1946,117 @@ void gemm_kernel_i8i4_m1(const uint8_t * quant_a_ptr,
     }
 }
 
-void gemm_kernel_i8i4_hp_m1(const uint8_t * quant_a_ptr,
-                            const uint8_t * quant_b_data,
-                            const uint8_t * quant_b_zp,
-                            float *         c_ptr,
-                            size_t          count_n,
-                            size_t          k_blks) {
-    constexpr size_t NB_COLS                = 32;
-    constexpr size_t k_subblks_per_superblk = 8;
-    constexpr size_t k_subblk_len           = 32;
+// Q41Block<32,32,2>-layout variant of gemm_kernel_i8i4_m1 (decode GEMV) for
+// the f16 traits' M == 1 route: same vmadot hp inner loop and same A-side
+// layout, but B blocks come from the Q41 repack instead of the legacy
+// block_q4_0x32.  Only the B field offsets and block stride differ:
+//   legacy block_q4_0x32 (576B): scale @ +0,  data @ +64,  stride 576
+//   Q41Block<32,32,2>   (608B): data  @ +0,  scale @ +544, stride 608
+// (608 = 512B data + 32B zp + 64B scale; zp[0]=8 matches the implicit 8 the
+// legacy path bakes into the vmv.v.i v28, 8 correction).  The nibble order
+// and the [rows/32][kblocks] block indexing are identical between the two
+// repacks, so the vmadot core is reused verbatim.  Per-row tile pitch is
+// 608/32 = 19 bytes.
+void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
+                             const uint8_t * quant_b_data,
+                             float *         c_ptr,
+                             size_t          count_n,
+                             size_t          k_blks) {
+    for (size_t n = 0; n < count_n; n += 32) {
+        size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
+        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + n * k_blks * 19;  // n * k_blks * 608/32
+        float *   CPtr          = c_ptr + n;
+        size_t    cnt           = k_blks;
 
-    // B-side layout: one K256 superblock is 8 K32 subblocks; each subblock is
-    // a 576 B block (64 B fp16 scale[32] then 512 B q4 payload), optionally
-    // followed by a zp area of 8 x 32 B inside the same superblock.
-    constexpr size_t b_scale_bytes          = NB_COLS * sizeof(_Float16);
-    constexpr size_t b_subblk_payload       = 16 * NB_COLS;
-    constexpr size_t b_subblk_stride        = b_scale_bytes + b_subblk_payload;
-    constexpr size_t b_superblk_data_stride = b_subblk_stride * k_subblks_per_superblk;
-    constexpr size_t b_zp_subblk_stride     = NB_COLS * sizeof(uint8_t);
+        __asm__ volatile(
 
-    // A-side layout (one row, one K256 block): 8 x ([fp16 subblock scale]
-    // [32 B data]) = 272 B, then 8 fp16 a-sums, then one fp16 average scale.
-    constexpr size_t a_subblk_stride = sizeof(_Float16) + k_subblk_len;
-    constexpr size_t a_sum_off       = a_subblk_stride * k_subblks_per_superblk;
-    constexpr size_t a_scale_avg_off = a_sum_off + k_subblks_per_superblk * sizeof(_Float16);
+            // t3 = k/32
+            "mv           t3, %[BCK]              \n\t"
+            "mv           t4, %[NBLKS]            \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.i      v0, 1                   \n\t"  // init the scale
+            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
+            "addi         s3, %[pA], 4+2          \n\t"  // s3 = pAData, (pA+AScl+ASum)
+            "addi         s4, %[pB], 512+32       \n\t"  // s4 = pBSCL, (pB+Data+zp)
+            "mv           s5, %[pB]               \n\t"  // s5 = pBdata;
+            "mv           s6, %[pC]               \n\t"
 
-    static_assert(b_subblk_stride == 576 && b_superblk_data_stride == 4608, "B layout");
-    static_assert(a_subblk_stride == 34 && a_sum_off == 272 && a_scale_avg_off == 288, "A layout");
-    // One row's K256 block must stay the q8 HP row block the caller
-    // quantizes and strides with.
-    static_assert(a_scale_avg_off + sizeof(_Float16) == q8_hp_blk_size(256, true, true), "A row stride");
+            "vsll.vi      v1, v0, 4               \n\t"
+            "vxor.vv      v2, v0, v0              \n\t"  // clear acc
+            "vfcvt.f.x.v  v0, v0                  \n\t"
+            "vfcvt.f.x.v  v1, v1                  \n\t"
 
-    const size_t b_superblk_stride =
-        b_superblk_data_stride + (quant_b_zp ? b_zp_subblk_stride * k_subblks_per_superblk : 0);
-    const size_t b_tile_stride = k_blks * b_superblk_stride;
+            // vmadot hp: vle*7 flw*1 vecIns*14 vmadot*8
+            ".align 4                             \n\t"
+            "_K_LPST%=:                           \n\t"
 
-    if (quant_b_zp == NULL) {
-        for (size_t ni = 0; ni < count_n; ni += 32) {
-            uint8_t * b_data = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
-            int8_t *  a_data = (int8_t *) quant_a_ptr;
-            float *   dst_c  = c_ptr + ni;
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vl4r.v       v4, (s5)                \n\t"  // B Data 4VRF * 8Row * 32
+            "addi         s5, s5, 128*4+96        \n\t"  // 1024bit + zp, Q41 block 608B
 
-            asm volatile(
-                "vsetvli        t0, x0, e16, m1         \n\t"
-                "vxor.vv        v31, v31, v31           \n\t"  // init acc to zero
-                "mv             t4, %[BK]               \n\t"
-                "li             t0, 0x4c00              \n\t"  // 16 in fp16
-                "fmv.h.x        fa0, t0                 \n\t"
+            "vsetvli      t0, x0, e8, mf2         \n\t"
+            "vle8.v       v30, (s4)               \n\t"  // B Scale 4VRF*8Row*FP16 = 512bit
+            "addi         s4, s4, 96+128*4        \n\t"
 
-                ".align 4                               \n\t"
-                "BLK_LOOP%=:                            \n\t"
-                "li             t5, %[K_SUBBLKS]        \n\t"
-                "addi           t6, %[A], %[A_SCALE_AVG_OFF] \n\t"  // point to blk scale
-                "flh            ft1, (t6)               \n\t"
-                "addi           t6, %[A], %[A_SUM_OFF]  \n\t"  // point to asum
+            "vsetvli      t0, x0, e8, mf4         \n\t"
+            "vle8.v       v3, (s3)                \n\t"  // A Data M1*K32*int8 = 256bit
+            "addi         s3, s3, 32+6            \n\t"
 
-                // init the acc fp16
-                "vsetvli        t0, x0, e16, m1         \n\t"
-                "vxor.vv        v16, v18, v18           \n\t"
-                "vxor.vv        v17, v18, v18           \n\t"
-                "vxor.vv        v18, v18, v18           \n\t"
-                "vxor.vv        v19, v18, v18           \n\t"
+            "flw          f0, (s2)                \n\t"  // A Scale fp32
+            "lh           t2, 4(s2)               \n\t"  // A sum of int16
+            "addi         s2, s2, 6+32            \n\t"
 
-                "INNER_BLK_LOOP%=:                      \n\t"
-                // load a sum and scale
-                "flh            fa1, (t6)               \n\t"
-                "addi           t6, t6, 2               \n\t"
-                "flh            ft0, (%[A])             \n\t"
-                "addi           %[A], %[A], 2           \n\t"
-                // load A
-                "vsetvli        t0, x0, e8, mf4         \n\t"
-                "vle8.v         v3, (%[A])              \n\t"  // 1x32@i8
-                "addi           %[A], %[A], 32          \n\t"
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmv.v.i      v28, 8                  \n\t"  // Bzp u8 -> u16 (Q41 zp[0]=8)
+            "vsetvli      t0, x0, e8, m1          \n\t"
+            "vsrl.vi      v24, v3, 4              \n\t"
 
-                // load scale B and B
-                "vsetvli        t0, x0, e16, mf2        \n\t"
-                "vle16.v        v8, (%[B])              \n\t"  // b_scale fp16
-                "addi           %[B], %[B], %[B_SCALE_BYTES] \n\t"
-                "vl4r.v         v4, (%[B])              \n\t"  // 32*32@i4
-                "addi           %[B], %[B], %[B_SUBBLK_PAYLOAD] \n\t"
-                "vfmul.vf       v8, v8, ft0             \n\t"  // scale b * scale a
-                "vfmul.vf       v9, v8, fa0             \n\t"
-                "vfmul.vf       v10, v8, fa1            \n\t"  // scale b * scale a * asm
-                "vfwmacc.vf     v31, ft1, v10           \n\t"  // asum * scale a * scale b * blk scale
+            "vsetvli      t0, x0, e16, m1         \n\t"
+            "vmul.vx      v26, v28, t2            \n\t"  // asum*zp i16*i16
+            "vnpack4.vv   v8, v3, v3, 3           \n\t"  // lo4 of A
+            "vnpack4.vv   v10, v24, v24, 3        \n\t"  // hi4 of A
 
-                "vsetvli        t0, x0, e8, m1          \n\t"
-                "vpack.vv       v0, v8, v9, 3           \n\t"
-                "vsrl.vi        v28, v3, 4              \n\t"
+            "vfcvt.f.x.v  v16, v26                \n\t"  // zp i16 -> fp16
+            "vadd.vi      v18, v16, 0             \n\t"
+            "vadd.vi      v20, v16, 0             \n\t"
+            "vadd.vi      v22, v16, 0             \n\t"
 
-                "vsetvli        t0, x0, e16, m1         \n\t"
-                "vnpack4.vv     v2, v3, v3, 3           \n\t"  // lo4 of A
-                "vnpack4.vv     v3, v28, v28, 3         \n\t"  // hi4 of A
+            "vmadotsu.hp  v16, v10, v4, v1, 0, i4 \n\t"  // high 4
+            "vmadotsu.hp  v18, v10, v5, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v20, v10, v6, v1, 0, i4 \n\t"
+            "vmadotsu.hp  v22, v10, v7, v1, 0, i4 \n\t"
+            "vmadotu.hp   v16, v8, v4, v0, 0, i4  \n\t"  // low 4
+            "vmadotu.hp   v18, v8, v5, v0, 0, i4  \n\t"
+            "vmadotu.hp   v20, v8, v6, v0, 0, i4  \n\t"
+            "vmadotu.hp   v22, v8, v7, v0, 0, i4  \n\t"
 
-                // i4 * i4 vmadot
-                "vsetvli        t0, x0, e16, m1         \n\t"
-                "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"  // high 4
-                "vmadotsu.hp    v17, v3, v5, v0, 5, i4  \n\t"
-                "vmadotsu.hp    v18, v3, v6, v0, 6, i4  \n\t"
-                "vmadotsu.hp    v19, v3, v7, v0, 7, i4  \n\t"
-                "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"  // low 4
-                "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
-                "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
-                "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
+            "vpack.vv     v24, v16, v18, 1        \n\t"
+            "vpack.vv     v26, v20, v22, 1        \n\t"
+            "vpack.vv     v16, v24, v26, 2        \n\t"
 
-                "addi           t5, t5, -1              \n\t"
-                "bgtz           t5, INNER_BLK_LOOP%=    \n\t"
+            "vsetvli      t0, x0, e16, mf2        \n\t"
+            // mac result * b_scale; f16*f16->f32
+            "vfwmul.vv     v31, v30, v16          \n\t"
 
-                "vpack.vv       v8, v16, v17, 1         \n\t"
-                "vpack.vv       v12, v18, v19, 1        \n\t"
-                "vpack.vv       v20, v8, v12, 2         \n\t"
+            "vsetvli      t0, x0, e32, m1         \n\t"
+            // static_cast<float>(qsum * b_scale) * a_scale;
+            "vfmacc.vf    v2, f0, v31             \n\t"
 
-                "vsetvli        t0, x0, e16, mf2        \n\t"
-                "addi           t4, t4, -1              \n\t"
-                "vfwmacc.vf     v31, ft1, v20           \n\t"
-                //"vsetvli        t0, x0, e32, m1         \n\t"
-                //"vfmul.vf       v31, v31, ft1           \n\t"  // blk scale
+            "addi         t3, t3, -1              \n\t"
+            "bgtz         t3, _K_LPST%=           \n\t"
+            "_K_LPND%=:                           \n\t"
 
-                // update A ptr
-                "addi           %[A], t6, 2             \n\t"
+            //-----------------------------------------
+            // STORE Equal 32N-------------------------
+            "_ST32%=:                             \n\t"
+            "vsetvli      t0, t4, e32, m1         \n\t"
+            "vse32.v      v2, (s6)                \n\t"  // M0 [N0 : N32]; FP32(1024bit)
 
-                "bgtz           t4, BLK_LOOP%=          \n\t"
+            "_FUNC_END%=:                         \n\t"
 
-                // save
-                "vsetvli        t0, x0, e32, m1         \n\t"
-                "vse32.v        v31, (%[DST])           \n\t"
-                : [A] "+r"(a_data), [B] "+r"(b_data)
-                : [DST] "r"(dst_c), [BK] "r"(k_blks), [K_SUBBLKS] "i"(k_subblks_per_superblk),
-                  [A_SUM_OFF] "i"(a_sum_off), [A_SCALE_AVG_OFF] "i"(a_scale_avg_off),
-                  [B_SCALE_BYTES] "i"(b_scale_bytes), [B_SUBBLK_PAYLOAD] "i"(b_subblk_payload)
-                : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9",
-                  "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
-                  "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "ft0", "ft1");
-        }
-    } else {
-        // TODO: support quant_b_zp for i8i4 hp kernel
-        GGML_ABORT("gemm_kernel_i8i4_hp_m1 with quant_b_zp is not supported yet");
+            :
+            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
+            : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
     }
 }
 
@@ -2431,415 +2408,6 @@ void gemm_kernel_i8i4_m4(const uint8_t * quant_a_ptr,
                   "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24",
                   "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "fa3", "s1", "s2", "s3", "s4");
         }
-    }
-}
-
-void gemm_kernel_i8i4_hp_m4(const uint8_t * quant_a_ptr,
-                            const uint8_t * quant_b_data,
-                            const uint8_t * quant_b_zp,
-                            float *         c_ptr,
-                            size_t          count_n,
-                            size_t          k_blks,
-                            size_t          ldc) {
-    constexpr size_t NB_COLS                = 32;
-    constexpr size_t K_SUBBLKS_PER_SUPERBLK = 8;
-    constexpr size_t K_SUBBLK_LEN           = 32;
-
-    // Contract:
-    // - computes a 4-row x 32-col tile per inner invocation
-    // - A is q8 HP packed in m4 layout, one logical K256 block at a time
-    // - B is q4 HP packed in N32 tiles, optionally with a separate zp area
-    // - tail-N is currently not handled here; the caller must provide full N32 tiles
-
-    // B-side layout: one K256 superblock is 8 K32 subblocks; each subblock is
-    // a 576 B block (64 B fp16 scale[32] then 512 B q4 payload). An optional
-    // zp area of 8 x 32 B follows the payload area inside the same superblock.
-    constexpr size_t b_scale_bytes          = NB_COLS * sizeof(_Float16);
-    constexpr size_t b_subblk_payload       = 16 * NB_COLS;
-    constexpr size_t b_subblk_stride        = b_scale_bytes + b_subblk_payload;
-    constexpr size_t b_superblk_data_stride = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
-    constexpr size_t b_zp_subblk_stride     = NB_COLS * sizeof(uint8_t);
-
-    // A-side layout: one K32 subblock stores the 4 fp16 row scales (8 B) then
-    // the 4 x 32 B row payload lanes (128 B); after 8 subblocks a 72 B trailer
-    // holds the 4 rows x 8 fp16 a-sums and then the 4 fp16 average scales.
-    constexpr size_t a_subblk_scale_bytes = 4 * sizeof(_Float16);
-    constexpr size_t a_subblk_stride      = a_subblk_scale_bytes + 4 * K_SUBBLK_LEN;
-    constexpr size_t a_sum_off            = a_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
-    constexpr size_t a_sum_row_stride     = K_SUBBLKS_PER_SUPERBLK * sizeof(_Float16);
-    constexpr size_t a_scale_avg_off      = 4 * a_sum_row_stride;
-    constexpr size_t a_trailer_bytes      = a_scale_avg_off + 4 * sizeof(_Float16);
-
-    static_assert(b_subblk_stride == 576 && b_superblk_data_stride == 4608 && b_zp_subblk_stride == 32, "B layout");
-    static_assert(a_subblk_stride == 136 && a_sum_off == 1088 && a_scale_avg_off == 64 && a_trailer_bytes == 72,
-                  "A layout");
-    // One m4 group must stay the 4-row q8 HP row block the quantizer emits.
-    static_assert(a_sum_off + a_trailer_bytes == q8_hp_blk_size(256, true, true) * 4, "A group stride");
-    // With zp, s6 walks B + b_superblk_data_stride + 8 x b_zp_subblk_stride
-    // inside the loop, so it lands exactly on the next superblock base.
-    static_assert(b_superblk_data_stride + K_SUBBLKS_PER_SUPERBLK * b_zp_subblk_stride == 4864,
-                  "with-zp superblock stride");
-
-    const size_t b_superblk_stride =
-        b_superblk_data_stride + (quant_b_zp ? b_zp_subblk_stride * K_SUBBLKS_PER_SUPERBLK : 0);
-    const size_t b_tile_stride = k_blks * b_superblk_stride;
-
-    if (quant_b_zp != nullptr) {
-        for (size_t ni = 0; ni < count_n; ni += NB_COLS) {
-            const size_t nb_real = std::min<size_t>(NB_COLS, count_n - ni);
-            if (nb_real != NB_COLS) {
-                break;
-            }
-
-            uint8_t * b_tile_base = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
-            uint8_t * a_block     = (uint8_t *) quant_a_ptr;
-            float *   dst_c       = c_ptr + ni;
-
-            // Data layout summary for the with-zp path.
-            //
-            // A: M4 x K256 q8 HP block
-            //   - split into 8 x K32 subblocks
-            //   - each K32 subblock is 136B:
-            //       8B   = 4 x fp16 row scales
-            //       128B = 4 x int8[32] row payloads
-            //   - trailer after 8 subblocks is 72B:
-            //       4 rows x fp16[8] a_sum values, indexed as [row][ksi]
-            //       4 rows x fp16 scale_avg tail
-            //
-            // B: N32 x K256 q4 HP block with explicit zp area
-            //   - each K32 subblock is 576B:
-            //       64B  = fp16 scale[32]
-            //       512B = packed q4 payload for 32 columns x 32 k-elements
-            //   - zp is stored separately, not interleaved with the 576B payload block
-            //   - one K256 superblock is laid out as:
-            //       8 x (scale + qs) blocks = 4608B
-            //       8 x zp[32]              =  256B
-            //
-            // C: 4 rows x 32 fp32 outputs
-            //
-            // ASM pointer convention:
-            //   - t6: current A K32 subblock base
-            //   - t2: current A a_sum base for this ksi
-            //         row1/row2/row3 are at +16/+32/+48 bytes
-            //   - s5: current B (scale + qs) K32 subblock base
-            //   - s6: current B zp[32] base for this ksi
-            //
-            // Loop progression:
-            //   - per ksi: A += 136, a_sum += 2, B_data += 576, B_zp += 32
-            //   - per ki : skip the 72B A trailer and advance B to the next 4864B superblock
-
-            const _Float16 hp_scale_16   = (_Float16) 16.0f;
-            const _Float16 hp_scale_1    = (_Float16) 1.0f;
-            const _Float16 hp_scale_0125 = (_Float16) 0.125f;
-
-            // VPR grouping used below:
-            // - v4-v7   : B q4 payload for N32 split as 4 x N8 groups
-            // - v8/v10  : zp u8 / widened fp16
-            // - v12     : B fp16 scale[32]
-            // - v14-v15 : packed (Bscale * Ascale) for rows [0,1] / [2,3]
-            // - v16-v19 : temporary per-row scaled B scales
-            // - v28-v31 : final fp32 accumulators for rows 0..3
-
-            asm volatile(
-                "mv             t5, %[BK]                 \n\t"
-                "mv             t6, %[A]                  \n\t"
-                "mv             s5, %[B]                  \n\t"
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vxor.vv        v28, v28, v28             \n\t"
-                "vxor.vv        v29, v29, v29             \n\t"
-                "vxor.vv        v30, v30, v30             \n\t"
-                "vxor.vv        v31, v31, v31             \n\t"
-                "li             t4, %[K_SUBBLKS]          \n\t"
-                "li             t1, %[B_SUPERBLK_DATA_STRIDE] \n\t"
-                "addi           t2, t6, %[A_SUM_OFF]      \n\t"  // a_sum trailer starts here
-                "add            s6, s5, t1                \n\t"  // zp area starts after the B data area
-
-                ".align 4                                 \n\t"
-                "_BLK_LPST%=:                             \n\t"
-                "flh            fa1, %[A_SCALE_AVG_OFF](t2) \n\t"  // a_scale_avg_row[0]
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vxor.vv        v18, v30, v30             \n\t"
-                "vxor.vv        v19, v31, v31             \n\t"
-                "vxor.vv        v20, v30, v30             \n\t"
-                "vxor.vv        v21, v31, v31             \n\t"
-                "_KsubBLK_LPST%=:                         \n\t"
-                // load first subblock scales for 4 rows
-                "flh            fa0,   0(t6)              \n\t"  // ascale_fp16
-
-                // load B fp16 scales[32]
-                "vsetvli        t0, x0, e16, mf2          \n\t"
-                "vle16.v        v12, (s5)                 \n\t"
-
-                // load Bzp[32] for the current ksi from the dedicated zp area
-                "vsetvli        t0, x0, e8, mf4           \n\t"
-                "vle8.v         v8, (s6)                  \n\t"
-
-                "fmul.h         fa2, fa0, %[HP16]         \n\t"
-                "vfwcvt.f.xu.v  v10, v8                   \n\t"  // uint8 -> fp16
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"
-                "vfmul.vf       v16, v12, fa0             \n\t"  // row0: Bscale * Ascale
-                "vfmul.vf       v17, v12, fa2             \n\t"
-
-                // load a_sum[row][ksi] from the trailer; t2 points to row0[ksi]
-                "flh            ft1, 0(t2)                \n\t"
-                "flh            ft2, 16(t2)               \n\t"
-                "flh            ft3, 32(t2)               \n\t"
-                "flh            ft4, 48(t2)               \n\t"
-
-                "fmul.h         ft1, ft1, %[HP0125]       \n\t"
-                "fmul.h         ft2, ft2, %[HP0125]       \n\t"
-                "fmul.h         ft3, ft3, %[HP0125]       \n\t"
-                "fmul.h         ft4, ft4, %[HP0125]       \n\t"
-
-                // load A payload from current K32 subblock and B q4 payload from current 576B block
-                "addi           t3, t6, %[A_SUBBLK_SCALE_BYTES] \n\t"
-                "vsetvli        t0, x0, e8, m1            \n\t"
-                "vl1r.v         v0, (t3)                  \n\t"  //A
-                "addi           t3, s5, %[B_SCALE_BYTES]  \n\t"
-                "vl4r.v         v4, (t3)                  \n\t"  //B
-
-                "vsetvli        t0, x0, e8, m1            \n\t"
-                "vsrl.vi        v1, v0, 4                 \n\t"
-                "vnpack4.vv     v12, v0, v1, 3            \n\t"
-                "vpack.vv       v0, v17, v16, 3           \n\t"
-                "vupack.vv      v2, v12, v12, 2           \n\t"
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"  // mf2 -> mf2
-                "vfmul.vv       v10, v10, v16             \n\t"  // zp * ascale * bscale; fp16*fp16
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"  // mf2 -> m1
-                "vfmul.vf       v12, v10, ft1             \n\t"  // zp(1:n)* abscale * asum_m0; fp16*fp16
-                "vfmul.vf       v13, v10, ft2             \n\t"  // zp(1:n)* abscale * asum_m1; fp16*fp16
-                "vfmul.vf       v24, v10, ft3             \n\t"  // zp(1:n)* abscale * asum_m2; fp16*fp16
-                "vfmul.vf       v25, v10, ft4             \n\t"  // zp(1:n)* abscale * asum_m3; fp16*fp16
-
-                "vsetvli        t0, x0, e16, mf2           \n\t"
-                "vfwmacc.vf     v28, fa1, v12             \n\t"  // row0/1 accum += dot * packed scale
-                "vfwmacc.vf     v29, fa1, v13             \n\t"
-                "vfwmacc.vf     v30, fa1, v24             \n\t"
-                "vfwmacc.vf     v31, fa1, v25             \n\t"
-
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vmadotsu.hp    v18, v3, v4, v0, 0, i4    \n\t"  //lo4;n0n7
-                "vmadotsu.hp    v19, v3, v5, v0, 1, i4    \n\t"  //lo4;n8n15
-                "vmadotsu.hp    v20, v3, v6, v0, 2, i4    \n\t"  //lo4;n16n23
-                "vmadotsu.hp    v21, v3, v7, v0, 3, i4    \n\t"  //lo4;n24n31
-                "vmadotu.hp     v18, v2, v4, v0, 4, i4    \n\t"  //hi4;n0n7
-                "vmadotu.hp     v19, v2, v5, v0, 5, i4    \n\t"  //hi4;n8n15
-                "vmadotu.hp     v20, v2, v6, v0, 6, i4    \n\t"  //hi4;n16n23
-                "vmadotu.hp     v21, v2, v7, v0, 7, i4    \n\t"  //hi4;n24n31
-
-                "addi           t4, t4, -1                \n\t"
-                "addi           t6, t6, %[A_SUBBLK_STRIDE] \n\t"  // next A K32 subblock
-                "addi           t2, t2, 2                 \n\t"  // next ksi entry in each a_sum row
-                "addi           s5, s5, %[B_SUBBLK_STRIDE] \n\t"  // next B (scale + qs) K32 block
-                "addi           s6, s6, %[B_ZP_SUBBLK_STRIDE] \n\t"  // next zp[32]
-                "bgtz           t4, _KsubBLK_LPST%=       \n\t"
-
-                "vsetvli        t0, x0, e16, m1           \n\t"
-                "vpack.vv       v8, v18, v19, 1           \n\t"  // 128(16*8)->256(16*16)
-                "vpack.vv       v12, v20, v21, 1          \n\t"
-                "vpack.vv       v26, v8, v12, 2           \n\t"  // 256(16*16)->512(16*32)
-
-                "vsetvli        t0, x0, e16, m1           \n\t"
-                "vfwmacc.vf     v28, fa1, v26             \n\t"  // row0/1 accum += dot * packed scale
-                "vfwmacc.vf     v30, fa1, v27             \n\t"
-
-                "li             t4, %[K_SUBBLKS]          \n\t"
-                "addi           t5, t5, -1                \n\t"
-                "addi           t6, t6, %[A_TRAILER_BYTES] \n\t"  // skip A trailer after 8 subblocks and scale_avg tail
-                "mv             s5, s6                    \n\t"  // s6 already points to next B superblock base
-                "addi           t2, t6, %[A_SUM_OFF]      \n\t"  // a_sum trailer starts here
-                "add            s6, s5, t1                \n\t"  // zp area starts after the B data area
-                "bgtz           t5, _BLK_LPST%=           \n\t"
-
-                "_BLK_LPND%=:                             \n\t"
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "add            t2, %[LDC], %[DST]        \n\t"
-                "vse32.v        v28, (%[DST])             \n\t"
-                "add            t3, %[LDC], t2            \n\t"
-                "vse32.v        v29, (t2)                 \n\t"
-                "add            t2, %[LDC], t3            \n\t"
-                "vse32.v        v30, (t3)                 \n\t"
-                "vse32.v        v31, (t2)                 \n\t"
-                : [A] "+r"(a_block), [B] "+r"(b_tile_base)
-                : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16),
-                  [HP1] "f"(hp_scale_1), [HP0125] "f"(hp_scale_0125), [K_SUBBLKS] "i"(K_SUBBLKS_PER_SUPERBLK),
-                  [B_SUPERBLK_DATA_STRIDE] "i"(b_superblk_data_stride), [B_SCALE_BYTES] "i"(b_scale_bytes),
-                  [B_SUBBLK_STRIDE] "i"(b_subblk_stride), [B_ZP_SUBBLK_STRIDE] "i"(b_zp_subblk_stride),
-                  [A_SUBBLK_SCALE_BYTES] "i"(a_subblk_scale_bytes), [A_SUBBLK_STRIDE] "i"(a_subblk_stride),
-                  [A_SUM_OFF] "i"(a_sum_off), [A_SCALE_AVG_OFF] "i"(a_scale_avg_off),
-                  [A_TRAILER_BYTES] "i"(a_trailer_bytes)
-                : "t0", "t1", "t2", "t3", "t4", "t5", "t6", "s5", "s6", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-                  "v8", "v10", "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v24",
-                  "v25", "v26", "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "ft1", "ft2", "ft3", "ft4",
-                  "memory");
-        }
-        return;
-    } else {
-        for (size_t ni = 0; ni < count_n; ni += NB_COLS) {
-            const size_t nb_real = std::min<size_t>(NB_COLS, count_n - ni);
-            if (nb_real != NB_COLS) {
-                break;
-            }
-
-            uint8_t * b_tile_base = (uint8_t *) quant_b_data + (ni / NB_COLS) * b_tile_stride;
-            uint8_t * a_block     = (uint8_t *) quant_a_ptr;
-            float *   dst_c       = c_ptr + ni;
-
-            // Data layout summary for the no-zp path.
-            //
-            // A layout is identical to the with-zp branch.
-            //
-            // B: N32 x K256 q4 HP block without explicit zp storage
-            //   - each K32 subblock is still 576B:
-            //       64B  = fp16 scale[32]
-            //       512B = packed q4 payload
-            //   - zp is implicit and treated as a constant value 8 in the kernel
-            //   - one K256 superblock therefore contains only:
-            //       8 x (scale + qs) blocks = 4608B
-            //
-            // C: 4 rows x 32 fp32 outputs
-            //
-            // ASM pointer convention:
-            //   - t6: current A K32 subblock base
-            //   - t2: current A a_sum base for this ksi
-            //   - s5: current B (scale + qs) K32 subblock base
-            //
-            // Loop progression:
-            //   - per ksi: A += 136, a_sum += 2, B_data += 576
-            //   - per ki : skip the 72B A trailer and advance B to the next 4608B superblock
-
-            const _Float16 hp_scale_16 = (_Float16) 16.0f;
-            const _Float16 hp_scale_1  = (_Float16) 1.0f;
-
-            // VPR grouping used below matches the with-zp path:
-            // - v4-v7   : B q4 payload for N32 split as 4 x N8 groups
-            // - v8/v10  : implicit zp lane / widened fp16
-            // - v12     : B fp16 scale[32]
-            // - v14-v15 : packed (Bscale * Ascale) for rows [0,1] / [2,3]
-            // - v16-v19 : temporary per-row scaled B scales
-            // - v28-v31 : final fp32 accumulators for rows 0..3
-
-            asm volatile(
-                "mv             t5, %[BK]                 \n\t"
-                "mv             t6, %[A]                  \n\t"
-                "mv             s5, %[B]                  \n\t"
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vxor.vv        v28, v28, v28             \n\t"
-                "vxor.vv        v29, v29, v29             \n\t"
-                "vxor.vv        v30, v30, v30             \n\t"
-                "vxor.vv        v31, v31, v31             \n\t"
-                "li             t4, %[K_SUBBLKS]          \n\t"
-                "addi           t2, t6, %[A_SUM_OFF]      \n\t"  // a_sum trailer starts here
-
-                ".align 4                                 \n\t"
-                "_BLK_LPST%=:                             \n\t"
-                "flh            fa1, %[A_SCALE_AVG_OFF](t2) \n\t"  // a_scale_avg_row[0]
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vxor.vv        v18, v30, v30             \n\t"
-                "vxor.vv        v19, v31, v31             \n\t"
-                "vxor.vv        v20, v30, v30             \n\t"
-                "vxor.vv        v21, v31, v31             \n\t"
-                "_KsubBLK_LPST%=:                         \n\t"
-                // load first subblock scales for 4 rows
-                "flh            fa0,   0(t6)              \n\t"  // ascale_fp16
-
-                // load B fp16 scales[32]
-                "vsetvli        t0, x0, e16, mf2          \n\t"
-                "vle16.v        v12, (s5)                 \n\t"
-
-                "fmul.h         fa2, fa0, %[HP16]         \n\t"
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"
-                "vfmul.vf       v16, v12, fa0             \n\t"  // row0: Bscale * Ascale
-                "vfmul.vf       v17, v12, fa2             \n\t"
-
-                // load a_sum[row][ksi] from the trailer; t2 points to row0[ksi]
-                "flh            ft1, 0(t2)                \n\t"
-                "flh            ft2, 16(t2)               \n\t"
-                "flh            ft3, 32(t2)               \n\t"
-                "flh            ft4, 48(t2)               \n\t"
-
-                // load A payload from current K32 subblock and B q4 payload from current 576B block
-                "addi           t3, t6, %[A_SUBBLK_SCALE_BYTES] \n\t"
-                "vsetvli        t0, x0, e8, m1            \n\t"
-                "vl1r.v         v0, (t3)                  \n\t"  //A
-                "addi           t3, s5, %[B_SCALE_BYTES]  \n\t"
-                "vl4r.v         v4, (t3)                  \n\t"  //B
-
-                "vsetvli        t0, x0, e8, m1            \n\t"
-                "vsrl.vi        v1, v0, 4                 \n\t"
-                "vnpack4.vv     v12, v0, v1, 3            \n\t"
-                "vpack.vv       v0, v17, v16, 3           \n\t"
-                "vupack.vv      v2, v12, v12, 2           \n\t"
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"  // mf2 -> m1
-                "vfmul.vf       v12, v16, ft1             \n\t"  // zp(1:n)* abscale * asum_m0; fp16*fp16
-                "vfmul.vf       v13, v16, ft2             \n\t"  // zp(1:n)* abscale * asum_m1; fp16*fp16
-                "vfmul.vf       v24, v16, ft3             \n\t"  // zp(1:n)* abscale * asum_m2; fp16*fp16
-                "vfmul.vf       v25, v16, ft4             \n\t"  // zp(1:n)* abscale * asum_m3; fp16*fp16
-
-                "vsetvli        t0, x0, e16, mf2          \n\t"
-                "vfwmacc.vf     v28, fa1, v12             \n\t"
-                "vfwmacc.vf     v29, fa1, v13             \n\t"
-                "vfwmacc.vf     v30, fa1, v24             \n\t"
-                "vfwmacc.vf     v31, fa1, v25             \n\t"
-
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "vmadotsu.hp    v18, v3, v4, v0, 0, i4    \n\t"  //lo4;n0n7
-                "vmadotsu.hp    v19, v3, v5, v0, 1, i4    \n\t"  //lo4;n8n15
-                "vmadotsu.hp    v20, v3, v6, v0, 2, i4    \n\t"  //lo4;n16n23
-                "vmadotsu.hp    v21, v3, v7, v0, 3, i4    \n\t"  //lo4;n24n31
-                "vmadotu.hp     v18, v2, v4, v0, 4, i4    \n\t"  //hi4;n0n7
-                "vmadotu.hp     v19, v2, v5, v0, 5, i4    \n\t"  //hi4;n8n15
-                "vmadotu.hp     v20, v2, v6, v0, 6, i4    \n\t"  //hi4;n16n23
-                "vmadotu.hp     v21, v2, v7, v0, 7, i4    \n\t"  //hi4;n24n31
-
-                "addi           t4, t4, -1                \n\t"
-
-                "addi           t6, t6, %[A_SUBBLK_STRIDE] \n\t"  // next A K32 subblock
-                "addi           t2, t2, 2                 \n\t"  // next ksi entry in each a_sum row
-                "addi           s5, s5, %[B_SUBBLK_STRIDE] \n\t"  // next B (scale + qs) K32 block
-                "bgtz           t4, _KsubBLK_LPST%=       \n\t"
-
-                "vsetvli        t0, x0, e16, m1           \n\t"  //N32in1register
-                "vpack.vv       v8, v18, v19, 1           \n\t"  // 128(16*8)->256(16*16)
-                "vpack.vv       v12, v20, v21, 1          \n\t"
-                "vpack.vv       v26, v8, v12, 2           \n\t"  // 256(16*16)->512(16*32)
-
-                "vsetvli        t0, x0, e16, m1           \n\t"
-                "vfwmacc.vf     v28, fa1, v26             \n\t"  // row0/1 accum += dot * packed scale
-                "vfwmacc.vf     v30, fa1, v27             \n\t"
-
-                "li             t4, %[K_SUBBLKS]          \n\t"
-                "addi           t5, t5, -1                \n\t"
-                "addi           t6, t6, %[A_TRAILER_BYTES] \n\t"  // skip A trailer after 8 subblocks and scale_avg tail
-                // s5 already points to next B superblock base
-                "addi           t2, t6, %[A_SUM_OFF]      \n\t"  // a_sum trailer starts here
-                "bgtz           t5, _BLK_LPST%=           \n\t"
-
-                "_BLK_LPND%=:                             \n\t"
-                "vsetvli        t0, x0, e32, m1           \n\t"
-                "add            t2, %[LDC], %[DST]        \n\t"
-                "vse32.v        v28, (%[DST])             \n\t"
-                "add            t3, %[LDC], t2            \n\t"
-                "vse32.v        v29, (t2)                 \n\t"
-                "add            t2, %[LDC], t3            \n\t"
-                "vse32.v        v30, (t3)                 \n\t"
-                "vse32.v        v31, (t2)                 \n\t"
-                : [A] "+r"(a_block), [B] "+r"(b_tile_base)
-                : [DST] "r"(dst_c), [LDC] "r"(ldc * 4), [BK] "r"(k_blks), [HP16] "f"(hp_scale_16), [HP1] "f"(hp_scale_1),
-                  [K_SUBBLKS] "i"(K_SUBBLKS_PER_SUPERBLK), [B_SCALE_BYTES] "i"(b_scale_bytes),
-                  [B_SUBBLK_STRIDE] "i"(b_subblk_stride), [A_SUBBLK_SCALE_BYTES] "i"(a_subblk_scale_bytes),
-                  [A_SUBBLK_STRIDE] "i"(a_subblk_stride), [A_SUM_OFF] "i"(a_sum_off),
-                  [A_SCALE_AVG_OFF] "i"(a_scale_avg_off), [A_TRAILER_BYTES] "i"(a_trailer_bytes)
-                : "t0", "t2", "t3", "t4", "t5", "t6", "s5", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v10",
-                  "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v24", "v25", "v26",
-                  "v27", "v28", "v29", "v30", "v31", "fa0", "fa1", "fa2", "ft1", "ft2", "ft3", "ft4", "memory");
-        }
-        return;
     }
 }
 
@@ -5123,37 +4691,27 @@ size_t gemm_i8i4_k32(a_pack          ap,
 }
 
 size_t gemm_i8i4_k256(a_pack          ap,
-                             size_t          blk_len,
-                             const uint8_t * quant_a_ptr,
-                             const uint8_t * quant_b_data,
-                             const uint8_t * quant_b_zp,
-                             float *         c_ptr,
-                             size_t          count_m,
-                             size_t          count_n,
-                             size_t          k_blks,
-                             size_t          ldc) {
+                      size_t          blk_len,
+                      const uint8_t * quant_a_ptr,
+                      const uint8_t * quant_b_data,
+                      const uint8_t * quant_b_zp,
+                      float *         c_ptr,
+                      size_t          count_m,
+                      size_t          count_n,
+                      size_t          k_blks,
+                      size_t          ldc) {
     GGML_ASSERT(blk_len == 256);
-    if (count_m >= 4) {
-        GGML_ASSERT(ap == a_pack::r4);
-        gemm_kernel_i8i4_hp_m4(quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_n, k_blks, ldc);
-        return 4;
+    if (quant_b_zp != nullptr) {
+        // Q4_1 / Q4_K: bare-nibble B with the dedicated zero-point area.
+        if (count_m >= 4) {
+            GGML_ASSERT(ap == a_pack::r4_al);
+            gemm_kernel_i8i4_hpzp_al_m4(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
+            return 4;
+        }
+        gemm_kernel_i8i4_hpzp_m1(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
+        return 1;
     }
-    gemm_kernel_i8i4_hp_m1(quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_n, k_blks);
-    return 1;
-}
-
-size_t gemm_i8i4_k256_q40fast(a_pack          ap,
-                          size_t          blk_len,
-                          const uint8_t * quant_a_ptr,
-                          const uint8_t * quant_b_data,
-                          const uint8_t * quant_b_zp,
-                          float *         c_ptr,
-                          size_t          count_m,
-                          size_t          count_n,
-                          size_t          k_blks,
-                          size_t          ldc) {
-    GGML_ASSERT(blk_len == 256);
-    GGML_ASSERT(quant_b_zp == nullptr);
+    // Q4_0: offset-nibble B with the zero point folded into the nibbles.
     if (count_m >= 8) {
         GGML_ASSERT(ap == a_pack::r8);
         gemm_kernel_i8i4_hp_al_m8(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
@@ -5165,27 +4723,6 @@ size_t gemm_i8i4_k256_q40fast(a_pack          ap,
         return 4;
     }
     gemm_kernel_i8i4_hp_al_m1(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
-    return 1;
-}
-
-size_t gemm_i8i4_k256_zp(a_pack          ap,
-                         size_t          blk_len,
-                         const uint8_t * quant_a_ptr,
-                         const uint8_t * quant_b_data,
-                         const uint8_t * quant_b_zp,
-                         float *         c_ptr,
-                         size_t          count_m,
-                         size_t          count_n,
-                         size_t          k_blks,
-                         size_t          ldc) {
-    GGML_ASSERT(blk_len == 256);
-    GGML_ASSERT(quant_b_zp != nullptr);
-    if (count_m >= 4) {
-        GGML_ASSERT(ap == a_pack::r4_al);
-        gemm_kernel_i8i4_hpzp_al_m4(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
-        return 4;
-    }
-    gemm_kernel_i8i4_hpzp_m1(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
     return 1;
 }
 
@@ -5238,6 +4775,165 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
     GGML_ASSERT(blk_len == 32);
     moe_gemm_kernel_i8i5_m2_impl(quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_n, k_blks);
     return 2;
+}
+
+void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(count_m > 0 && count_m <= 16);
+    GGML_ASSERT(count_n > 0 && count_n <= 32);
+    GGML_ASSERT(gemm_k % 8 == 0);
+    // The spine mmt4d kernel has no accumulate epilogue (C = A @ B only).
+    GGML_ASSERT(!accumulate);
+
+    // Same native [K/8][M16|N32][K8] A/B layouts as the f32 kernel.  kc counts
+    // K8 groups and c_stride is a byte row stride; each row store is one
+    // vse16.v of count_n f16, so the caller must 64B-align c_ptr to keep one
+    // store inside a single DDR bank.
+    mlir::speir::spekernel::ime2::_spe_hpgemm_impl_m16n32k8_none(
+        count_m, count_n, gemm_k / 8, a_f16_k8, b_f16_k8, reinterpret_cast<int8_t *>(c_ptr),
+        ldc * sizeof(_Float16));
+}
+
+// f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
+// M-split schedule (whole K loop inside one call, C written straight to the
+// f32 output).  A/B native [K/8][M16|N32][K8] layouts; accumulate=true seeds
+// the accumulators from c_ptr's rows first.
+void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        float *          c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(count_m > 0 && count_m <= 16);
+    GGML_ASSERT(count_n > 0 && count_n <= 32);
+    GGML_ASSERT(gemm_k % 8 == 0);
+    // count_n < 32 with a partial-M accumulate seed is not supported (every
+    // call site gates on N % 32 == 0, so tiles are always full N32).
+    GGML_ASSERT(count_m == 16 || count_n == 32 || !accumulate);
+
+    alignas(128) float tile[16 * 32];
+    const _Float16 * a0            = a_f16_k8;
+    const _Float16 * a1            = a_f16_k8 + 64;
+    const _Float16 * b0            = b_f16_k8;
+    const _Float16 * b1            = b_f16_k8 + 64;
+    const _Float16 * b2            = b_f16_k8 + 128;
+    const _Float16 * b3            = b_f16_k8 + 192;
+    size_t           kc_left       = gemm_k / 8;
+    // The vfwmadot accumulators (v16-v31) hold an internal 8x8-dot-tile pair
+    // layout -- the vpack unpack butterfly below only turns them into 16
+    // row-major N32 rows at the very end -- so an accumulate chunk must NOT
+    // preload its C seed into those registers: a row-major seed garbles
+    // straight through the butterfly, with an error that grows with the K
+    // already behind the seed.  (Dense never caught this: every correctness
+    // shape was single-chunk; multi-chunk split-N shapes only ever ran in
+    // llama-bench.)  Accumulate (and partial-M) calls instead run the kernel
+    // with zeroed accumulators into the local tile and add the seed back in
+    // the scalar epilogue below, which is layout-agnostic.
+    const bool       via_tile      = accumulate || count_m != 16;
+    float *          out           = via_tile ? tile : c_ptr;
+    const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
+
+    asm volatile(
+        "vsetvli t0, zero, e32, m8, tu, mu\n\t"
+        "vxor.vv v16, v16, v16\n\t"
+        "vxor.vv v24, v24, v24\n\t"
+        "vsetvli t0, zero, e16, m1, tu, mu\n\t"
+        "1:\n\t"
+        "vle16.v v0,  (%[a0])\n\t"
+        "vle16.v v1,  (%[a1])\n\t"
+        "vle16.v v8,  (%[b0])\n\t"
+        "vle16.v v9,  (%[b1])\n\t"
+        "vle16.v v10, (%[b2])\n\t"
+        "vle16.v v11, (%[b3])\n\t"
+        "vfwmadot v16, v0, v8\n\t"
+        "vfwmadot v18, v0, v9\n\t"
+        "vfwmadot v20, v0, v10\n\t"
+        "vfwmadot v22, v0, v11\n\t"
+        "vfwmadot v24, v1, v8\n\t"
+        "vfwmadot v26, v1, v9\n\t"
+        "vfwmadot v28, v1, v10\n\t"
+        "vfwmadot v30, v1, v11\n\t"
+        "addi %[a0], %[a0], 256\n\t"
+        "addi %[a1], %[a1], 256\n\t"
+        "addi %[b0], %[b0], 512\n\t"
+        "addi %[b1], %[b1], 512\n\t"
+        "addi %[b2], %[b2], 512\n\t"
+        "addi %[b3], %[b3], 512\n\t"
+        "addi %[kc], %[kc], -1\n\t"
+        "bnez %[kc], 1b\n\t"
+        // Official IME2 accumulator unpack sequence.  It transforms the
+        // eight 8x8 dot-product tiles into 16 row-major N32 vectors.
+        "vsetvli t0, zero, e32, m1, tu, mu\n\t"
+        "vpack.vv v0,  v16, v18, 2\n\t"
+        "vpack.vv v2,  v20, v22, 2\n\t"
+        "vpack.vv v4,  v17, v19, 2\n\t"
+        "vpack.vv v6,  v21, v23, 2\n\t"
+        "vpack.vv v8,  v24, v26, 2\n\t"
+        "vpack.vv v10, v28, v30, 2\n\t"
+        "vpack.vv v12, v25, v27, 2\n\t"
+        "vpack.vv v14, v29, v31, 2\n\t"
+        "vpack.vv v16, v0,  v2,  3\n\t"
+        "vpack.vv v18, v1,  v3,  3\n\t"
+        "vpack.vv v20, v4,  v6,  3\n\t"
+        "vpack.vv v22, v5,  v7,  3\n\t"
+        "vpack.vv v24, v8,  v10, 3\n\t"
+        "vpack.vv v26, v9,  v11, 3\n\t"
+        "vpack.vv v28, v12, v14, 3\n\t"
+        "vpack.vv v30, v13, v15, 3\n\t"
+        "vsetvli t0, %[count_n], e32, m1, tu, mu\n\t"
+        "vse32.v v16, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v17, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v18, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v19, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v20, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v21, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v22, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v23, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v24, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v25, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v26, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v27, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v28, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v29, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v30, (%[out])\n\t"
+        "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v31, (%[out])\n\t"
+        : [a0] "+r"(a0), [a1] "+r"(a1), [b0] "+r"(b0), [b1] "+r"(b1), [b2] "+r"(b2), [b3] "+r"(b3), [kc] "+r"(kc_left),
+          [out] "+r"(out)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes)
+        : "cc", "memory", "t0", "t1", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+          "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
+          "v29", "v30", "v31");
+
+    if (via_tile) {
+        for (size_t m = 0; m < count_m; ++m) {
+            for (size_t n = 0; n < count_n; ++n) {
+                c_ptr[m * ldc + n] = accumulate ? c_ptr[m * ldc + n] + tile[m * 32 + n] : tile[m * 32 + n];
+            }
+        }
+    }
 }
 
 }  // namespace ime2

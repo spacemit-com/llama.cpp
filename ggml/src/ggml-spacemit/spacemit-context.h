@@ -6,6 +6,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 
 struct spacemit_opnode;  // forward declaration (defined in spacemit-opnode.h)
 
@@ -56,6 +57,12 @@ class tensor_traits_base {
         return false;
     }
     virtual int  repack(ggml_tensor * tensor, const void * data, size_t size) const     = 0;
+
+    // convert the physically stored tensor back to the ggml layout; traits that
+    // change the physical layout should override this (default: raw copy)
+    virtual void unpack(const ggml_tensor * tensor, void * data, size_t size) const {
+        memcpy(data, tensor->data, size);
+    }
 };
 
 }  // namespace ggml::spacemit

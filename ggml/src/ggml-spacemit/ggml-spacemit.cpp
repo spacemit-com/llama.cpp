@@ -449,7 +449,15 @@ static void ggml_backend_spacemit_buffer_get_tensor(ggml_backend_buffer_t buffer
                                                      void *                data,
                                                      size_t                offset,
                                                      size_t                size) {
-    memcpy(data, (const char *) tensor->data + offset, size);
+    // Repacked tensors are stored in a physical layout; convert whole-tensor
+    // reads back to the ggml layout so consumers (e.g. test-backend-ops input
+    // copies to the CPU reference) see the original data. Partial reads keep
+    // the raw physical bytes, matching the set_tensor atomic-upload contract.
+    if (tensor->extra && offset == 0 && size == ggml_nbytes(tensor)) {
+        ggml_riscv64_spacemit_unpack_tensor(tensor, data, size);
+    } else {
+        memcpy(data, (const char *) tensor->data + offset, size);
+    }
     GGML_UNUSED(buffer);
 }
 

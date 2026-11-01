@@ -83,7 +83,10 @@ static_assert(sizeof(nrow_block_q5_0<1>) == 22, "wrong nrow_block_q5_0 block siz
 //                  per row count; internal to ime2_kernels.cpp.  A leaf takes
 //                  only the buffers, count_n, k_blks and (for m > 1) ldc: the
 //                  row count, block length and zp presence are implied by the
-//                  entry that dispatches to it.
+//                  entry that dispatches to it.  (Exception: the f16 tile
+//                  kernels and the Q41 GEMV leaf below are declared here
+//                  because the f16 tensor traits in ime.cpp calls them
+//                  directly.)
 //
 // A pack ops (rvv / ime1): quantize_a_<bits>_r<rows>[_<layout>] — e.g.
 // quantize_a_i8_r4_hp packs 4 rows into the k256 hp family group layout.
@@ -153,6 +156,16 @@ size_t gemm_i8i4_k32(a_pack          ap,
                      size_t          k_blks,
                      size_t          ldc);
 
+// Q4 family k256 entry: N32xK256 superblock B, serving the MoE expert
+// tensors' r8/r4_al/r1 A groups (the dense Q4 MUL_MAT runs on the f16
+// traits instead).  The zero-point pointer selects the B encoding:
+// nullptr = Q4_0's offset-nibble encoding (the repack twists qs ^ 0x88),
+// where the vmadot/vmadotus pair folds the fixed zero point into the i4
+// dot product and skips it as a separate term; non-null = Q4_1 / Q4_K's
+// bare-nibble encoding with a dedicated zero-point area (repacked from
+// Q4_1 or Q4_K), where the vmadotsu/vmadotu dot pair runs on natural
+// unsigned B nibbles and the zero-point correction is applied as an
+// explicit term.
 size_t gemm_i8i4_k256(a_pack          ap,
                       size_t          blk_len,
                       const uint8_t * quant_a_ptr,
@@ -163,37 +176,6 @@ size_t gemm_i8i4_k256(a_pack          ap,
                       size_t          count_n,
                       size_t          k_blks,
                       size_t          ldc);
-
-// Q4_0 fast path: N32xK256 superblock B in the offset-nibble encoding
-// (repack twists qs ^ 0x88 for 3-dim expert tensors), so the vmadot/vmadotus
-// pair folds the zero-point correction into the i4 dot product and skips it
-// as a separate term.  Serves the MoE r8/r4_al/r1 A groups.
-size_t gemm_i8i4_k256_q40fast(a_pack          ap,
-                         size_t          blk_len,
-                         const uint8_t * quant_a_ptr,
-                         const uint8_t * quant_b_data,
-                         const uint8_t * quant_b_zp,
-                         float *         c_ptr,
-                         size_t          count_m,
-                         size_t          count_n,
-                         size_t          k_blks,
-                         size_t          ldc);
-
-// Q4_1 / Q4_K fast path: N32xK256 superblock B in the bare-nibble encoding
-// with a dedicated zero-point area (repacked from Q4_1 or Q4_K), so the
-// vmadotsu/vmadotu dot pair runs on natural unsigned B nibbles and the
-// zero-point correction is applied as an explicit term.  Serves the MoE
-// r4_al/r1 A groups.
-size_t gemm_i8i4_k256_zp(a_pack          ap,
-                         size_t          blk_len,
-                         const uint8_t * quant_a_ptr,
-                         const uint8_t * quant_b_data,
-                         const uint8_t * quant_b_zp,
-                         float *         c_ptr,
-                         size_t          count_m,
-                         size_t          count_n,
-                         size_t          k_blks,
-                         size_t          ldc);
 
 size_t gemm_i8i8_k32(a_pack          ap,
                      size_t          blk_len,
@@ -238,5 +220,47 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
                          size_t           count_n,
                          size_t           k_blks,
                          size_t           ldc);
+
+// ---- f16 matmul kernels (dense Q4 MUL_MAT on the f16 compute path).  These
+// are tile kernels called directly by the f16 tensor traits in ime.cpp, not
+// family entries: count_m/count_n are the real extents of one M16xN32 tile
+// (tail masking), not a row loop count. ----
+
+// M1 i8i4 GEMV over the Q41Block<32,32,2> weight layout (the Q41 repack): B
+// data sits at block+0 and the per-row fp16 scales at block+544 (608B
+// blocks, 19B per-row pitch) instead of the legacy block_q4_0x32
+// [scale@+0 | data@+64] (576B, 18B pitch).  zp=8 is implicit.  The decode
+// (M == 1) route of the f16 traits: f16 GEMM is prefill-only.
+void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
+                             const uint8_t * quant_b_data,
+                             float *         c_ptr,
+                             size_t          count_n,
+                             size_t          k_blks);
+
+// f16 GEMM inner-kernel wrapper around spine-kernel's _spe_hpgemm_impl_m16n32k8_none.
+// a/b are the native [K/8][M16|N32][K8] f16 layouts, gemm_k is the K extent,
+// ldc counts f16 rows of the output tile.
+void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate);
+
+// f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
+// M-split schedule (whole K loop inside one call, C written straight to the
+// f32 output).  a/b are the same native [K/8][M16|N32][K8] f16 layouts;
+// accumulate=true seeds the accumulators from c_ptr's rows first, ldc counts
+// f32 rows of the output tile.
+void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        float *          c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate = false);
 }  // namespace ime2
 }  // namespace spacemit_kernels
