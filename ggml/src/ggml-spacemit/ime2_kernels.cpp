@@ -1501,7 +1501,7 @@ void gemm_kernel_i8i4_m1(const uint8_t * quant_a_ptr,
                          float *         c_ptr,
                          size_t          count_n,
                          size_t          k_blks) {
-    constexpr size_t blk_len = 32;  // k32 leaf: the entry fixes the block length
+    constexpr size_t blk_len = 32;
     if (quant_b_zp == NULL) {
         for (size_t n = 0; n < count_n; n += 32) {
             size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
@@ -1946,19 +1946,13 @@ void gemm_kernel_i8i4_m1(const uint8_t * quant_a_ptr,
     }
 }
 
-// Decode GEMV for the common Q41Block layout used by Q4_0/Q4_1/Q4_K.
-// Every row and K32 block supplies its own uint8 zero point; Q4_0 stores 8.
-// Accumulate the integer dot and zero-point correction in INT32, then scale
-// and accumulate in FP32. No source quantization type is needed here.
+// A stores (dA, -sum(qA), qA); B has a uint8 zero point per row and K32 block.
+// Compute dot(qA,qB) - zpB*sum(qA) in INT32 before applying FP32 scales.
 void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
                            const uint8_t * quant_b_data,
                            float *         c_ptr,
                            size_t          count_n,
                            size_t          k_blks) {
-    // A stores (dA, -sum(qA), qA). Read each row's uint8 zero point
-    // from the unchanged Q41Block and correct the dot in INT32:
-    // C += dA * scaleB * (dot(qA,qB) + zpB * stored_negative_sum).
-    // Both the unsigned zero point and its product must avoid I8/I16 truncation.
     using block_type = ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>;
     static_assert(sizeof(block_type) == 608 && offsetof(block_type, zp) == 512 && offsetof(block_type, scale) == 544);
     for (size_t n = 0; n < count_n; n += 32) {
@@ -2444,30 +2438,20 @@ void gemm_kernel_i8i4_hp_al_m4(const uint8_t * quant_a_ptr,
     constexpr size_t b_subblk_payload        = 16 * NB_COLS;
     constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
     constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
-    constexpr size_t a_data_bytes            = 8 * 4 * 32;  // 8 K32 subblocks x 4 rows x 32 B data lanes
-    constexpr size_t a_scale_bytes           = 8 * 4 * sizeof(_Float16);  // per-subblock 4 row scales
-    constexpr size_t a_sum_bytes             = 4 * 8 * sizeof(_Float16);  // 4 rows x 8 subblock a-sums
+    // A group order: K32 data lanes, subblock scales, a_sum[row][subblock], average scales.
+    constexpr size_t a_data_bytes            = 8 * 4 * 32;
+    constexpr size_t a_scale_bytes           = 8 * 4 * sizeof(_Float16);
+    constexpr size_t a_sum_bytes             = 4 * 8 * sizeof(_Float16);
     constexpr size_t a_scale_avg_bytes       = 4 * sizeof(_Float16);
-    // t2 walks the subblock scales starting at the scale area (a_data_bytes,
-    // +16 per K32 subblock); the group's 4 average scales follow the a_sum
-    // trailer at the end of the group.
     constexpr size_t a_scale_off             = a_data_bytes;
     constexpr size_t a_sum_off               = a_scale_off + a_scale_bytes;
     constexpr size_t a_scale_avg_off         = a_sum_off + a_sum_bytes - a_scale_off;
     static_assert(b_superblk_stride == 4608, "B superblock layout");
     static_assert(q8_hp_m4al_blk_size == 1216, "A superblock layout");
     static_assert(a_sum_off == 1088 && a_scale_avg_off == 128, "m4al A group offsets");
-    // B-side offsets: each K32 subblock of the superblock is a 576 B block
-    // (64 B fp16 scales then 512 B q4 payload); the unrolled loop strides two
-    // subblocks at a time (2 * 576). Payload offsets used by the load macros:
-    // next subblock payload 576 + 64 = 640, subblock 3 payload 2 * 576 + 64 = 1216.
-    // A-side: each unrolled step consumes 2 x 4-row x 32 B subblock lanes
-    // (256 B); the tail step closes the 1216 B group after 7 of 8 subblocks.
     constexpr size_t b_2subblk_stride = 2 * b_subblk_stride;
     constexpr size_t b_next_payload    = b_subblk_stride + b_scale_bytes;
     constexpr size_t b_3rd_payload     = 2 * b_subblk_stride + b_scale_bytes;
-    // One K32 subblock holds 4 rows x 32 B lanes (128 B); the unrolled loop
-    // consumes two subblocks per step, the tail step closes the 1216 B group.
     constexpr size_t a_subblk_stride   = 4 * k_subblk_len;
     constexpr size_t a_loop_step       = 2 * a_subblk_stride;
     constexpr size_t a_grp_tail_step   = q8_hp_m4al_blk_size - 3 * a_loop_step;
@@ -2613,29 +2597,18 @@ void gemm_kernel_i8i4_hp_al_m8(const uint8_t * quant_a_ptr,
     constexpr size_t b_subblk_payload       = 16 * NB_COLS;
     constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
     constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
-    constexpr size_t a_scale_off            = 8 * 8 * 32;  // 8 K32 subblocks x 8 rows x 32 B data lanes
-    // B-side offsets for the m8 load macros: first payload after the 64 B
-    // scale area, next payloads at 576 + 64 = 640 and 2 * 576 + 64 = 1216; the
-    // unrolled loop strides two subblocks (2 * 576). A-side: one subblock is 8
-    // lo lanes (128 B) then 8 hi lanes (+128); each unrolled step consumes two
-    // subblocks (512 B); the tail step closes the 2176 B group after 7 of 8.
+    constexpr size_t a_scale_off            = 8 * 8 * 32;
     constexpr size_t b_2subblk_stride       = 2 * b_subblk_stride;
     constexpr size_t b_next_payload         = b_subblk_stride + b_scale_bytes;
     constexpr size_t b_3rd_payload          = 2 * b_subblk_stride + b_scale_bytes;
-    // A-side: one K32 subblock stores 8 lo-nibble lanes then 8 hi-nibble
-    // lanes (128 B each, one 16 B lane per row); the unrolled loop consumes
-    // two subblocks per step, the tail step closes the 2176 B group.
+    // A stores eight 16-byte low-nibble lanes, then eight high-nibble lanes per K32 block.
     constexpr size_t a_hi_lane_off          = 8 * (k_subblk_len / 2);
     constexpr size_t a_subblk_stride        = 2 * a_hi_lane_off;
     constexpr size_t a_subblk_stride_plus_hi = a_subblk_stride + a_hi_lane_off;
     constexpr size_t a_loop_step            = 2 * a_subblk_stride;
     constexpr size_t a_grp_tail_step        = q8_hp_m8_blk_size - 3 * a_loop_step;
-    // A-side offsets used by the m8 load macros: the next subblock's lo/hi
-    // lanes at t6 + a_subblk_stride / + a_subblk_stride_plus_hi, the subblock
-    // after that at t6 + a_loop_step / + a_loop_step + a_hi_lane_off.
     constexpr size_t a_loop_step_plus_hi    = a_loop_step + a_hi_lane_off;
     static_assert(a_scale_off == 2048, "m8 A group scale offset");
-    // scale[8] (the group's average scale) is at t2 + 16 once t2 = t6 + a_scale_off.
     static_assert(b_superblk_stride == 4608, "B superblock layout");
     static_assert(q8_hp_m8_blk_size == 2176, "A superblock layout");
     static_assert(b_2subblk_stride == 1152 && b_next_payload == 640 && b_3rd_payload == 1216, "B offsets");
@@ -2659,9 +2632,9 @@ void gemm_kernel_i8i4_hp_al_m8(const uint8_t * quant_a_ptr,
             "vmv.v.i        v14, 0                    \n\t"
             ".align 4                                 \n\t"
             "_HPM8_BLK%=:                             \n\t"
-            "addi           t2, t6, %[A_SCALE_OFF] - 1   \n\t"  // t2 = t6 + 2048, split to keep the offset in imm range
+            "addi           t2, t6, %[A_SCALE_OFF] - 1   \n\t"  // Split +2048 to fit signed 12-bit immediates.
             "addi           t2, t2, 1                 \n\t"
-            "flh            fa1, 16(t2)               \n\t"  // 16 = scale[8], the group's average scale
+            "flh            fa1, 16(t2)               \n\t"  // scale[8]: group average.
             "vsetvli        t0, x0, e16, m1           \n\t"
             "vmv.v.i        v16, 0                    \n\t"
             "vmv.v.i        v17, 0                    \n\t"
@@ -2748,12 +2721,9 @@ void gemm_kernel_i8i4_hp_al_m1(const uint8_t * quant_a_ptr,
     constexpr size_t b_subblk_payload       = 16 * NB_COLS;
     constexpr size_t b_subblk_stride         = b_scale_bytes + b_subblk_payload;
     constexpr size_t b_superblk_stride       = b_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
-    // A is a single natural-layout hp row: per K256 block, 8 x [f16 scale +
-    // 32 B payload] then 8 f16 a-sums, then the row's average scale.
+    // A K256 row: 8 x [FP16 scale, 32-byte data], FP16 a_sum[8], FP16 average scale.
     constexpr size_t a_sum_off               = K_SUBBLKS_PER_SUPERBLK * (sizeof(_Float16) + k_subblk_len);
     constexpr size_t a_scale_avg_off         = a_sum_off + K_SUBBLKS_PER_SUPERBLK * sizeof(_Float16);
-    // One natural-layout A row block: 8 x [f16 scale + 32 B payload], then the
-    // 16 B a-sum trailer and the 2 B average scale.
     constexpr size_t a_row_blk_stride        = a_scale_avg_off + sizeof(_Float16);
     static_assert(b_superblk_stride == 4608, "B superblock layout");
     static_assert(a_sum_off == 272 && a_scale_avg_off == 288, "natural-layout single-row A offsets");
@@ -2843,18 +2813,8 @@ void gemm_kernel_i8i4_hp_al_m1(const uint8_t * quant_a_ptr,
     }
 }
 
-// K256 hp kernels for B block types that carry an explicit zero-point (Q4_1 /
-// Q4_K repacked to the bare-nibble layout).  B nibbles are natural unsigned
-// values, so the dot pair is vmadotsu (A hi plane, signed x unsigned B) /
-// vmadotu (A lo plane, unsigned x unsigned), and each superblock adds the
-// correction
-//   acc[r][n] += scale_avg * zp[ksi][n] * (bscale*ascale)[ksi][n] * (-sum_a[r][ksi])
-// (a_sum is stored as -8*sum(q); the kernels fold the 1/8 into the
-// accumulator scale).  The m4 leaf runs the correction as a pre-pass over the
-// superblock, before the dot loop head re-initialises v18-v27, walking the al
-// A-group trailer (a_sum[4][8] at +1088, scale_avg at +1152) and the B zp
-// area (superblock base + 4608).  The m1 leaf consumes a single natural
-// 290 B A row and folds the correction inline per subblock.
+// B retains unsigned nibbles and a separate zp; A stores a_sum = -8*sum(qA).
+// The zp correction therefore uses scale_avg/8 before accumulating in FP32.
 
 #define HPZP_MM8(H0, H1, H2, H3, L0, L1, L2, L3, AH, AL, B0, B1, B2, B3, S) \
     "vmadotsu.hp   " H0 ", " AH ", " B0 ", " S ", 0, i4 \n\t"             \
@@ -2918,19 +2878,12 @@ void gemm_kernel_i8i4_hpzp_al_m4(const uint8_t * quant_a_ptr,
     constexpr size_t b_zp_subblk_stride     = NB_COLS;
     constexpr size_t b_zp_area_bytes        = b_zp_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
     constexpr size_t b_superblk_stride      = b_superblk_data_stride + b_zp_area_bytes;
-    // A is one al group: 1024 B data lanes, 8 x 8 B subblock scale slots,
-    // a_sum[4][8] (row stride 16 B), scale_avg at the very end.
+    // A group order: data lanes, subblock scales, a_sum[4][8], average scales.
     constexpr size_t a_data_bytes           = 8 * 4 * 32;
     constexpr size_t a_scale_off            = a_data_bytes;
     constexpr size_t a_sum_off              = a_scale_off + 8 * 8;
     constexpr size_t a_scale_avg_abs_off    = a_sum_off + 4 * 16;
-    constexpr size_t a_scale_avg_off        = a_scale_avg_abs_off - a_scale_off;  // t2-relative (dot head)
-    // B-side offsets: each K32 subblock of the superblock is a 576 B block
-    // (64 B fp16 scales then 512 B q4 payload); the unrolled loop strides two
-    // subblocks at a time (2 * 576). Payload offsets used by the load macros:
-    // next subblock payload 576 + 64 = 640, subblock 3 payload 2 * 576 + 64 = 1216.
-    // A-side: each unrolled step consumes 2 x 4-row x 32 B subblock lanes
-    // (256 B); the tail step closes the 1216 B group after 7 of 8 subblocks.
+    constexpr size_t a_scale_avg_off        = a_scale_avg_abs_off - a_scale_off;  // Relative to t2.
     constexpr size_t b_2subblk_stride       = 2 * b_subblk_stride;
     constexpr size_t b_next_payload         = b_subblk_stride + b_scale_bytes;
     constexpr size_t b_3rd_payload          = 2 * b_subblk_stride + b_scale_bytes;
@@ -2963,8 +2916,7 @@ void gemm_kernel_i8i4_hpzp_al_m4(const uint8_t * quant_a_ptr,
 
             ".align 4                                 \n\t"
             "_HPZP_BLK%=:                             \n\t"
-            // zp-correction pre-pass over the 8 K32 subblocks:
-            // acc[r][n] += (scale_avg*0.125) * zp[ksi][n] * (bscale*ascale)[ksi][n] * a_sum[r][ksi]
+            // Apply the zp correction before the dot loop reuses these registers.
             "mv             s5, s7                    \n\t"
             "add            s6, s7, t1                \n\t"
             "addi           t2, t6, %[A_SUM_OFF]      \n\t"
@@ -3052,7 +3004,6 @@ void gemm_kernel_i8i4_hpzp_al_m4(const uint8_t * quant_a_ptr,
             "vfwmacc.vf     v28, fa1, v26             \n\t"
             "vfwmacc.vf     v30, fa1, v27             \n\t"
 
-            // skip the zp area and advance the superblock base
             "addi           s5, s5, %[B_ZP_AREA_BYTES] \n\t"
             "mv             s7, s5                    \n\t"
             "addi           t5, t5, -1                \n\t"
@@ -3106,8 +3057,7 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
     constexpr size_t b_zp_subblk_stride     = NB_COLS;
     constexpr size_t b_zp_area_bytes        = b_zp_subblk_stride * K_SUBBLKS_PER_SUPERBLK;
     constexpr size_t b_superblk_stride      = b_superblk_data_stride + b_zp_area_bytes;
-    // A is a single natural-layout hp row: per K256 block, 8 x [f16 scale +
-    // 32 B payload] then 8 f16 a-sums, then the row's average scale.
+    // A K256 row: 8 x [FP16 scale, 32-byte data], FP16 a_sum[8], FP16 average scale.
     constexpr size_t a_sum_off              = K_SUBBLKS_PER_SUPERBLK * (sizeof(_Float16) + k_subblk_len);
     constexpr size_t a_scale_avg_off        = a_sum_off + K_SUBBLKS_PER_SUPERBLK * sizeof(_Float16);
     constexpr size_t a_row_blk_stride       = a_scale_avg_off + sizeof(_Float16);
@@ -3127,16 +3077,16 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
             "vxor.vv        v31, v31, v31           \n\t"
             "mv             t4, %[BK]               \n\t"
             "li             t1, %[B_SUPERBLK_DATA_STRIDE] \n\t"
-            "add            s6, %[B], t1            \n\t"  // zp area of the first superblock
-            "li             t0, 0x4c00              \n\t"  // 16 in fp16
+            "add            s6, %[B], t1            \n\t"
+            "li             t0, 0x4c00              \n\t"  // FP16 16.
             "fmv.h.x        fa0, t0                 \n\t"
 
             ".align 4                               \n\t"
             "BLK_LOOP%=:                            \n\t"
             "li             t5, 8                   \n\t"
             "flh            ft1, %[A_SCALE_AVG_OFF](%[A]) \n\t"
-            "fmul.h         ft2, ft1, %[HP0125]     \n\t"  // zp-correction accumulator scale
-            "addi           t6, %[A], %[A_SUM_OFF]  \n\t"  // walk a_sum[ksi]
+            "fmul.h         ft2, ft1, %[HP0125]     \n\t"
+            "addi           t6, %[A], %[A_SUM_OFF]  \n\t"
 
             "vsetvli        t0, x0, e16, m1         \n\t"
             "vxor.vv        v16, v18, v18           \n\t"
@@ -3145,7 +3095,7 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
             "vxor.vv        v19, v18, v18           \n\t"
 
             "INNER_BLK_LOOP%=:                      \n\t"
-            "flh            fa1, (t6)               \n\t"  // a_sum[ksi], stored as -8*sum(q)
+            "flh            fa1, (t6)               \n\t"
             "addi           t6, t6, 2               \n\t"
             "flh            ft0, (%[A])             \n\t"
             "addi           %[A], %[A], 2           \n\t"
@@ -3161,8 +3111,6 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
             "vfmul.vf       v8, v8, ft0             \n\t"
             "vfmul.vf       v9, v8, fa0             \n\t"
 
-            // zp correction:
-            // acc[n] += (scale_avg*0.125) * zp[ksi][n] * (bscale*ascale)[n] * a_sum[ksi]
             "vsetvli        t0, x0, e8, mf4         \n\t"
             "vle8.v         v10, (s6)               \n\t"
             "addi           s6, s6, %[B_ZP_SUBBLK_STRIDE] \n\t"
@@ -3177,15 +3125,15 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
             "vsrl.vi        v28, v3, 4              \n\t"
 
             "vsetvli        t0, x0, e16, m1         \n\t"
-            "vnpack4.vv     v2, v3, v3, 3           \n\t"  // lo4 of A
-            "vnpack4.vv     v3, v28, v28, 3         \n\t"  // hi4 of A
+            "vnpack4.vv     v2, v3, v3, 3           \n\t"
+            "vnpack4.vv     v3, v28, v28, 3         \n\t"
 
             "vsetvli        t0, x0, e16, m1         \n\t"
-            "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"  // hi4 of A, natural B
+            "vmadotsu.hp    v16, v3, v4, v0, 4, i4  \n\t"
             "vmadotsu.hp    v17, v3, v5, v0, 5, i4  \n\t"
             "vmadotsu.hp    v18, v3, v6, v0, 6, i4  \n\t"
             "vmadotsu.hp    v19, v3, v7, v0, 7, i4  \n\t"
-            "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"  // lo4 of A
+            "vmadotu.hp     v16, v2, v4, v0, 0, i4  \n\t"
             "vmadotu.hp     v17, v2, v5, v0, 1, i4  \n\t"
             "vmadotu.hp     v18, v2, v6, v0, 2, i4  \n\t"
             "vmadotu.hp     v19, v2, v7, v0, 3, i4  \n\t"
@@ -3201,7 +3149,6 @@ void gemm_kernel_i8i4_hpzp_m1(const uint8_t * quant_a_ptr,
             "addi           t4, t4, -1              \n\t"
             "vfwmacc.vf     v31, ft1, v20           \n\t"
 
-            // next row block; B skips the zp area and s6 follows it
             "addi           %[A], t6, 2             \n\t"
             "addi           %[B], %[B], %[B_ZP_AREA_BYTES] \n\t"
             "add            s6, %[B], t1            \n\t"
@@ -3228,7 +3175,7 @@ void gemm_kernel_i8i5_m1(const uint8_t * quant_a_ptr,
                          float *         c_ptr,
                          size_t          count_n,
                          size_t          k_blks) {
-    constexpr size_t blk_len = 32;  // k32 leaf: the entry fixes the block length
+    constexpr size_t blk_len = 32;
     // =========================================================================
     // i8i5: 8-bit activation × 5-bit weight (4-bit low + 1-bit high mask)
     //
@@ -3877,7 +3824,6 @@ void gemm_kernel_i8i5_m4(const uint8_t * quant_a_ptr,
                 "addi           %[BK], %[BK], -1        \n\t"
                 "bgtz           %[BK], BLK_LOOP%=       \n\t"
 
-                // Tail-aware store for the final N tile (`nb_real` may be < 32).
                 "vsetvli        t0, %[NBLKS], e32, m1   \n\t"
                 "add            t1, %[LDC], %[DST]      \n\t"
                 "vse32.v        v4, (%[DST])            \n\t"
@@ -3902,7 +3848,7 @@ static void gemm_kernel_i8i8_m4(const uint8_t * quant_a_ptr,
                                 size_t          count_n,
                                 size_t          k_blks,
                                 size_t          ldc) {
-    constexpr size_t blk_len = 32;  // k32 leaf: the entry fixes the block length
+    constexpr size_t blk_len = 32;
     int64_t b_data_stride = k_blks * sizeof(ggml_fp16_t) + k_blks * blk_len;
     for (size_t ni = 0; ni < count_n; ni += 32) {
         uint8_t * b_data = (uint8_t *) quant_b_data + ni * b_data_stride;
@@ -3999,7 +3945,7 @@ static void gemm_kernel_i8i8_m1(const uint8_t * quant_a_ptr,
                                 float *         c_ptr,
                                 size_t          count_n,
                                 size_t          k_blks) {
-    constexpr size_t blk_len = 32;  // k32 leaf: the entry fixes the block length
+    constexpr size_t blk_len = 32;
     for (size_t n = 0; n < count_n; n += 32) {
         size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
         uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + n * k_blks * blk_len + n * k_blks * sizeof(_Float16);
@@ -4677,7 +4623,7 @@ size_t gemm_i8i4_k256(a_pack          ap,
                       size_t          ldc) {
     GGML_ASSERT(blk_len == 256);
     if (quant_b_zp != nullptr) {
-        // Q4_1 / Q4_K: bare-nibble B with the dedicated zero-point area.
+        // Q4_1/Q4_K store unsigned nibbles with a separate zp area.
         if (count_m >= 4) {
             GGML_ASSERT(ap == a_pack::r4_al);
             gemm_kernel_i8i4_hpzp_al_m4(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
@@ -4686,7 +4632,7 @@ size_t gemm_i8i4_k256(a_pack          ap,
         gemm_kernel_i8i4_hpzp_m1(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks);
         return 1;
     }
-    // Q4_0: offset-nibble B with the zero point folded into the nibbles.
+    // Q4_0 folds its zero point into the nibble encoding.
     if (count_m >= 8) {
         GGML_ASSERT(ap == a_pack::r8);
         gemm_kernel_i8i4_hp_al_m8(quant_a_ptr, quant_b_data, c_ptr, count_n, k_blks, ldc);
@@ -4752,10 +4698,7 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
     return 2;
 }
 
-// f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
-// M-split schedule (whole K loop inside one call, C written straight to the
-// f32 output).  A/B native [K/8][M16|N32][K8] layouts; accumulate=true seeds
-// the accumulators from c_ptr's rows first.
+// A/B use [K/8][M16|N32][K8]; the output is row-major FP32.
 void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
                                         const _Float16 * b_f16_k8,
                                         _Float16 *       a_f16_k8,
@@ -4767,8 +4710,7 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
     GGML_ASSERT(count_m > 0 && count_m <= 16);
     GGML_ASSERT(count_n > 0 && count_n <= 32);
     GGML_ASSERT(gemm_k % 8 == 0);
-    // count_n < 32 with a partial-M accumulate seed is not supported (every
-    // call site gates on N % 32 == 0, so tiles are always full N32).
+    // Partial-M accumulation requires a full N32 tile.
     GGML_ASSERT(count_m == 16 || count_n == 32 || !accumulate);
 
     alignas(128) float tile[16 * 32];
@@ -4779,16 +4721,8 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
     const _Float16 * b2            = b_f16_k8 + 128;
     const _Float16 * b3            = b_f16_k8 + 192;
     size_t           kc_left       = gemm_k / 8;
-    // The vfwmadot accumulators (v16-v31) hold an internal 8x8-dot-tile pair
-    // layout -- the vpack unpack butterfly below only turns them into 16
-    // row-major N32 rows at the very end -- so an accumulate chunk must NOT
-    // preload its C seed into those registers: a row-major seed garbles
-    // straight through the butterfly, with an error that grows with the K
-    // already behind the seed.  (Dense never caught this: every correctness
-    // shape was single-chunk; multi-chunk split-N shapes only ever ran in
-    // llama-bench.)  Accumulate (and partial-M) calls instead run the kernel
-    // with zeroed accumulators into the local tile and add the seed back in
-    // the scalar epilogue below, which is layout-agnostic.
+    // Accumulator register pairs are not row-major; add existing C only after unpacking.
+    // The local tile also avoids writing beyond a partial-M output.
     const bool       via_tile      = accumulate || count_m != 16;
     float *          out           = via_tile ? tile : c_ptr;
     const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
@@ -4821,8 +4755,7 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "addi %[b3], %[b3], 512\n\t"
         "addi %[kc], %[kc], -1\n\t"
         "bnez %[kc], 1b\n\t"
-        // Official IME2 accumulator unpack sequence.  It transforms the
-        // eight 8x8 dot-product tiles into 16 row-major N32 vectors.
+        // Unpack eight 8x8 accumulator tiles into row-major M16N32.
         "vsetvli t0, zero, e32, m1, tu, mu\n\t"
         "vpack.vv v0,  v16, v18, 2\n\t"
         "vpack.vv v2,  v20, v22, 2\n\t"

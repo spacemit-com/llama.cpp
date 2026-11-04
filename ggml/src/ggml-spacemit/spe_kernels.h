@@ -1,15 +1,9 @@
 #pragma once
-// Vendored interfaces from spine-kernel (MIT, (c) 2025-2026 SpacemiT),
-// originally imported at commit 29955e5. Kernel implementations live in
-// spe_kernels_core.h; consumers of the dispatch API only need this header.
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <typeinfo>
 
-// ---- build/_deps/spine-arch-info-src/inc/spine_arch_info.h: arch descriptor
-// unions (verbatim; the toString/GetSpineCoreInfo
-// helpers stay in the spine-runtime side and are not vendored). ----
 constexpr uint64_t SpineInvalidCoreID = 0xFFFFFFFF;
 
 enum class SpineCoreArchID : uint16_t {
@@ -46,7 +40,6 @@ union SpineArchInfoDef {
 
 namespace mlir::speir::spekernel {
 
-// ---- inc/spe_kernel_func_types.h: the function typedefs (verbatim) ----
 using spe_pack_cast_function_def = std::function<void(void *  in,
                                                       int64_t in_offset,
                                                       int64_t in_stride,
@@ -71,7 +64,6 @@ using spe_reducesum_mxn_function_def = std::function<void(void *  in,
                                                           int64_t dst_mc,
                                                           int64_t dst_nc)>;
 
-// ---- inc/spe_kernel_func_types.h: primary template declarations (macros expanded) ----
 template <typename in_type, typename out_type, size_t src_mb, size_t src_kb, size_t dst_mb, size_t dst_kb>
 void spe_pack_cast(void * in, int64_t in_offset, int64_t in_stride, void * out, int64_t out_offset,
                    int64_t out_stride, int64_t mc, int64_t kc, int64_t dst_mc, int64_t dst_kc);
@@ -83,11 +75,8 @@ void spe_reducesum_mxn(void * in, int64_t lhs_offset, int64_t lhs_stride0, int64
 
 }  // namespace mlir::speir::spekernel
 
-// ---- inc/spe_kernel_cxx_helper.h: dispatch getter declarations (macros
-// expanded; spe_kernel_dispatch.cpp defines them). ----
 namespace mlir::speir::spekernel::ime2 {
-// Resolver hint for Q41Block -> FP16 only. The returned pack callback keeps
-// the same signature; fixed_8 requires every input zero-point slot to equal 8.
+// fixed_8 requires every Q41Block zero-point slot to equal 8.
 enum class q41_zero_point_mode { per_row, fixed_8 };
 
 spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         march,

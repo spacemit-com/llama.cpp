@@ -58,8 +58,7 @@ class tensor_traits_base {
     }
     virtual int  repack(ggml_tensor * tensor, const void * data, size_t size) const     = 0;
 
-    // convert the physically stored tensor back to the ggml layout; traits that
-    // change the physical layout should override this (default: raw copy)
+    // Override for repacked tensors; the default copies raw bytes.
     virtual void unpack(const ggml_tensor * tensor, void * data, size_t size) const {
         memcpy(data, tensor->data, size);
     }

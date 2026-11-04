@@ -39,13 +39,8 @@ constexpr size_t q8k_blk_size(size_t blk_len) {
 
 using quantize_a_row_def = std::function<void(size_t, const float *, size_t, uint8_t *)>;
 
-// Aligned-layout A-side groups for the q8 HP kernels (q4_0 32x256 experts).
-// One group is one K256 chunk; its K32 subblocks are stored consecutively and
-// within a subblock the group's rows are interleaved as one 32 B lane per row
-// (m8: lo/hi nibble lanes at +0/+128 per subblock). After the payload:
-//   m4al (4 rows): 8 x 4 fp16 subblock scales, 4 rows x 8 fp16 a-sums,
-//                  4 fp16 average scales, padded to 64 B
-//   m8   (8 rows): 8 fp16 subblock scales, 1 fp16 average scale, padded to 128 B
+// K256 A groups store eight K32 payloads followed by FP16 scales/sums.
+// m4_al metadata pads to 64B; m8 metadata pads to 128B.
 constexpr size_t q8_hp_m4al_blk_size =
     (8 * 4 * 32 + 8 * 4 * sizeof(_Float16) + 4 * 8 * sizeof(_Float16) + 4 * sizeof(_Float16) + 63) / 64 * 64;
 constexpr size_t q8_hp_al_row_blk_size = q8_hp_m4al_blk_size / 4;
@@ -53,11 +48,9 @@ constexpr size_t q8_hp_m8_blk_size    = (8 * 8 * 32 + 8 * sizeof(_Float16) + siz
 static_assert(q8_hp_m4al_blk_size == 1216, "m4al group layout");
 static_assert(q8_hp_m8_blk_size == 2176, "m8 group layout");
 
-// Per-expert A-group offsets stay 128 B aligned.
 constexpr size_t q8_hp_al_align = 128;
 
-// Aligned-layout A-side group for the i8i8 kernels (q8_0 32x32): 4 f32 row
-// scales and 4 i16 row sums padded to 64 B, then 4 x 32 B payload lanes.
+// Q8_0 r4 groups: 64B of padded row scales/sums, then four 32B payload lanes.
 constexpr size_t q8_m4al_hdr_size     = (4 * (sizeof(float) + sizeof(int16_t)) + 63) / 64 * 64;
 constexpr size_t q8_m4al_blk_size     = q8_m4al_hdr_size + 4 * 32;
 constexpr size_t q8_m4al_row_blk_size = q8_m4al_blk_size / 4;

@@ -5320,7 +5320,7 @@ void quantize_a_i8_r4_hp_al(size_t blk_len, const float * a_ptr, size_t count_k,
 void quantize_a_i8_r8_hp(size_t blk_len, const float * a_ptr, size_t count_k, uint8_t * quant_a_ptr) {
     constexpr size_t k_subblk_len = 32;
     constexpr size_t subblk_count = 256 / k_subblk_len;
-    constexpr size_t a_scale_off  = 8 * 8 * k_subblk_len;  // scale[8] right after 8 data lanes of the first K32 subblock
+    constexpr size_t a_scale_off  = 8 * 8 * k_subblk_len;  // FP16 scales follow all eight K32 payloads.
     GGML_ASSERT(blk_len == 256);
 
     const float stable_factor = 0.1f;

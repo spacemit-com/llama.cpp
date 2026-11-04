@@ -1,12 +1,3 @@
-// Vendored from spine-kernel (MIT, (c) 2026 SpacemiT) at commit 29955e5:
-// src/ime2/spe_pack_cast.cc (the three ime2 spe_pack_cast specializations and
-// get_spe_pack_cast_function) and src/rvv/spe_reducesum_mxn.cc (the f16->f32
-// spe_reducesum_mxn specialization and get_spe_reducesum_mxn_function).
-// Only deviation: the generic march/dispatch-table getters are collapsed to
-// direct returns of the single matching entry per op -- the q4_0_f16 path
-// always builds an A100 march, so the ime2 / rvv gates always pass and the
-// scalar fallbacks are dead code.
-
 #include "ggml.h"
 #include "ime_kernels.h"
 #include "spe_kernels_core.h"
@@ -14,14 +5,9 @@
 #include <typeindex>
 #include <vector>
 
-// The spe_pack_cast specializations are defined in the owning namespace
-// mlir::speir::spekernel (GCC requires explicit specializations in the
-// namespace of the primary template); their bodies call the ime2 inner
-// kernels with explicit qualification.
 namespace mlir::speir::spekernel {
 
-// [M,K] FP32 -> [dst_mc,dst_kc,MB,8] FP16.
-// out[mo,ko,mi,ki] = f16(in[mo*MB+mi,ko*8+ki]); offsets/strides are bytes.
+// FP32 [M,K] -> FP16 [dst_mc,dst_kc,16,8]; offsets and strides are bytes.
 template <>
 void spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8>(void *  in,
                                                    int64_t in_offset,
@@ -56,12 +42,10 @@ void spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8>(void *  in,
     const int64_t mc       = valid_m / mb;
     const int64_t m_remain = valid_m % mb;
 
-    // Complete M blocks, including K tails and K padding.
     if (mc != 0) {
         ime2::_spe_pack_cast_f32_f16_full_blocks<mb>(src, in_stride, dst, out_stride, mc, valid_k, dst_kc);
     }
 
-    // The final partial M block: convert valid rows, then pad missing rows.
     if (m_remain != 0) {
         auto *  src_tail = src + mc * mb * in_stride;
         auto *  dst_tail = reinterpret_cast<_spe_fp16_ *>(dst + mc * out_stride);
@@ -74,15 +58,13 @@ void spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8>(void *  in,
         }
     }
 
-    // An oversized destination can also contain complete padding blocks.
     const int64_t written_mc = mc + (m_remain != 0);
     if (written_mc < dst_mc) {
         ime2::_spe_pack_cast_f16_pad_blocks<mb>(dst + written_mc * out_stride, out_stride, dst_mc - written_mc, dst_kc);
     }
 }
 
-// [M,K] FP32 -> [dst_mc,dst_kc,MB,8] FP16.
-// out[mo,ko,mi,ki] = f16(in[mo*MB+mi,ko*8+ki]); offsets/strides are bytes.
+// FP32 [M,K] -> FP16 [dst_mc,dst_kc,32,8]; offsets and strides are bytes.
 template <>
 void spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8>(void *  in,
                                                    int64_t in_offset,
@@ -117,12 +99,10 @@ void spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8>(void *  in,
     const int64_t mc       = valid_m / mb;
     const int64_t m_remain = valid_m % mb;
 
-    // Complete M blocks, including K tails and K padding.
     if (mc != 0) {
         ime2::_spe_pack_cast_f32_f16_full_blocks<mb>(src, in_stride, dst, out_stride, mc, valid_k, dst_kc);
     }
 
-    // The final partial M block: convert valid rows, then pad missing rows.
     if (m_remain != 0) {
         auto *  src_tail = src + mc * mb * in_stride;
         auto *  dst_tail = reinterpret_cast<_spe_fp16_ *>(dst + mc * out_stride);
@@ -135,14 +115,13 @@ void spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8>(void *  in,
         }
     }
 
-    // An oversized destination can also contain complete padding blocks.
     const int64_t written_mc = mc + (m_remain != 0);
     if (written_mc < dst_mc) {
         ime2::_spe_pack_cast_f16_pad_blocks<mb>(dst + written_mc * out_stride, out_stride, dst_mc - written_mc, dst_kc);
     }
 }
 
-// One source struct contains 32x32 U4 values and produces four 32x8 FP16 tiles.
+// Each Q41Block<32,32,2> produces four FP16 [32,8] tiles.
 template <ime2::q41_zero_point_mode Mode>
 static void spe_pack_cast_q41(void *  in,
                              int64_t in_offset,
@@ -197,8 +176,6 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
         return nullptr;
     }
 
-    // Resolve the optional specialization once; never inspect weight data or
-    // branch on the mode inside the returned callback's hot block loop.
     if (mode == q41_zero_point_mode::fixed_8) {
         if (in_type == typeid(Q41Block<32, 32, 2>) && out_type == typeid(_spe_fp16_) &&
             src_mb == 32 && src_kb == 32 && dst_mb == 32 && dst_kb == 8) {
@@ -345,7 +322,6 @@ spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t    
 
 }  // namespace mlir::speir::spekernel::rvv
 
-// Backend wrapper for the SPE GEMM inner kernel; keep core consumers here.
 namespace spacemit_kernels::ime2 {
 
 void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
@@ -359,13 +335,9 @@ void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
     GGML_ASSERT(count_m > 0 && count_m <= 16);
     GGML_ASSERT(count_n > 0 && count_n <= 32);
     GGML_ASSERT(gemm_k % 8 == 0);
-    // The spine mmt4d kernel has no accumulate epilogue (C = A @ B only).
     GGML_ASSERT(!accumulate);
 
-    // Same native [K/8][M16|N32][K8] A/B layouts as the f32 kernel.  kc counts
-    // K8 groups and c_stride is a byte row stride; each row store is one
-    // vse16.v of count_n f16, so the caller must 64B-align c_ptr to keep one
-    // store inside a single DDR bank.
+    // Align c_ptr to 64 bytes so each FP16 row store stays within one DDR bank.
     mlir::speir::spekernel::ime2::_spe_hpgemm_impl_m16n32k8_none(
         count_m, count_n, gemm_k / 8, a_f16_k8, b_f16_k8, reinterpret_cast<int8_t *>(c_ptr),
         ldc * sizeof(_Float16));

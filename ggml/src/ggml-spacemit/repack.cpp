@@ -694,13 +694,7 @@ static int repack_q4_0_to_q4_1_256_32_bl_ref(ggml_tensor *              t,
     GGML_UNUSED(data_size);
 }
 
-// Q4_K -> bare-nibble + zp superblock: each 256-wide Q4_K block holds 8
-// 32-element sub-blocks with per-sub-block (d*sc_j, dmin*m_j) scales.  The
-// sub-block quant is stored as a native block_q4_1 with the negated-min
-// convention (m = -dmin*m_j), so the shared mid = -nearbyint(m/d) clamp
-// yields exactly the Q4_K zero point m1/d1, and the writeout matches the
-// Q4_1 superblock byte-for-byte (d[i] fp16 scale, zps[j*32+i], lo-nibble
-// plane first / hi-nibble plane second per 16 B row).
+// Map Q4_K K32 scales/minima to the Q4_1 superblock layout, with min=-dmin*sub_min.
 static int repack_q4_k_to_q4_1_256_32_bl_ref(ggml_tensor *              t,
                                              int                        interleave_block,
                                              const void * GGML_RESTRICT data,
@@ -1734,7 +1728,6 @@ static int q8_0x32_finish(ggml_tensor * t, int ret) {
     return ret;
 }
 
-
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> int repack(ggml_tensor *, const void *, size_t);
 
 template <> int repack<block_q4_0, 32, 16>(ggml_tensor * t, const void * data, size_t data_size) {
@@ -1772,12 +1765,7 @@ template <> int repack<block_q4_0, 256, 32>(ggml_tensor * t, const void * data, 
     //return repack_q4_0_to_q4_0_256_32_bl(t, 32, data, data_size);
 #endif
     if (ret == 0) {
-        // Signed-nibble twist, consumed by the m8/m4_al/m1 kernels: q4_0
-        // nibbles hold u4 = q + 8, so qs ^ 0x88 flips both nibbles to u4 ^ 8
-        // and the kernels' vmadot.hp / vmadotus.hp pairs accumulate the i4
-        // dot product without a separate zero-point correction.  This repack
-        // is MoE-only since the dense Q4 MUL_MAT moved to the f16 path: only
-        // 3-dim expert tensors reach it through the dispatch gate.
+        // MoE Q4_0 kernels consume signed nibbles: qs ^ 0x88 folds the fixed zero point into the dot.
         block_q4_0x32x256 * dst = (block_q4_0x32x256 *) t->data;
         const int64_t       n   = ggml_nrows(t) / 32 * (t->ne[0] / 256);
         for (int64_t i = 0; i < n; i++) {
@@ -1822,7 +1810,6 @@ template <> int repack<block_q6_K, 32, 32>(ggml_tensor * t, const void * data, s
     return repack_q6_k_to_q8_0_32_bl(t, 32, data, data_size);
 #endif
 }
-
 
 // Q5_0 -> Q8_0 at load time, exact: Q5_0 value d * (q - 16) with q in [0, 31] is Q8_0 with the same d and
 // qs = q - 16. The result is repacked like a Q8_0 tensor and runs on the Q8_0 IME kernels.
@@ -1891,12 +1878,8 @@ int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     }
 
     const int64_t kblocks = ne00 / 32;
-    // The f16 gate only sends 2-D dense weights here, so ggml_nrows == ne01;
-    // the flat walk stays correct for any row count the gate lets through.
     const int64_t nrows = ggml_nrows(t);
 
-    // destination is (nrows/32)*kblocks blocks of 608B; nbytes reserves
-    // exactly this when the f16 gate selected this path.
     if (data_size != static_cast<size_t>(nrows) * kblocks * sizeof(block_q4_0)) {
         return -1;
     }
@@ -1904,22 +1887,15 @@ int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     auto                dst = reinterpret_cast<Q41Block<32, 32, 2> *>(t->data);
     const block_q4_0 * src = reinterpret_cast<const block_q4_0 *>(data);
 
-    // layout: [ne01/32][ne00/32] blocks of 608B; one block holds one K32
-    // window across 32 rows (scale per row bit-exact from q4_0.d, each zp=8,
-    // nibbles shuffled from q4_0 split-half order to Q41 interleaved order)
+    // Q41 blocks cover 32 rows x K32; preserve each row’s scale bits and set zp=8.
     for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
         for (int64_t j = 0; j < kblocks; j++) {
             Q41Block<32, 32, 2> & blk = dst[(n0 / 32) * kblocks + j];
             memset(blk.zp, 8, sizeof(blk.zp));
             for (int i = 0; i < 32; i++) {
                 const block_q4_0 & b = src[(n0 + i) * kblocks + j];
-                // bit-exact f16 copy of the q4_0 per-(row,K32) scale
                 memcpy(&blk.scale[i], &b.d, sizeof(ggml_half));
-                // ggml q4_0 packs byte p as element p (low nibble) | element
-                // p+16 (high nibble) -- a split-half layout.  Q41Block's scalar
-                // dequant expects byte p as element 2p (low) | element 2p+1
-                // (high) -- an interleaved layout.  Unpack the 32 elements and
-                // re-pack them in Q41's order (NOT a byte copy).
+                // Convert split-half nibbles (p, p+16) to adjacent pairs (2p, 2p+1).
                 uint8_t e[32];
                 for (int p = 0; p < 16; p++) {
                     e[p]      = static_cast<uint8_t>(b.qs[p] & 0x0F);
@@ -1936,10 +1912,7 @@ int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     return 0;
 }
 
-// Keep the original nibble grid and approximate only its offset. The zero
-// point is a byte, not a nibble: values 16..255 remain valid in consumers
-// that subtract it in a widened integer lane. A zero scale cannot preserve
-// a nonzero constant offset; choose zp=0 explicitly for this lossy case.
+// Approximate offsets with uint8 zp, including values above 15; zero scale uses zp=0.
 static uint8_t q41_zero_point(float scale, float offset) {
     if (scale == 0.0f) {
         return 0;
@@ -1951,7 +1924,6 @@ static uint8_t q41_zero_point(float scale, float offset) {
     return zp >= 255.0f ? 255 : static_cast<uint8_t>(zp);
 }
 
-// Q4_1 preserves its source scale bits and nibbles, with a rounded uint8 zp.
 int repack_q4_1_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_1);
     const int64_t kblocks = t->ne[0] / QK4_1;
@@ -1973,8 +1945,6 @@ int repack_q4_1_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
                     GGML_FP16_TO_FP32(b.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d),
                     GGML_FP16_TO_FP32(b.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m));
                 uint8_t * row = reinterpret_cast<uint8_t *>(blk.data) + i * 16;
-                // Source bytes contain K[p] and K[p+16]. Each destination
-                // byte contains adjacent K values to match the IME layout.
                 for (int p = 0; p < 8; ++p) {
                     row[p] = (b.qs[2 * p] & 15) | ((b.qs[2 * p + 1] & 15) << 4);
                     row[p + 8] = (b.qs[2 * p] >> 4) | (b.qs[2 * p + 1] & 0xf0);
@@ -1985,8 +1955,7 @@ int repack_q4_1_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     return 0;
 }
 
-// Q4_K preserves source nibbles, folds each K32 scale into FP16, and
-// approximates the original offset with a saturated uint8 zero point.
+// Q4_K folds each K32 scale into FP16 and rounds its offset to a saturated uint8 zp.
 int repack_q4_k_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_K);
     const int64_t kblocks = t->ne[0] / 32;
@@ -2036,14 +2005,11 @@ int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_si
     }
 
     const int64_t kblocks = ne00 / 32;
-    // flat over ggml_nrows, mirroring the repack drivers.
     const int64_t nrows = ggml_nrows(t);
 
-    // callers pass the tensor's logical (source type) byte count
     const size_t block_size = t->type == GGML_TYPE_Q4_0 ? sizeof(block_q4_0)
                                : t->type == GGML_TYPE_Q4_1 ? sizeof(block_q4_1)
                                                             : sizeof(block_q4_K);
-    // one q4_K source block covers QK_K/QK4_0 = 8 K32 windows
     const int64_t src_blocks = t->type == GGML_TYPE_Q4_K ? kblocks / 8 : kblocks;
     if (data_size != static_cast<size_t>(nrows) * src_blocks * block_size) {
         return -1;
@@ -2052,9 +2018,7 @@ int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_si
     const Q41Block<32, 32, 2> * src = reinterpret_cast<const Q41Block<32, 32, 2> *>(t->data);
 
     if (t->type == GGML_TYPE_Q4_K) {
-        // q4_K cannot hold the Q41 grid exactly (6-bit per-K32 scale/min with
-        // a shared d/dmin per K256 block), so dequantize and re-encode with
-        // the reference quantizer.
+        // Q4_K cannot represent the Q41 grid exactly; reconstruct and requantize it.
         block_q4_K * dst = reinterpret_cast<block_q4_K *>(data);
         float        vals[QK_K];
         for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
@@ -2079,16 +2043,13 @@ int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_si
         return 0;
     }
 
-    // Q4_0 restores the original bytes. Q4_1 retains its scale/nibbles
-    // and reconstructs an approximate half min from the per-row zero point.
     block_q4_0 * dst0 = t->type == GGML_TYPE_Q4_0 ? reinterpret_cast<block_q4_0 *>(data) : nullptr;
     block_q4_1 * dst1 = t->type == GGML_TYPE_Q4_1 ? reinterpret_cast<block_q4_1 *>(data) : nullptr;
     for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
         for (int64_t j = 0; j < kblocks; j++) {
             const Q41Block<32, 32, 2> & blk = src[(n0 / 32) * kblocks + j];
             for (int i = 0; i < 32; i++) {
-                // Q41 interleaved nibbles (elem 2p | elem 2p+1) -> ggml
-                // split-half (elem p | elem p+16)
+                // Convert adjacent nibbles back to split-half order.
                 const uint8_t * row = reinterpret_cast<const uint8_t *>(blk.data) + i * 16;
                 uint8_t         e[32];
                 for (int p = 0; p < 16; p++) {
@@ -2107,7 +2068,6 @@ int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_si
                     block_q4_1 & b = dst1[(n0 + i) * kblocks + j];
                     memcpy(&b.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.d, &blk.scale[i], sizeof(ggml_half));
                     memcpy(b.qs, qs, sizeof(qs));
-                    // The reconstructed offset is rounded to the source half format.
                     ggml_half s_h;
                     memcpy(&s_h, &blk.scale[i], sizeof(s_h));
                     b.GGML_COMMON_AGGR_U.GGML_COMMON_AGGR_S.m =
