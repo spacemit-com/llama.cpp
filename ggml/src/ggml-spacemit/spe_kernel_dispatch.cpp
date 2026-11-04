@@ -7,7 +7,10 @@
 // always builds an A100 march, so the ime2 / rvv gates always pass and the
 // scalar fallbacks are dead code.
 
-#include "spe_kernels.h"
+#include "spe_kernels_core.h"
+
+#include <typeindex>
+#include <vector>
 
 // The spe_pack_cast specializations are defined in the owning namespace
 // mlir::speir::spekernel (GCC requires explicit specializations in the

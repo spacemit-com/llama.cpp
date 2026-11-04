@@ -2,7 +2,7 @@
 #include "ggml.h"
 #include "ime_kernels.h"
 #include "rvv_kernels.h"
-#include "spe_kernels.h"
+#include "spe_kernels_core.h"
 #include "string.h"
 
 #include <algorithm>
