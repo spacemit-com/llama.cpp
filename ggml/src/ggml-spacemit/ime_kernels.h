@@ -226,16 +226,14 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
 // family entries: count_m/count_n are the real extents of one M16xN32 tile
 // (tail masking), not a row loop count. ----
 
-// M1 i8i4 GEMV over the Q41Block<32,32,2> weight layout (the Q41 repack): B
-// data sits at block+0 and the per-row fp16 scales at block+544 (608B
-// blocks, 19B per-row pitch) instead of the legacy block_q4_0x32
-// [scale@+0 | data@+64] (576B, 18B pitch).  zp=8 is implicit.  The decode
-// (M == 1) route of the f16 traits: f16 GEMM is prefill-only.
+// M1 i8i4 GEMV over Q41Block<32,32,2> (608B) for all three Q4 sources.
+// Each row/K32 block has an explicit uint8 zero point (Q4_0: always 8).
+// INT32 dot/correction is followed by FP32 scaling and accumulation.
 void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
-                             const uint8_t * quant_b_data,
-                             float *         c_ptr,
-                             size_t          count_n,
-                             size_t          k_blks);
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_n,
+                           size_t          k_blks);
 
 // f16 GEMM inner-kernel wrapper around spine-kernel's _spe_hpgemm_impl_m16n32k8_none.
 // a/b are the native [K/8][M16|N32][K8] f16 layouts, gemm_k is the K extent,

@@ -137,13 +137,13 @@ static size_t mmid_m4_work_size(int n_threads, const ggml_tensor * op, size_t nb
 //
 //   f16 (gemm_path_f16 row): A castpack (f32 -> f16), B dequantpack
 //        (Q41Block -> f16 per compute, amortised by TCM staging), the
-//        f16/f32-accumulator mmt4d tiles, and the split-K reducesum.  One
-//        dtype-invariant row (the Q41Block repack normalises q4_0/q4_1/q4_K
-//        onto a single layout); decode (M == 1) borrows the i8i4 GEMV pair,
-//        listed as explicit row members.  Serves dense (2-D) Q4 MUL_MAT.
+//        f16/f32-accumulator mmt4d tiles, and the split-K reducesum.  Two
+//        cached rows share Q41Block and differ only in B pack: fixed8 for
+//        Q4_0, per-row for Q4_1/Q4_K. Decode uses common A-quantize and
+//        INT32 i8i4 GEMV members. Serves dense (2-D) Q4 MUL_MAT.
 //
 // use_f16_link() picks the link, resolve_gemm hands out the rows (overloaded
-// on the key: ggml dtype -> the i8 table, Q41Block layout -> the f16 row).
+// on the key: ggml dtype -> i8 rows, Q41Block and source dtype -> f16 row).
 // The schedulers stay per-link inside the traits' compute_forward and only
 // draw operators from these rows.
 
@@ -173,7 +173,7 @@ struct gemm_resolve_i8 {
 // The suite's single resolve entry, overloaded on the key:
 //   resolve_gemm<ggml_block, INTER_SIZE>(blk_len) -> that dtype's i8 rows
 //       (dense + MoE + the routed-row entry);
-//   resolve_gemm<Q41Block, NB, KB>() -> the f16 link's operator row.
+//   resolve_gemm<Q41Block, NB, KB>(source_type) -> the f16 operator row.
 // The overload is the internal judgment: ggml dtypes carry only i8 rows
 // here (their f16-ness lives in use_f16_link's traits routing), and the
 // Q41Block layout never carries i8 rows.
@@ -285,14 +285,14 @@ struct gemm_path_f16 {
     dot_f32acc_def dot_f32acc;  // f32 epilogue: split-M, whole-K, straight f32 out
 };
 
-// resolve_gemm, layout-keyed overload: the f16 link's single operator row
-// (dtype-invariant -- the Q41Block repack normalises q4_0/q4_1/q4_K).
-// Resolves once (magic static): the spe getters' march build and tuple
-// match run a single time instead of per MUL_MAT op.
+// Resolve the common f16 operator row with one B-pack callback. Q4_0 binds
+// the fixed-eight implementation once; Q4_1/Q4_K bind the per-row version.
+// Separate cached rows prevent the first source type from fixing later calls.
 template <typename BLOC_TYPE, size_t NB, size_t KB>
-static const gemm_path_f16 & resolve_gemm() {
+static const gemm_path_f16 & resolve_gemm(enum ggml_type source_type) {
     static_assert(std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>>, "the f16 link has a single B layout");
-    static const gemm_path_f16 ops = [] {
+    using mlir::speir::spekernel::ime2::q41_zero_point_mode;
+    const auto make_ops = [](q41_zero_point_mode mode) {
         // Hand-built march for the vendored spe dispatch getters (verbatim
         // from spine-kernel, defined in ime2_kernels.cpp): ime2 pack_cast
         // requires ime bit 1 + vector_info==128, rvv reducesum requires a
@@ -310,7 +310,7 @@ static const gemm_path_f16 & resolve_gemm() {
         o.castpack_a = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
             march.value, typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8);
         o.dequantpack_b = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
-            march.value, typeid(BLOC_TYPE), typeid(_spe_fp16_), NB, KB, NB, 8);
+            march.value, typeid(BLOC_TYPE), typeid(_spe_fp16_), NB, KB, NB, 8, mode);
         o.reducesum = mlir::speir::spekernel::rvv::get_spe_reducesum_mxn_function(
             march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
         o.quantize_a_gemv = &spacemit_kernels::rvv::quantize_a_i8_r1;
@@ -322,8 +322,11 @@ static const gemm_path_f16 & resolve_gemm() {
                        o.castpack_a ? 1 : 0, o.dequantpack_b ? 1 : 0, o.reducesum ? 1 : 0);
         }
         return o;
-    }();
-    return ops;
+    };
+    static const gemm_path_f16 per_row_ops = make_ops(q41_zero_point_mode::per_row);
+    static const gemm_path_f16 fixed8_ops  = make_ops(q41_zero_point_mode::fixed_8);
+    GGML_ASSERT(source_type == GGML_TYPE_Q4_0 || source_type == GGML_TYPE_Q4_1 || source_type == GGML_TYPE_Q4_K);
+    return source_type == GGML_TYPE_Q4_0 ? fixed8_ops : per_row_ops;
 }
 
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
@@ -1800,7 +1803,8 @@ static bool q4_0_f16_split_n(const size_t K, const size_t M) {
 
 // q4_0 weights repacked losslessly into spine-kernel's Q41Block<32,32,2>
 // (per-row scale bit-exact, shared zp=8, nibbles identical to q4_0 qs);
-// q4_1/q4_K requantize onto the same shared zp=8 q4_0 grid.  compute_forward
+// q4_1/q4_K retain their source nibbles and map offsets to per-row uint8
+// zero points in the same 608B layout; rounding/clamping remains lossy. compute_forward
 // ports the f16 split-K schedule: each worker owns one K slice, A is
 // f32->f16 pack_cast into TCM, B is Q41Block->f16 pack_cast into TCM, the
 // IME2 m16n32k8 kernel accumulates f16 partials in the workspace, and
@@ -1900,11 +1904,12 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
         // the spe getters resolve once inside the magic static, so the
         // per-op march build and tuple match are gone.  Aliases keep the
         // scheduler body below unchanged.
-        const gemm_path_f16 & ops = resolve_gemm<BLOC_TYPE, NB, KB>();
+        const gemm_path_f16 & ops = resolve_gemm<BLOC_TYPE, NB, KB>(src0->type);
         // A: f32 -> f16 [K/8][16][8]; B: Q41Block -> f16 [K/8][32][8];
         // reduce: f16 partials -> f32.
         const auto pack_func   = ops.castpack_a;
         const auto q41_func    = ops.dequantpack_b;
+        const auto gemv_func   = ops.dot_gemv;
         const auto reduce_func = ops.reducesum;
 
         const auto * a_src = reinterpret_cast<const uint8_t *>(src1->data);
@@ -1923,10 +1928,9 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
         // A is i8-quantized once (K32 blocks split across workers, same
         // contract as forward_mul_mat's gemm_m==1 branch) into the workspace,
         // then each worker runs round-robin N32 tiles straight from DRAM --
-        // no TCM staging, no partials.  The Q41-adapted kernel
-        // (gemm_kernel_i8i4_m1_q41) differs from the legacy one only in the
-        // B field offsets/stride (data @ block+0, scale follows the data field
-        // blocks); A quantization (quantize_a_i8_r1) is reused verbatim.
+        // no TCM staging, no partials. The single Q41-layout GEMV entry
+        // reads the per-row zero points for every Q4 source; A quantization
+        // (quantize_a_i8_r1) is unchanged.
         // Takes precedence over every f16 schedule so
         // decode always stays on the i8i4 route (f16 GEMM is prefill-only).
         if (M == 1 && K % KB == 0) {
@@ -1958,7 +1962,7 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
                     const int64_t nb_real = std::min((int64_t) N - ni, (int64_t) tile_cols);
                     const uint8_t * b_row = b_src + ni * b_row_stride;
                     auto *          c_row = reinterpret_cast<float *>(out) + ni;
-                    ops.dot_gemv(quant_a, b_row, c_row, (size_t) nb_real, k_blks);
+                    gemv_func(quant_a, b_row, c_row, (size_t) nb_real, k_blks);
                 }
                 return true;
             }
@@ -2437,7 +2441,9 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
 
         const size_t a_budget = tcm_size - n_tile * ks * sizeof(_Float16);
         const size_t m_fit    = (a_budget / (ks * sizeof(_Float16))) & ~size_t{ 15 };
-        const size_t m_block  = std::min(std::max(M, m_tile), m_fit);
+        // pack_func writes complete M16 tiles, including the padded final rows.
+        // Reserve that full A footprint before placing B in the same TCM block.
+        const size_t m_block  = std::min(mt_count * m_tile, m_fit);
         const size_t nc_count = nt_count;
 
         // Round the workspace base up to 64B: the f16f16f16 kernel's 32-f16
@@ -2542,8 +2548,9 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
 
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: repack tensor %s (type %s) with q4_0_q41block_f16\n", __func__, t->name, ggml_type_name(t->type));
-        // q4_0 keeps its per-row scale bit-exact (lossless); q4_1/q4_K are
-        // dequant-requantized onto the shared zp=8 q4_0 grid (lossy).
+        // Keep the original 608B Q41Block contract. Q4_1/Q4_K preserve
+        // nibbles and fold their offsets into per-row uint8 zero points.
+        // Zero-point rounding/clamping is intentionally lossy.
         switch (t->type) {
             case GGML_TYPE_Q4_0:
                 return ggml::cpu::riscv64_spacemit::repack_q4_0_to_q41(t, data, data_size);
@@ -2559,8 +2566,8 @@ class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
     void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: unpack tensor %s from q4_0_q41block_f16\n", __func__, t->name);
         // Writes the tensor back in its source type layout: bit-exact for
-        // q4_0/q4_1 (q4_1 carries the shared zp as its min), q4_K re-encoded
-        // by the reference quantizer.
+        // q4_0; q4_1 reconstructs an approximate half min from each row's
+        // integer zero point, and q4_K is re-encoded by the reference quantizer.
         auto ok = ggml::cpu::riscv64_spacemit::unpack_q41_to_q4_0_common(t, data, data_size);
         GGML_ASSERT(ok == 0);
     }
@@ -2657,7 +2664,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 // Dense (2-D) Q4_1 weights run on the f16 compute path
-                // (requantized onto the shared-zp Q41 grid); the i8 repacks
+                // (folded to per-row scale/uint8 zero point); the i8 repacks
                 // below serve MoE expert (3-D) tensors only.
                 if (ggml::cpu::riscv64_spacemit::use_f16_link(cur)) {
                     return &ggml::cpu::riscv64_spacemit::q4_0_f16_impl;
@@ -2686,7 +2693,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 // Dense (2-D) Q4_K weights run on the f16 compute path
-                // (requantized onto the shared-zp Q41 grid); the i8 repacks
+                // (folded to per-row scale/uint8 zero point); the i8 repacks
                 // below serve MoE expert (3-D) tensors only.
                 if (ggml::cpu::riscv64_spacemit::use_f16_link(cur)) {
                     return &ggml::cpu::riscv64_spacemit::q4_0_f16_impl;
@@ -2825,13 +2832,12 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     size_t nbytes = row_nbytes;
     switch (tensor->type) {
         case GGML_TYPE_Q4_K:
-            // Q41Block f16 path: 19 bytes per row per K32 block (608B/32),
-            // padded to 32 rows.  One q4_K source block (QK_K=256) holds 8
-            // K32 windows, so the per-source-block destination size is 8*19.
+            // Original Q41Block stores 19 bytes per row per K32 block.
+            // One Q4_K source block contains eight such windows.
             // 3-D expert tensors keep the MoE q4_1 remap; a 2-D weight that
             // failed the f16 gate stays natural (no dense i8 repack remains).
             nbytes = ggml::cpu::riscv64_spacemit::use_f16_link(tensor)
-                         ? remap_block_nbytes(sizeof(block_q4_K), 8 * 19, 32)
+                         ? remap_block_nbytes(sizeof(block_q4_K), 8 * sizeof(ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>) / 32, 32)
                          : (tensor->ne[2] > 1 ? remap_block_nbytes(sizeof(block_q4_K), sizeof(block_q4_1) * 8)
                                               : add_strided_nbytes(row_nbytes, 1, 1));
             break;
@@ -2861,18 +2867,18 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             }
             break;
         case GGML_TYPE_Q4_0:
-            // Gated f16 path stores Q41Block<32,32,2> (608B) per 32 rows x K32
-            // window = 19 bytes per row per K32 block, padded to 32 rows.
+            // Original Q41Block stores 19 bytes per row per K32 block,
+            // padded to 32 rows.
             // Everything else (MoE i8 permutation repacks, gate-failed dense)
             // keeps the natural size.
             nbytes = ggml::cpu::riscv64_spacemit::use_f16_link(tensor)
-                         ? remap_block_nbytes(sizeof(block_q4_0), 19, 32)
+                         ? remap_block_nbytes(sizeof(block_q4_0), sizeof(ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>) / 32, 32)
                          : add_strided_nbytes(row_nbytes, 1, 1);
             break;
         case GGML_TYPE_Q4_1:
-            // Q41Block f16 path, same 19B/row/K32 allocation as Q4_0 above.
+            // Q41Block f16 path, same allocation as Q4_0 above.
             nbytes = ggml::cpu::riscv64_spacemit::use_f16_link(tensor)
-                         ? remap_block_nbytes(sizeof(block_q4_1), 19, 32)
+                         ? remap_block_nbytes(sizeof(block_q4_1), sizeof(ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>) / 32, 32)
                          : add_strided_nbytes(row_nbytes, 1, 1);
             break;
         default:

@@ -138,17 +138,17 @@ void spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8>(void *  in,
 }
 
 // One source struct contains 32x32 U4 values and produces four 32x8 FP16 tiles.
-template <>
-void spe_pack_cast<Q41Block<32, 32, 2>, _spe_fp16_, 32, 32, 32, 8>(void *  in,
-                                                                   int64_t in_offset,
-                                                                   int64_t in_stride,
-                                                                   void *  out,
-                                                                   int64_t out_offset,
-                                                                   int64_t out_stride,
-                                                                   int64_t src_mc,
-                                                                   int64_t src_kc,
-                                                                   int64_t dst_mc,
-                                                                   int64_t dst_kc) {
+template <ime2::q41_zero_point_mode Mode>
+static void spe_pack_cast_q41(void *  in,
+                             int64_t in_offset,
+                             int64_t in_stride,
+                             void *  out,
+                             int64_t out_offset,
+                             int64_t out_stride,
+                             int64_t src_mc,
+                             int64_t src_kc,
+                             int64_t dst_mc,
+                             int64_t dst_kc) {
     using in_type                     = Q41Block<32, 32, 2>;
     constexpr int64_t tiles_per_block = 32 / 8;
     constexpr int64_t tile_bytes      = 32 * 8 * sizeof(_spe_fp16_);
@@ -165,9 +165,12 @@ void spe_pack_cast<Q41Block<32, 32, 2>, _spe_fp16_, 32, 32, 32, 8>(void *  in,
 
     const auto *  src        = reinterpret_cast<const uint8_t *>(in) + in_offset;
     auto *        dst        = reinterpret_cast<uint8_t *>(out) + out_offset;
-    const int32_t zero_point = src[offsetof(in_type, zp)];
     for (int64_t mo = 0; mo < src_mc; ++mo) {
-        ime2::_spe_pack_cast_q41_f16_m32k32(src + mo * in_stride, dst + mo * out_stride, zero_point, src_kc);
+        if constexpr (Mode == ime2::q41_zero_point_mode::fixed_8) {
+            ime2::_spe_pack_cast_q41_fixed8_f16_m32k32(src + mo * in_stride, dst + mo * out_stride, 8, src_kc);
+        } else {
+            ime2::_spe_pack_cast_q41_f16_m32k32(src + mo * in_stride, dst + mo * out_stride, src_kc);
+        }
     }
 }
 
@@ -181,10 +184,24 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
                                                       const size_t           src_mb,
                                                       const size_t           src_kb,
                                                       const size_t           dst_mb,
-                                                      const size_t           dst_kb) {
+                                                      const size_t           dst_kb,
+                                                      q41_zero_point_mode mode) {
     SpineArchInfoDef arch_info;
     arch_info.value = march;
     if (!(arch_info.fields.core_ext_info.fields.ime & SPE_ARCH_IME2) || arch_info.fields.vector_info != 128) {
+        return nullptr;
+    }
+
+    // Resolve the optional specialization once; never inspect weight data or
+    // branch on the mode inside the returned callback's hot block loop.
+    if (mode == q41_zero_point_mode::fixed_8) {
+        if (in_type == typeid(Q41Block<32, 32, 2>) && out_type == typeid(_spe_fp16_) &&
+            src_mb == 32 && src_kb == 32 && dst_mb == 32 && dst_kb == 8) {
+            return spe_pack_cast_q41<q41_zero_point_mode::fixed_8>;
+        }
+        return nullptr;
+    }
+    if (mode != q41_zero_point_mode::per_row) {
         return nullptr;
     }
 
@@ -203,7 +220,7 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
         { typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8> },
         { typeid(float), typeid(_spe_fp16_), 1, 1, 32, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8> },
         { typeid(Q41Block<32, 32, 2>), typeid(_spe_fp16_), 32, 32, 32, 8,
-          spe_pack_cast<Q41Block<32, 32, 2>, _spe_fp16_, 32, 32, 32, 8> },
+          spe_pack_cast_q41<q41_zero_point_mode::per_row> },
     };
     // clang-format on
 

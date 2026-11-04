@@ -22,11 +22,10 @@ struct uint4x2_t {
 
 using _spe_fp16_ = _Float16;
 
-// Q4-family dense repack block: 32 M rows x 32 U4 K values (16 packed bytes
-// per row), shared zero point, one f16 scale per row.  q4_0 repacks into it
-// losslessly; q4_1/q4_K requantize onto the shared zp=8 q4_0 grid.  Layout
-// must stay bit-identical to spine-kernel's Q41Block<32,32,2> -- the vendored
-// ime2 pack_cast asm and the Q41 GEMV read it directly.
+// Original Q41Block layout, unchanged from spine-kernel. All Q4 sources
+// use every scale/zp slot per row and K32 block; Q4_0 fills all zps with 8.
+// The comments inside the unchanged struct describe the historical shared-zp
+// consumer, not the unified per-row semantics used by the current kernels.
 template <size_t, size_t, size_t> struct Q41Block;
 
 template <> struct Q41Block<32, 32, 2> {
@@ -48,15 +47,19 @@ int repack(ggml_tensor * t, const void * data, size_t data_size);
 // lossless q4_0 -> Q41Block<32,32,2> repack for the f16 path
 int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size);
 
-// q4_1 / q4_K weights requantized to q4_0 (dequant -> requant) and repacked
-// into Q41Block<32,32,2> for the f16 path.  Not lossless: q4_1's per-block
-// min and q4_K's per-K32 scales/mins are folded into a shared zp=8 q4_0 grid.
+// Q4_1 copies source scale bits and nibbles, then rounds -min/scale to
+// a saturated uint8 zero point. Q4_K first folds each K32 scale into FP16
+// and rounds its offset using that stored scale. These mappings are lossy:
+// offsets outside zp=[0,255], fractional zero points, and nonzero offsets
+// with zero scale cannot be represented. Zero scale uses zp=0. No nibble
+// requantization or replacement metadata is introduced.
 int repack_q4_1_to_q41(ggml_tensor * t, const void * data, size_t data_size);
 int repack_q4_k_to_q41(ggml_tensor * t, const void * data, size_t data_size);
 
-// shared inverse for all three Q41Block sources: writes the tensor back in
-// its source type layout (q4_0/q4_1 exactly, q4_K re-encoded by the
-// reference quantizer).  Callers pass the source type's byte count.
+// Read back in the source type: Q4_0 restores original bytes; Q4_1
+// reconstructs min=-zp*scale (rounded to half); Q4_K uses the reference
+// quantizer. Readback is not a correctness oracle for original source data.
+// Callers pass the source type's byte count.
 int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_size);
 
 // Q5_0 tensor converted exactly to Q8_0 and repacked into the q8_0 32x32 layout (allocation: Q8_0 size)

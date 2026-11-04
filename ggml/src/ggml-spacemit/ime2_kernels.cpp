@@ -1946,117 +1946,92 @@ void gemm_kernel_i8i4_m1(const uint8_t * quant_a_ptr,
     }
 }
 
-// Q41Block<32,32,2>-layout variant of gemm_kernel_i8i4_m1 (decode GEMV) for
-// the f16 traits' M == 1 route: same vmadot hp inner loop and same A-side
-// layout, but B blocks come from the Q41 repack instead of the legacy
-// block_q4_0x32.  Only the B field offsets and block stride differ:
-//   legacy block_q4_0x32 (576B): scale @ +0,  data @ +64,  stride 576
-//   Q41Block<32,32,2>   (608B): data  @ +0,  scale @ +544, stride 608
-// (608 = 512B data + 32B zp + 64B scale; zp[0]=8 matches the implicit 8 the
-// legacy path bakes into the vmv.v.i v28, 8 correction).  The nibble order
-// and the [rows/32][kblocks] block indexing are identical between the two
-// repacks, so the vmadot core is reused verbatim.  Per-row tile pitch is
-// 608/32 = 19 bytes.
+// Decode GEMV for the common Q41Block layout used by Q4_0/Q4_1/Q4_K.
+// Every row and K32 block supplies its own uint8 zero point; Q4_0 stores 8.
+// Accumulate the integer dot and zero-point correction in INT32, then scale
+// and accumulate in FP32. No source quantization type is needed here.
 void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
-                             const uint8_t * quant_b_data,
-                             float *         c_ptr,
-                             size_t          count_n,
-                             size_t          k_blks) {
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_n,
+                           size_t          k_blks) {
+    // A stores (dA, -sum(qA), qA). Read each row's uint8 zero point
+    // from the unchanged Q41Block and correct the dot in INT32:
+    // C += dA * scaleB * (dot(qA,qB) + zpB * stored_negative_sum).
+    // Both the unsigned zero point and its product must avoid I8/I16 truncation.
+    using block_type = ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>;
+    static_assert(sizeof(block_type) == 608 && offsetof(block_type, zp) == 512 && offsetof(block_type, scale) == 544);
     for (size_t n = 0; n < count_n; n += 32) {
-        size_t    nblks         = (count_n - n) > 32 ? 32 : count_n - n;
-        uint8_t * QuantBDataPtr = (uint8_t *) quant_b_data + n * k_blks * 19;  // n * k_blks * 608/32
-        float *   CPtr          = c_ptr + n;
-        size_t    cnt           = k_blks;
-
+        const size_t nblks = std::min<size_t>(count_n - n, 32);
+        const uint8_t * b = quant_b_data + (n / 32) * k_blks * sizeof(block_type);
+        float * c = c_ptr + n;
+        // clang-format off
         __asm__ volatile(
-
-            // t3 = k/32
-            "mv           t3, %[BCK]              \n\t"
-            "mv           t4, %[NBLKS]            \n\t"
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vmv.v.i      v0, 1                   \n\t"  // init the scale
-            "mv           s2, %[pA]               \n\t"  // s2 = pASCL
-            "addi         s3, %[pA], 4+2          \n\t"  // s3 = pAData, (pA+AScl+ASum)
-            "addi         s4, %[pB], 512+32       \n\t"  // s4 = pBSCL, (pB+Data+zp)
-            "mv           s5, %[pB]               \n\t"  // s5 = pBdata;
-            "mv           s6, %[pC]               \n\t"
-
-            "vsll.vi      v1, v0, 4               \n\t"
-            "vxor.vv      v2, v0, v0              \n\t"  // clear acc
-            "vfcvt.f.x.v  v0, v0                  \n\t"
-            "vfcvt.f.x.v  v1, v1                  \n\t"
-
-            // vmadot hp: vle*7 flw*1 vecIns*14 vmadot*8
-            ".align 4                             \n\t"
-            "_K_LPST%=:                           \n\t"
-
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vl4r.v       v4, (s5)                \n\t"  // B Data 4VRF * 8Row * 32
-            "addi         s5, s5, 128*4+96        \n\t"  // 1024bit + zp, Q41 block 608B
-
-            "vsetvli      t0, x0, e8, mf2         \n\t"
-            "vle8.v       v30, (s4)               \n\t"  // B Scale 4VRF*8Row*FP16 = 512bit
-            "addi         s4, s4, 96+128*4        \n\t"
-
-            "vsetvli      t0, x0, e8, mf4         \n\t"
-            "vle8.v       v3, (s3)                \n\t"  // A Data M1*K32*int8 = 256bit
-            "addi         s3, s3, 32+6            \n\t"
-
-            "flw          f0, (s2)                \n\t"  // A Scale fp32
-            "lh           t2, 4(s2)               \n\t"  // A sum of int16
-            "addi         s2, s2, 6+32            \n\t"
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vmv.v.i      v28, 8                  \n\t"  // Bzp u8 -> u16 (Q41 zp[0]=8)
-            "vsetvli      t0, x0, e8, m1          \n\t"
-            "vsrl.vi      v24, v3, 4              \n\t"
-
-            "vsetvli      t0, x0, e16, m1         \n\t"
-            "vmul.vx      v26, v28, t2            \n\t"  // asum*zp i16*i16
-            "vnpack4.vv   v8, v3, v3, 3           \n\t"  // lo4 of A
-            "vnpack4.vv   v10, v24, v24, 3        \n\t"  // hi4 of A
-
-            "vfcvt.f.x.v  v16, v26                \n\t"  // zp i16 -> fp16
-            "vadd.vi      v18, v16, 0             \n\t"
-            "vadd.vi      v20, v16, 0             \n\t"
-            "vadd.vi      v22, v16, 0             \n\t"
-
-            "vmadotsu.hp  v16, v10, v4, v1, 0, i4 \n\t"  // high 4
-            "vmadotsu.hp  v18, v10, v5, v1, 0, i4 \n\t"
-            "vmadotsu.hp  v20, v10, v6, v1, 0, i4 \n\t"
-            "vmadotsu.hp  v22, v10, v7, v1, 0, i4 \n\t"
-            "vmadotu.hp   v16, v8, v4, v0, 0, i4  \n\t"  // low 4
-            "vmadotu.hp   v18, v8, v5, v0, 0, i4  \n\t"
-            "vmadotu.hp   v20, v8, v6, v0, 0, i4  \n\t"
-            "vmadotu.hp   v22, v8, v7, v0, 0, i4  \n\t"
-
-            "vpack.vv     v24, v16, v18, 1        \n\t"
-            "vpack.vv     v26, v20, v22, 1        \n\t"
-            "vpack.vv     v16, v24, v26, 2        \n\t"
-
-            "vsetvli      t0, x0, e16, mf2        \n\t"
-            // mac result * b_scale; f16*f16->f32
-            "vfwmul.vv     v31, v30, v16          \n\t"
-
-            "vsetvli      t0, x0, e32, m1         \n\t"
-            // static_cast<float>(qsum * b_scale) * a_scale;
-            "vfmacc.vf    v2, f0, v31             \n\t"
-
-            "addi         t3, t3, -1              \n\t"
-            "bgtz         t3, _K_LPST%=           \n\t"
-            "_K_LPND%=:                           \n\t"
-
-            //-----------------------------------------
-            // STORE Equal 32N-------------------------
-            "_ST32%=:                             \n\t"
-            "vsetvli      t0, t4, e32, m1         \n\t"
-            "vse32.v      v2, (s6)                \n\t"  // M0 [N0 : N32]; FP32(1024bit)
-
-            "_FUNC_END%=:                         \n\t"
-
+            "mv t3, %[BCK]\n\t"
+            "mv t4, %[NBLKS]\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "mv s2, %[pA]\n\t"
+            "addi s3, %[pA], 6\n\t"
+            "mv s5, %[pB]\n\t"
+            "mv s6, %[pC]\n\t"
+            "vxor.vv v2, v0, v0\n\t"
+            ".align 4\n\t"
+            "Q4_AFFINE_GEMV_K%=:\n\t"
+            "vsetvli t0, x0, e8, m1\n\t"
+            "vl4r.v v4, (s5)\n\t"
+            "vsetvli t0, x0, e8, mf4\n\t"
+            "vle8.v v3, (s3)\n\t"
+            "addi s3, s3, 38\n\t"
+            "flw f0, (s2)\n\t"
+            "lh t2, 4(s2)\n\t"
+            "addi s2, s2, 38\n\t"
+            "vsetvli t0, x0, e8, m1\n\t"
+            "vsrl.vi v24, v3, 4\n\t"
+            "vnpack4.vv v8, v3, v3, 3\n\t"
+            "vnpack4.vv v10, v24, v24, 3\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "vxor.vv v16, v16, v16\n\t"
+            "vxor.vv v18, v18, v18\n\t"
+            "vxor.vv v20, v20, v20\n\t"
+            "vxor.vv v22, v22, v22\n\t"
+            "vmadotsu v16, v10, v4, i4\n\t"
+            "vmadotsu v18, v10, v5, i4\n\t"
+            "vmadotsu v20, v10, v6, i4\n\t"
+            "vmadotsu v22, v10, v7, i4\n\t"
+            "vsll.vi v16, v16, 4\n\t"
+            "vsll.vi v18, v18, 4\n\t"
+            "vsll.vi v20, v20, 4\n\t"
+            "vsll.vi v22, v22, 4\n\t"
+            "vmadotu v16, v8, v4, i4\n\t"
+            "vmadotu v18, v8, v5, i4\n\t"
+            "vmadotu v20, v8, v6, i4\n\t"
+            "vmadotu v22, v8, v7, i4\n\t"
+            "vsetvli t0, x0, e16, m1\n\t"
+            "vpack.vv v24, v16, v18, 2\n\t"
+            "vpack.vv v26, v20, v22, 2\n\t"
+            "vpack.vv v16, v24, v26, 3\n\t"
+            "vsetvli t0, x0, e16, mf2\n\t"
+            "addi s4, s5, 512\n\t"
+            "vle8.v v28, (s4)\n\t"
+            "vzext.vf2 v26, v28\n\t"
+            "vwmacc.vx v16, t2, v26\n\t"
+            "addi s4, s5, 544\n\t"
+            "vle16.v v30, (s4)\n\t"
+            "vfwcvt.f.f.v v22, v30\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "vfcvt.f.x.v v20, v16\n\t"
+            "vfmul.vv v20, v20, v22\n\t"
+            "vfmacc.vf v2, f0, v20\n\t"
+            "addi s5, s5, %[block_bytes]\n\t"
+            "addi t3, t3, -1\n\t"
+            "bgtz t3, Q4_AFFINE_GEMV_K%=\n\t"
+            "vsetvli t0, t4, e32, m1\n\t"
+            "vse32.v v2, (s6)\n\t"
             :
-            : [BCK] "r"(cnt), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(QuantBDataPtr), [pC] "r"(CPtr)
-            : "cc", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+            : [BCK] "r"(k_blks), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(b), [pC] "r"(c),
+              [block_bytes] "i"(sizeof(block_type))
+            : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
+        // clang-format on
     }
 }
 

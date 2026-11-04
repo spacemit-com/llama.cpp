@@ -1460,11 +1460,8 @@ using ggml::cpu::riscv64_spacemit::uint4x2_t;
 
 namespace mlir::speir::spekernel::ime2 {
 
-// Q41Block<32,32,2> stores 32x32 U4 values and one scale per row.
-// v0 selects the second K32 row in each FP16 register; v4..v7 carry the next block.
-// v8..v23 hold the current FP16 rows, and v24..v31 receive each packed 16-row half.
-// zero_point comes from the first input block of the entire kernel call.
-SPINE_FORCE_INLINE void _spe_pack_cast_q41_f16_m32k32(const void * in, void * out, int32_t zero_point, int64_t blocks) {
+// Internal Q4_0 specialization; the shared pack callback binds zero_point=8.
+SPINE_FORCE_INLINE void _spe_pack_cast_q41_fixed8_f16_m32k32(const void * in, void * out, int32_t zero_point, int64_t blocks) {
     using block_type = Q41Block<32, 32, 2>;
     static_assert(sizeof(uint4x2_t) == 1 && sizeof(_spe_fp16_) == 2);
     if (blocks == 0) {
@@ -1511,6 +1508,153 @@ SPINE_FORCE_INLINE void _spe_pack_cast_q41_f16_m32k32(const void * in, void * ou
         "bnez           %[blocks], LOOP_Q41_BLOCK%=                              \n\t"
         : [in] "+&r"(src), [out] "+&r"(dst), [blocks] "+&r"(blocks)
         : [zero_point] "r"(zero_point), [tile_stride] "i"(32 * 8 * sizeof(_spe_fp16_)),
+          [block_bytes] "i"(sizeof(block_type)), [scale_offset] "i"(offsetof(block_type, scale))
+        : "cc", "memory", "t0", "t1", "t2", "t3",
+          "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
+          "fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7");
+    // clang-format on
+}
+
+// Original 608-byte Q41Block, using the full per-row uint8 zero point.
+// Subtract in I16 before converting to FP16; q-zp is always in [-255,15].
+// Keep the baseline paired-row scaling, tile packing, and next-block preload.
+SPINE_FORCE_INLINE void _spe_pack_cast_q41_f16_m32k32(const void * in, void * out, int64_t blocks) {
+    using block_type = Q41Block<32, 32, 2>;
+    static_assert(sizeof(uint4x2_t) == 1 && sizeof(_spe_fp16_) == 2);
+    if (blocks == 0) {
+        return;
+    }
+    const auto * src = reinterpret_cast<const uint8_t *>(in);
+    auto *       dst = reinterpret_cast<uint8_t *>(out);
+
+    // A finite FP16 scale times an integer of magnitude <=255 is exact in FP32.
+    // Direct FP16 multiplication retains that final rounding without FP32 intermediates.
+    // clang-format off
+    __asm__ volatile(
+        "vsetvli        t0, zero, e16, m1, tu, mu                                \n\t"
+        "vid.v          v1                                                       \n\t"
+        "li             t0, 31                                                   \n\t"
+        "vmsgtu.vx      v0, v1, t0                                               \n\t"
+        "vl4re8.v       v4, (%[in])                                              \n\t"
+        "LOOP_Q41_BLOCK%=:                                                       \n\t"
+        "addi           t1, %[in], %[scale_offset]                               \n\t"
+        "vsetvli        t0, zero, e16, m8, tu, mu                                \n\t"
+        "vzext.vf2 v8, v4\n\t"
+        "vsrl.vi v16, v8, 4\n\t"
+        "vand.vi v8, v8, 15\n\t"
+        "vsll.vi v16, v16, 8\n\t"
+        "vor.vv v24, v8, v16\n\t"
+        "vzext.vf2 v8, v24\n\t"
+        "vzext.vf2 v16, v28\n\t"
+        "vsetvli t0, zero, e16, m1, tu, mu\n\t"
+        "lbu t2, -32(t1)\n\t"
+        "lbu t3, -31(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v8, v8, v1\n\t"
+        "lbu t2, -30(t1)\n\t"
+        "lbu t3, -29(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v9, v9, v1\n\t"
+        "lbu t2, -28(t1)\n\t"
+        "lbu t3, -27(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v10, v10, v1\n\t"
+        "lbu t2, -26(t1)\n\t"
+        "lbu t3, -25(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v11, v11, v1\n\t"
+        "lbu t2, -24(t1)\n\t"
+        "lbu t3, -23(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v12, v12, v1\n\t"
+        "lbu t2, -22(t1)\n\t"
+        "lbu t3, -21(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v13, v13, v1\n\t"
+        "lbu t2, -20(t1)\n\t"
+        "lbu t3, -19(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v14, v14, v1\n\t"
+        "lbu t2, -18(t1)\n\t"
+        "lbu t3, -17(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v15, v15, v1\n\t"
+        "lbu t2, -16(t1)\n\t"
+        "lbu t3, -15(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v16, v16, v1\n\t"
+        "lbu t2, -14(t1)\n\t"
+        "lbu t3, -13(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v17, v17, v1\n\t"
+        "lbu t2, -12(t1)\n\t"
+        "lbu t3, -11(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v18, v18, v1\n\t"
+        "lbu t2, -10(t1)\n\t"
+        "lbu t3, -9(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v19, v19, v1\n\t"
+        "lbu t2, -8(t1)\n\t"
+        "lbu t3, -7(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v20, v20, v1\n\t"
+        "lbu t2, -6(t1)\n\t"
+        "lbu t3, -5(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v21, v21, v1\n\t"
+        "lbu t2, -4(t1)\n\t"
+        "lbu t3, -3(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v22, v22, v1\n\t"
+        "lbu t2, -2(t1)\n\t"
+        "lbu t3, -1(t1)\n\t"
+        "vmv.v.x v1, t2\n\t"
+        "vmerge.vxm v1, v1, t3, v0\n\t"
+        "vsub.vv v23, v23, v1\n\t"
+        "vsetvli t0, zero, e16, m8, tu, mu\n\t"
+        "vfcvt.f.x.v v8, v8\n\t"
+        "vfcvt.f.x.v v16, v16\n\t"
+        // v4..v7 are free: preload only if another complete K block exists.
+        "addi           %[blocks], %[blocks], -1                                 \n\t"
+        "beqz           %[blocks], Q41_SCALE_BLOCK%=                             \n\t"
+        "addi           %[in], %[in], %[block_bytes]                             \n\t"
+        "vl4re8.v       v4, (%[in])                                              \n\t"
+        "Q41_SCALE_BLOCK%=:                                                      \n\t"
+        "vsetvli        t0, zero, e16, m1, tu, mu                                \n\t"
+        PACK_CAST_LOAD_SCALE_F16_M16_LO
+        PACK_CAST_SCALE_F16_M16K32_LO
+        PACK_CAST_PACK_F16_M16K32_LO
+        "mv             t2, %[out]                                               \n\t"
+        "addi           t3, t2, 128                                              \n\t"
+        PACK_CAST_STORE_F16_M16K32
+        // The final sixteen rows and their own scales use the same vtype.
+        PACK_CAST_LOAD_SCALE_F16_M16_HI
+        PACK_CAST_SCALE_F16_M16K32_HI
+        PACK_CAST_PACK_F16_M16K32_HI
+        "addi           t2, %[out], 256                                          \n\t"
+        "addi           t3, t2, 128                                              \n\t"
+        PACK_CAST_STORE_F16_M16K32
+        "addi           %[out], %[out], 1024                                     \n\t"
+        "addi           %[out], %[out], 1024                                     \n\t"
+        "bnez           %[blocks], LOOP_Q41_BLOCK%=                              \n\t"
+        : [in] "+&r"(src), [out] "+&r"(dst), [blocks] "+&r"(blocks)
+        : [tile_stride] "i"(32 * 8 * sizeof(_spe_fp16_)),
           [block_bytes] "i"(sizeof(block_type)), [scale_offset] "i"(offsetof(block_type, scale))
         : "cc", "memory", "t0", "t1", "t2", "t3",
           "ft0", "ft1", "ft2", "ft3", "ft4", "ft5", "ft6", "ft7",
@@ -2429,13 +2573,18 @@ void spe_reducesum_mxn(void * in, int64_t lhs_offset, int64_t lhs_stride0, int64
 // ---- inc/spe_kernel_cxx_helper.h: dispatch getter declarations (macros
 // expanded; spe_kernel_dispatch.cpp defines them). ----
 namespace mlir::speir::spekernel::ime2 {
+// Resolver hint for Q41Block -> FP16 only. The returned pack callback keeps
+// the same signature; fixed_8 requires every input zero-point slot to equal 8.
+enum class q41_zero_point_mode { per_row, fixed_8 };
+
 spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         march,
                                                       const std::type_info & in_type,
                                                       const std::type_info & out_type,
                                                       const size_t           src_mb,
                                                       const size_t           src_kb,
                                                       const size_t           dst_mb,
-                                                      const size_t           dst_kb);
+                                                      const size_t           dst_kb,
+                                                      q41_zero_point_mode mode = q41_zero_point_mode::per_row);
 }  // namespace mlir::speir::spekernel::ime2
 
 namespace mlir::speir::spekernel::rvv {
