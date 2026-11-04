@@ -1848,6 +1848,37 @@ int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) 
     return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
 
+int unpack_q8_0_32_to_f32(const ggml_tensor * t, void * data, size_t data_size) {
+    const int64_t nrows = ggml_nrows(t);
+    if (t->type != GGML_TYPE_F32 || t->ne[0] % QK8_0 != 0 || t->ne[1] % 32 != 0 ||
+        data_size != static_cast<size_t>(nrows) * t->ne[0] * sizeof(float)) {
+        return -1;
+    }
+
+    const int64_t nblocks = t->ne[0] / QK8_0;
+    const auto * src = static_cast<const block_q8_0x32 *>(t->data);
+    auto * dst = static_cast<uint8_t *>(data);
+    for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
+        for (int64_t kb = 0; kb < nblocks; ++kb) {
+            const auto & block = src[(n0 / 32) * nblocks + kb];
+            const auto * qs = reinterpret_cast<const int8_t *>(block.qs);
+            for (int row = 0; row < 32; ++row) {
+                const float d = GGML_FP16_TO_FP32(block.d[row]);
+                // Each group of eight rows stores its low K16 lanes before its high K16 lanes.
+                const size_t lane = (row / 8) * 256 + (row % 8) * 16;
+                uint8_t * out = dst + ((n0 + row) * t->ne[0] + kb * QK8_0) * sizeof(float);
+                for (int k = 0; k < 16; ++k) {
+                    const float lo = d * qs[lane + k];
+                    const float hi = d * qs[lane + 128 + k];
+                    memcpy(out + k * sizeof(float), &lo, sizeof(lo));
+                    memcpy(out + (k + 16) * sizeof(float), &hi, sizeof(hi));
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 template <> int repack<block_q8_0, 32, 32>(ggml_tensor * t, const void * data, size_t data_size) {
 #if 1
     return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl_ref(t, 32, data, data_size));

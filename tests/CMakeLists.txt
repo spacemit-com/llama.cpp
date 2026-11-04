@@ -314,6 +314,11 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+if (GGML_SPACEMIT)
+    llama_build_and_test(test-spacemit-readback.cpp LINK ggml)
+    set_tests_properties(test-spacemit-readback PROPERTIES SKIP_RETURN_CODE 77)
+    llama_build(test-spacemit-f16-workspace.cpp LINK ggml)
+endif()
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")

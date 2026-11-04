@@ -1729,23 +1729,28 @@ private:
     static constexpr size_t KB_BYTES   = sizeof(BLOC_TYPE);
     static constexpr size_t ROW_PITCH  = KB_BYTES / NB;  // bytes per row per block
 
+    static size_t partial_workspace_size(size_t M, size_t N, int n_threads) {
+        constexpr size_t partial_cap = size_t{ 512 } << 20;
+        const size_t m_pad = GGML_PAD(M, F16_M_TILE);
+        const size_t n_pad = GGML_PAD(N, F16_N_TILE);
+        if (m_pad == 0 || n_pad == 0 || m_pad > partial_cap / sizeof(_Float16) / n_pad) {
+            return 0;
+        }
+        const size_t slice_size = m_pad * n_pad * sizeof(_Float16);
+        const size_t slices = std::min(static_cast<size_t>(n_threads), partial_cap / slice_size);
+        // Include alignment and the largest cluster base-pointer table.
+        return slices * slice_size + 64 + 16 * sizeof(uint64_t);
+    }
+
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
         }
-        const size_t N        = static_cast<size_t>(op->src[0]->ne[1]);
-        const size_t M        = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
-        const size_t M_pad    = (M + F16_M_TILE - 1) & ~size_t{ F16_M_TILE - 1 };
-        const size_t nc_count = (N + F16_N_TILE - 1) / F16_N_TILE;
-        // F16 partials: [M/16][nc][16][nth][32], with 64B alignment slack.
-        const size_t partial_size = M_pad * nc_count * static_cast<size_t>(n_threads) * F16_N_TILE * sizeof(_Float16);
-        // Limit split-K workspace to 512 MiB.
-        constexpr size_t partial_cap = size_t{ 512 } << 20;
+        const size_t N         = static_cast<size_t>(op->src[0]->ne[1]);
+        const size_t M         = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
         const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
         const size_t gemv_size = ((K + KB - 1) / KB) * 38;
-        size_t       need      = partial_size <= partial_cap ? partial_size + 64 : 0;
-        need                   = std::max(need, GGML_PAD(gemv_size, sizeof(int64_t)));
-        size                   = need;
+        size = std::max(partial_workspace_size(M, N, n_threads), GGML_PAD(gemv_size, sizeof(int64_t)));
         return true;
     }
 
@@ -1780,6 +1785,7 @@ private:
         constexpr size_t n_tile = F16_N_TILE;
         const size_t     mt_count = (M + m_tile - 1) / m_tile;
         const size_t     nt_count = (N + n_tile - 1) / n_tile;
+        const size_t partial_workspace = std::min(ctx.workspace_size, partial_workspace_size(M, N, nth));
 
         void *      tcm_buffer      = ctx.shared.data;
         const int64_t tcm_buffer_size = ctx.shared.size;
@@ -2013,7 +2019,7 @@ private:
             const size_t m_fit = slots == 2 ? m_fit2 : m_fit1;
             // Prefer split-K only when the cluster A budget is small and split-K needs fewer M passes.
             bool route_split_k = false;
-            if (m_fit1 < 128 && K % (KB * (size_t) nth) == 0) {
+            if (m_fit >= m_tile && m_fit1 < 128 && K % (KB * (size_t) nth) == 0) {
                 const size_t ksg  = (size_t) K / (size_t) nth;
                 const size_t bg   = n_tile * ksg * sizeof(_Float16);
                 const size_t mfg  = tcm_size > bg
@@ -2026,8 +2032,10 @@ private:
             }
             // Per-thread TCM: [m_fit x ks A][slots x 32 x ks B][64B flags].
             const size_t slice_stride = mt_count * nt_count * m_tile * n_tile;
+            const size_t metadata_size = 64 + static_cast<size_t>(nth) * sizeof(uint64_t);
             if (!route_split_k && K % (KB * g) == 0 && m_fit >= m_tile &&
-                g * slice_stride * sizeof(_Float16) + 128 <= ctx.workspace_size) {
+                partial_workspace >= metadata_size &&
+                g <= (partial_workspace - metadata_size) / sizeof(_Float16) / slice_stride) {
                 const size_t group    = (size_t) ith / 2;
                 const size_t intra    = (size_t) ith % 2;
                 const size_t sib      = (size_t) ith ^ 1;
@@ -2181,8 +2189,8 @@ private:
                 continue;
             }
             const size_t slice_stride = mt_count * nt_count * m_tile * n_tile;
-            const size_t partial_size = s * slice_stride * sizeof(_Float16);
-            if (partial_size + 64 > ctx.workspace_size) {
+            if (partial_workspace < 64 ||
+                s > (partial_workspace - 64) / sizeof(_Float16) / slice_stride) {
                 continue;
             }
             s_count = s;
@@ -2190,8 +2198,41 @@ private:
             break;
         }
         if (s_count == 0) {
-            GGML_ABORT("q4_0_f16: no K-slice count fits TCM/workspace (K=%zu nth=%d tcm=%zu wsize=%zu)", K, nth,
-                       tcm_size, ctx.workspace_size);
+            // Stream K32 chunks into disjoint output tiles without a partials buffer.
+            const size_t bytes_per_k = (m_tile + n_tile) * sizeof(_Float16);
+            const size_t kb = std::min(K, (tcm_size / bytes_per_k) & ~(KB - 1));
+            GGML_ASSERT(kb >= KB && K % KB == 0);
+            auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
+            auto * b_tile = a_tile + m_tile * kb;
+            const size_t b_row_stride = (K / KB) * KB_BYTES;
+            const size_t tile_count = mt_count * nt_count;
+            for (size_t ti = static_cast<size_t>(ith); ti < tile_count; ti += static_cast<size_t>(nth)) {
+                const size_t m0 = (ti / nt_count) * m_tile;
+                const size_t nt = ti % nt_count;
+                const size_t n0 = nt * n_tile;
+                const size_t mc = std::min(m_tile, M - m0);
+                const size_t nc = std::min(n_tile, N - n0);
+                auto * c_tile = reinterpret_cast<float *>(out + m0 * out_row_stride) + n0;
+                for (size_t k0 = 0; k0 < K; k0 += kb) {
+                    const size_t kk = std::min(kb, K - k0);
+                    pack_func((void *) (a_src + m0 * a_src_stride),
+                              static_cast<int64_t>(k0 * sizeof(float)),
+                              static_cast<int64_t>(a_src_stride),
+                              (void *) a_tile, 0,
+                              static_cast<int64_t>(kb * m_tile * sizeof(_Float16)),
+                              static_cast<int64_t>(mc), static_cast<int64_t>(kk),
+                              1, static_cast<int64_t>(kk / 8));
+                    q41_func((void *) (b_src + nt * b_row_stride + (k0 / KB) * KB_BYTES),
+                             0, static_cast<int64_t>(b_row_stride),
+                             (void *) b_tile, 0,
+                             static_cast<int64_t>(kk / 8) * 512,
+                             1, static_cast<int64_t>(kk / KB),
+                             1, static_cast<int64_t>(kk / 8));
+                    ops.dot_f32acc(kk, b_tile, a_tile, c_tile, mc, nc,
+                                   out_row_stride / sizeof(float), k0 != 0);
+                }
+            }
+            return true;
         }
 
         const size_t a_budget = tcm_size - n_tile * ks * sizeof(_Float16);
@@ -2312,6 +2353,11 @@ class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
 class tensor_traits_f32_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         return repack_f32_to_q8_0_32(t, data, data_size);
+    }
+
+    void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
+        const int ok = unpack_q8_0_32_to_f32(t, data, data_size);
+        GGML_ASSERT(ok == 0);
     }
 };
 
@@ -2595,7 +2641,7 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             break;
     }
 
-    return nbytes;
+    return std::max(nbytes, ggml_nbytes(tensor));
 }
 
 bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {

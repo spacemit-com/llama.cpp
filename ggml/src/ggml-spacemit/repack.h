@@ -48,5 +48,6 @@ int unpack_q41_to_q4_0_common(const ggml_tensor * t, void * data, size_t data_si
 // Q5_0 tensor converted exactly to Q8_0 and repacked into the q8_0 32x32 layout (allocation: Q8_0 size)
 int repack_q5_0_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size);
 int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size);
+int unpack_q8_0_32_to_f32(const ggml_tensor * t, void * data, size_t data_size);
 
 }  // namespace ggml::cpu::riscv64_spacemit
