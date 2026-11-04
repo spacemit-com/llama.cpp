@@ -7,6 +7,8 @@
 // always builds an A100 march, so the ime2 / rvv gates always pass and the
 // scalar fallbacks are dead code.
 
+#include "ggml.h"
+#include "ime_kernels.h"
 #include "spe_kernels_core.h"
 
 #include <typeindex>
@@ -342,3 +344,31 @@ spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t    
 }
 
 }  // namespace mlir::speir::spekernel::rvv
+
+// Backend wrapper for the SPE GEMM inner kernel; keep core consumers here.
+namespace spacemit_kernels::ime2 {
+
+void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(count_m > 0 && count_m <= 16);
+    GGML_ASSERT(count_n > 0 && count_n <= 32);
+    GGML_ASSERT(gemm_k % 8 == 0);
+    // The spine mmt4d kernel has no accumulate epilogue (C = A @ B only).
+    GGML_ASSERT(!accumulate);
+
+    // Same native [K/8][M16|N32][K8] A/B layouts as the f32 kernel.  kc counts
+    // K8 groups and c_stride is a byte row stride; each row store is one
+    // vse16.v of count_n f16, so the caller must 64B-align c_ptr to keep one
+    // store inside a single DDR bank.
+    mlir::speir::spekernel::ime2::_spe_hpgemm_impl_m16n32k8_none(
+        count_m, count_n, gemm_k / 8, a_f16_k8, b_f16_k8, reinterpret_cast<int8_t *>(c_ptr),
+        ldc * sizeof(_Float16));
+}
+
+}  // namespace spacemit_kernels::ime2

@@ -1,8 +1,8 @@
 #include "ggml-impl.h"
 #include "ggml.h"
 #include "ime_kernels.h"
+#include "repack.h"
 #include "rvv_kernels.h"
-#include "spe_kernels_core.h"
 #include "string.h"
 
 #include <algorithm>
@@ -4750,29 +4750,6 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
     GGML_ASSERT(blk_len == 32);
     moe_gemm_kernel_i8i5_m2_impl(quant_a_ptr, quant_b_data, quant_b_zp, c_ptr, count_n, k_blks);
     return 2;
-}
-
-void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
-                                        const _Float16 * b_f16_k8,
-                                        _Float16 *       a_f16_k8,
-                                        _Float16 *       c_ptr,
-                                        size_t           count_m,
-                                        size_t           count_n,
-                                        size_t           ldc,
-                                        bool             accumulate) {
-    GGML_ASSERT(count_m > 0 && count_m <= 16);
-    GGML_ASSERT(count_n > 0 && count_n <= 32);
-    GGML_ASSERT(gemm_k % 8 == 0);
-    // The spine mmt4d kernel has no accumulate epilogue (C = A @ B only).
-    GGML_ASSERT(!accumulate);
-
-    // Same native [K/8][M16|N32][K8] A/B layouts as the f32 kernel.  kc counts
-    // K8 groups and c_stride is a byte row stride; each row store is one
-    // vse16.v of count_n f16, so the caller must 64B-align c_ptr to keep one
-    // store inside a single DDR bank.
-    mlir::speir::spekernel::ime2::_spe_hpgemm_impl_m16n32k8_none(
-        count_m, count_n, gemm_k / 8, a_f16_k8, b_f16_k8, reinterpret_cast<int8_t *>(c_ptr),
-        ldc * sizeof(_Float16));
 }
 
 // f16xf16 -> f32 macro tile with a K-accumulation epilogue, used by the
