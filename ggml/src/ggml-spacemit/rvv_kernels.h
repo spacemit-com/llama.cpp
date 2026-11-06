@@ -67,6 +67,12 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                                                     int                       ir0,
                                                     int                       ir1);
 
+#ifdef GGML_SPACEMIT_FA_IME2
+// Flash attention with S^T = K*Q^T and O^T += V^T*P^T on the IME2 fp16 engine (F16 K/V, DK % 8 == 0, DV % 16 == 0, <= 256).
+bool flash_attn_ext_f16_tiled_ime2_supported(const ggml_tensor * dst);
+void forward_flash_attn_ext_f16_tiled_ime2(ggml::spacemit::context & ctx, ggml_tensor * dst, int ir0, int ir1);
+#endif
+
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 void forward_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);

@@ -1434,6 +1434,11 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             const int64_t ir1 = MIN(ir0 + dr, nr);
 
             if (use_tiled) {
+#ifdef GGML_SPACEMIT_FA_IME2
+                if (spacemit_kernels::rvv::flash_attn_ext_f16_tiled_ime2_supported(dst)) {
+                    spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_ime2(ctx, dst, ir0, ir1);
+                } else
+#endif
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_vf16(
                     ctx, dst, ir0, ir1);
             } else {
