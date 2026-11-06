@@ -78,6 +78,13 @@ if (GGML_BUILD_PROFILE)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_BUILD_PROFILE)
 endif()
 
+option(GGML_SPACEMIT_REPACK_MT "ggml-spacemit: repack quantised tensors on all cores at load time" OFF)
+if (GGML_SPACEMIT_REPACK_MT)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_SPACEMIT_REPACK_MT)
+    find_package(Threads REQUIRED)
+    target_link_libraries(${TARGET_NAME} PRIVATE Threads::Threads)
+endif()
+
 # Pass the full march string to the backend target.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb")
