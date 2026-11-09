@@ -3,6 +3,7 @@
 #include "common.h"
 #include "spacemit-env.h"
 #include "ggml.h"
+#include "ggml-impl.h"
 #include "string.h"
 
 #include <algorithm>
@@ -4839,7 +4840,8 @@ static void forward_rope_impl(ggml::spacemit::context & ctx, ggml_tensor * op) {
     float corr_dims[2] = { 0.0f, 0.0f };
     float mscale = attn_factor;
     if (ext_factor != 0.0f) {
-        ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims);
+        ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow,
+                                 ggml_rope_get_truncate(op), corr_dims);
         mscale *= 1.0f + 0.1f * logf(1.0f / freq_scale);
     }
 

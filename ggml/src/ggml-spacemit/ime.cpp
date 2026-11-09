@@ -828,7 +828,12 @@ private:
                     const int32_t i02 =
                         *(const int32_t *) ((const char *) ids->data + iid1 * ids->nb[1] + id * ids->nb[0]);
 
-                    GGML_ASSERT(i02 >= 0 && i02 < n_as);
+                    GGML_ASSERT(i02 == -1 || (i02 >= 0 && i02 < n_as));
+
+                    if (i02 == -1) {
+                        memset((char *) dst->data + id * nb1 + iid1 * nb2, 0, ne0 * sizeof(float));
+                        continue;
+                    }
 
                     MMID_MATRIX_ROW(i02, matrix_row_counts[i02]) = { id, iid1 };
                     matrix_row_counts[i02] += 1;
@@ -2729,7 +2734,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            if (op->src[0] && op->src[1] && op->src[2] &&
+            if (op->src[0] && op->src[1] && op->src[2] && !op->src[5] &&
                 (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
@@ -2739,7 +2744,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_ROPE:
-            if (op->src[0] && op->src[1]) {
+            if (op->src[0] && op->src[1] && ggml_get_op_params_i32(op, 15) == 0) {
                 float freq_base;
                 memcpy(&freq_base,  op->op_params + 5, sizeof(float));
                 const int n_dims = ggml_get_op_params_i32(op, 1);
@@ -2963,7 +2968,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             }
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            if (op->src[0] && op->src[1] && op->src[2] &&
+            if (op->src[0] && op->src[1] && op->src[2] && !op->src[5] &&
                 (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
