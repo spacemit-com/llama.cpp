@@ -1730,16 +1730,17 @@ private:
     static constexpr size_t ROW_PITCH  = KB_BYTES / NB;  // bytes per row per block
 
     static size_t partial_workspace_size(size_t M, size_t N, int n_threads) {
-        constexpr size_t partial_cap = size_t{ 512 } << 20;
+        GGML_ASSERT(n_threads > 0);
         const size_t m_pad = GGML_PAD(M, F16_M_TILE);
         const size_t n_pad = GGML_PAD(N, F16_N_TILE);
-        if (m_pad == 0 || n_pad == 0 || m_pad > partial_cap / sizeof(_Float16) / n_pad) {
+        if (m_pad == 0 || n_pad == 0) {
             return 0;
         }
-        const size_t slice_size = m_pad * n_pad * sizeof(_Float16);
-        const size_t slices = std::min(static_cast<size_t>(n_threads), partial_cap / slice_size);
         // Include alignment and the largest cluster base-pointer table.
-        return slices * slice_size + 64 + 16 * sizeof(uint64_t);
+        constexpr size_t metadata_size = 64 + 16 * sizeof(uint64_t);
+        const size_t slices = static_cast<size_t>(n_threads);
+        GGML_ASSERT(m_pad <= (SIZE_MAX - metadata_size) / n_pad / sizeof(_Float16) / slices);
+        return slices * m_pad * n_pad * sizeof(_Float16) + metadata_size;
     }
 
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
@@ -1785,7 +1786,7 @@ private:
         constexpr size_t n_tile = F16_N_TILE;
         const size_t     mt_count = (M + m_tile - 1) / m_tile;
         const size_t     nt_count = (N + n_tile - 1) / n_tile;
-        const size_t partial_workspace = std::min(ctx.workspace_size, partial_workspace_size(M, N, nth));
+        const size_t partial_workspace = ctx.workspace_size;
 
         void *      tcm_buffer      = ctx.shared.data;
         const int64_t tcm_buffer_size = ctx.shared.size;
