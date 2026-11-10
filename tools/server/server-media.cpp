@@ -151,10 +151,6 @@ bool server_media_context::supports_audio() const {
     return false;
 }
 
-bool server_media_context::supports_video() const {
-    return pimpl->mode == server_media_backend::mtmd && mtmd_helper_support_video(pimpl->mtmd_ctx.get());
-}
-
 #if defined(LLAMA_SERVER_SMT_MTMD)
 const char * server_media_context::tts_backend_name() const {
     if (pimpl->smt_tts) {
