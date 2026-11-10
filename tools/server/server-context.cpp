@@ -1520,7 +1520,6 @@ private:
         if (media) {
             mtmd_cap.vision = media->supports_vision();
             mtmd_cap.audio = media->supports_audio();
-            mtmd_cap.video = media->supports_video();
         }
 #if defined(LLAMA_SERVER_SMT_MTMD)
         mtmd_cap.audio = mtmd_cap.audio || smt_asr_service != nullptr;

@@ -57,7 +57,6 @@ struct server_media_context {
     bool supports_prompt_embeddings() const;
     bool supports_vision() const;
     bool supports_audio() const;
-    bool supports_video() const;
 
 #if defined(LLAMA_SERVER_SMT_MTMD)
     const char * tts_backend_name() const;
