@@ -238,9 +238,7 @@ void multi_asr_decoder::step() {
         decode_added[(size_t) slot_id] = true;
     };
 
-    // Existing decode work gets first claim on the batch. New prefills use the
-    // remaining budget in FIFO slot order, so a stream of arrivals cannot
-    // starve older generation requests.
+    // Reserve batch rows for existing decode requests before adding prefill.
     for (auto & state : slots_) {
         if (!state.active || state.req == nullptr) {
             continue;
@@ -248,10 +246,8 @@ void multi_asr_decoder::step() {
         append_active(state);
     }
 
-    int prefill_budget = n_batch_ - n_batch;
-    // Admit one pending prefill request per scheduler tick. Existing decode
-    // rows have already claimed their budget; the oldest prompt can use all
-    // remaining rows and is split across ticks only when it exceeds n_batch.
+    const int prefill_budget = n_batch_ - n_batch;
+    // Give the remaining rows to the oldest pending prefill request.
     slot * pending = nullptr;
     for (auto & state : slots_) {
         if (state.occupied && !state.active && state.req != nullptr &&

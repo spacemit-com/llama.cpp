@@ -666,7 +666,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                                                                   size_t              tcm_buffer_size) {
     GGML_ASSERT(flash_attn_ext_supported_shape_vlen1024_vf16(DK, DV));
     float S[QLEN] = { 0.0f };       // sum
-    float M[QLEN] = { -INFINITY };  // maximum KQ value
+    float M[QLEN];                 // maximum KQ value
+    std::fill(M, M + QLEN, -INFINITY);
 
     _Float16 *   kq16_buffer          = (_Float16 *) tcm_buffer;
     _Float16 *   qv_buffer            = kq16_buffer + QLEN * DV;

@@ -1,16 +1,5 @@
 #pragma once
 
-// Multi-ASR 4-way concurrent orchestrator — common types & config.
-//
-// Design (see docs/../multi-asr-design.md, scheme B1 "错峰流水"):
-//   - encoder stage : 1 ONNX session (smt_audio_context), pinned to encoder cores,
-//                     serial encode -> produces audio embedding chunk.
-//   - decoder stage : 1 llama_context slot, pinned to decoder cores, serial decode.
-//   - orchestrator  : FIFO queue (>N waits) + encode/decode threads that overlap
-//                     E(N+1) with D(N).
-// Core split (encoder cores vs decoder cores) is a RUNTIME INPUT, not hardcoded,
-// so the optimal ratio can be swept experimentally.
-
 #include "ggml.h"  // GGML_MAX_N_THREADS
 #include "llama.h"
 
@@ -64,7 +53,7 @@ enum class multi_asr_stage : uint8_t {
 
 // Per-stage timing (ms), filled as the request flows through the pipeline.
 struct multi_asr_timings {
-    double  queue_ms       = 0.0;  // time spent waiting in FIFO before encode start
+    double  queue_ms       = 0.0;  // time spent waiting before encode start
     double  encode_ms      = 0.0;  // ONNX encoder wall time
     double  prefill_ms     = 0.0;  // audio embedding prefill into gguf
     double  decode_ms      = 0.0;  // token generation
