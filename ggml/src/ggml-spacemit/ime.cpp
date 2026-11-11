@@ -1938,7 +1938,7 @@ private:
             }
         }
 
-        // Split M across workers; accumulate K chunks directly into F32 output.
+        // Split M/N across workers; accumulate K chunks directly into F32 output.
         if (K < Q4_0_F16_SPLIT_K_MIN && M > Q4_0_F16_SPLIT_N_M_MAX && K % KB == 0) {
             const size_t bytes_per_k  = (m_tile + n_tile) * sizeof(_Float16);
             const size_t kb           = std::min(K, (tcm_size / bytes_per_k) & ~size_t{ 31 });
@@ -1946,9 +1946,18 @@ private:
             const size_t a_budget     = tcm_size > b_tile_bytes ? tcm_size - b_tile_bytes : 0;
             const size_t m_fit        = kb >= 32 ? (a_budget / (kb * sizeof(_Float16))) & ~size_t{ 15 } : 0;
             if (m_fit >= m_tile) {
+                // Split N only when each M group fits one block, avoiding extra M passes.
+                const size_t n_parts = nth >= 4 && nth % 2 == 0 && nt_count >= 2 &&
+                                               GGML_PAD((M + nth / 2 - 1) / (nth / 2), m_tile) <= m_fit
+                                           ? 2 : 1;
+                const size_t m_parts = (size_t) nth / n_parts;
+                const size_t m_group = (size_t) ith / n_parts;
+                const size_t n_group = (size_t) ith % n_parts;
+                const size_t nt_begin = nt_count * n_group / n_parts;
+                const size_t nt_end   = nt_count * (n_group + 1) / n_parts;
                 size_t mb_count = (M + m_fit - 1) / m_fit;
-                if (mb_count < (size_t) nth) {
-                    mb_count = (size_t) nth;
+                if (mb_count < m_parts) {
+                    mb_count = m_parts;
                 }
                 size_t m_block = 0;
                 do {
@@ -1963,7 +1972,7 @@ private:
                     auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
                     auto * b_tile = a_tile + m_block * kb;
                     const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
-                    for (size_t mb_i = (size_t) ith; mb_i < mb_count; mb_i += (size_t) nth) {
+                    for (size_t mb_i = m_group; mb_i < mb_count; mb_i += m_parts) {
                         const size_t mb      = mb_i * m_block;
                         const size_t m_count = std::min(m_block, M - mb);
                         const size_t m_tiles = (m_count + m_tile - 1) / m_tile;
@@ -1980,7 +1989,7 @@ private:
                                           static_cast<int64_t>(kk),
                                           1, static_cast<int64_t>(kk / 8));
                             }
-                            for (size_t nt = 0; nt < nt_count; ++nt) {
+                            for (size_t nt = nt_begin; nt < nt_end; ++nt) {
                                 const size_t n0 = nt * n_tile;
                                 const size_t nc = std::min(n_tile, N - n0);
                                 q41_func((void *) (b_src + nt * b_row_stride + (k0 / KB) * KB_BYTES),
