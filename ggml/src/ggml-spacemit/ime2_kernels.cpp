@@ -4744,13 +4744,14 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
                                         _Float16 *       a_f16_k8,
                                         float *          c_ptr,
                                         size_t           count_m,
-                                        size_t           count_n,
+                                        size_t          count_n,
                                         size_t           ldc,
                                         bool             accumulate) {
     GGML_ASSERT(count_m > 0 && count_m <= 16);
     GGML_ASSERT(count_n > 0 && count_n <= 32);
-    GGML_ASSERT(gemm_k % 8 == 0);
-    // Partial-M accumulation requires a full N32 tile.
+    GGML_ASSERT(gemm_k > 0 && gemm_k % 8 == 0);
+    // count_n < 32 with a partial-M accumulate seed is not supported (every
+    // call site gates on N % 32 == 0, so tiles are always full N32).
     GGML_ASSERT(count_m == 16 || count_n == 32 || !accumulate);
 
     alignas(128) float tile[16 * 32];
@@ -4764,6 +4765,7 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
     // Accumulator register pairs are not row-major; add existing C only after unpacking.
     // The local tile also avoids writing beyond a partial-M output.
     const bool       via_tile      = accumulate || count_m != 16;
+    const bool       store_vs8r    = count_m == 16 && count_n == 32 && ldc == 32 && !accumulate;
     float *          out           = via_tile ? tile : c_ptr;
     const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
 
@@ -4870,6 +4872,7 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "vpack.vv  v26, v9,  v11, 3\n\t"
         "vpack.vv  v28, v12, v14, 3\n\t"
         "vpack.vv  v30, v13, v15, 3\n\t"
+        "bnez      %[store_vs8r], .L_f16_store_whole_registers_%=\n\t"
         "vsetvli   t0, %[count_n], e32, m1, tu, mu\n\t"
         "vse32.v   v16, (%[out])\n\t"
         "add       %[out], %[out], %[out_stride]\n\t"
@@ -4902,9 +4905,15 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "vse32.v   v30, (%[out])\n\t"
         "add       %[out], %[out], %[out_stride]\n\t"
         "vse32.v   v31, (%[out])\n\t"
-        : [a0] "+r"(a0), [a1] "+r"(a1), [b0] "+r"(b0), [b1] "+r"(b1), [b2] "+r"(b2), [b3] "+r"(b3), [kc] "+r"(kc_left),
-          [out] "+r"(out)
-        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes)
+        "j         .L_f16_store_done_%=\n\t"
+        ".L_f16_store_whole_registers_%=:\n\t"
+        "vs8r.v    v16, (%[out])\n\t"
+        "addi      %[out], %[out], 1024\n\t"
+        "vs8r.v    v24, (%[out])\n\t"
+        ".L_f16_store_done_%=:\n\t"
+        : [a0] "+&r"(a0), [a1] "+&r"(a1), [b0] "+&r"(b0), [b1] "+&r"(b1),
+          [b2] "+&r"(b2), [b3] "+&r"(b3), [kc] "+&r"(kc_left), [out] "+&r"(out)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes), [store_vs8r] "r"(store_vs8r)
         : "cc", "memory", "t0", "t1", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
           "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
           "v29", "v30", "v31");
