@@ -5,7 +5,46 @@
 #include "smt-audio-wrapper.h"
 
 #include <algorithm>
+#include <cstring>
 #include <stdexcept>
+
+namespace {
+
+// Unsupported or malformed WAVs use the arrival deadline.
+// Parse chunk bounds and odd-byte padding without decoding audio.
+int64_t wav_duration_ms(const std::vector<uint8_t> & bytes) {
+    auto u16 = [&](size_t p) { return uint32_t(bytes[p]) | uint32_t(bytes[p + 1]) << 8; };
+    auto u32 = [&](size_t p) { return u16(p) | u16(p + 2) << 16; };
+    if (bytes.size() < 12 || std::memcmp(bytes.data(), "RIFF", 4) ||
+        std::memcmp(bytes.data() + 8, "WAVE", 4)) {
+        return 0;
+    }
+    uint32_t rate = 0, data_bytes = 0;
+    bool have_data = false;
+    for (size_t p = 12; p + 8 <= bytes.size();) {
+        const uint32_t length = u32(p + 4);
+        const size_t payload = p + 8;
+        if (length > bytes.size() - payload) return 0;
+        if (!std::memcmp(bytes.data() + p, "fmt ", 4) && length >= 16) {
+            const uint32_t format = u16(payload);
+            const uint32_t channels = u16(payload + 2);
+            const uint32_t samples = u32(payload + 4);
+            const uint32_t bits = u16(payload + 14);
+            const uint64_t expected = uint64_t(samples) * channels * bits / 8;
+            if ((format != 1 && format != 3) || !channels || !samples || !bits || bits % 8 ||
+                expected != u32(payload + 8)) return 0;
+            rate = u32(payload + 8);
+        } else if (!std::memcmp(bytes.data() + p, "data", 4)) {
+            data_bytes = length;
+            have_data = true;
+        }
+        p = payload + length;
+        if ((length & 1) && p < bytes.size()) ++p;
+    }
+    return rate && have_data ? (uint64_t(data_bytes) * 1000 + rate - 1) / rate : 0;
+}
+
+} // namespace
 
 multi_asr_orchestrator::~multi_asr_orchestrator() {
     stop();
@@ -63,6 +102,7 @@ bool multi_asr_orchestrator::submit_and_wait(const multi_asr_request & req_in, m
     auto job = std::make_shared<multi_asr_job>();
     job->req = req_in;
     job->t_submit_ms = ggml_time_ms();
+    job->deadline_ms = job->t_submit_ms + wav_duration_ms(req_in.audio);
     in_flight_.fetch_add(1);
     pending_encode_.fetch_add(1);
     {
@@ -96,15 +136,18 @@ void multi_asr_orchestrator::encode_loop() {
             if (!running_.load() && intake_.empty()) {
                 return;
             }
-            job = intake_.front();
-            intake_.pop_front();
+            // Order queued jobs by arrival + audio duration; do not wait
+            // for additional requests.
+            auto next = std::min_element(intake_.begin(), intake_.end(), [](const auto & a, const auto & b) {
+                return a->deadline_ms < b->deadline_ms;
+            });
+            job = *next;
+            intake_.erase(next);
         }
 
         job->req.stage = multi_asr_stage::encoding;
         job->req.timings.queue_ms = (double) (ggml_time_ms() - job->t_submit_ms);
-        // Experimental no-gate path: let ORT encoder work overlap GGML/IME
-        // decoder work.  All other FIFO and continuous-batch scheduling stays
-        // unchanged.
+        // Allow ORT encoding to overlap decoder execution.
         const bool encode_ok = encoder_.encode(job->req);
         if (!encode_ok) {
             pending_encode_.fetch_sub(1);

@@ -1,10 +1,5 @@
 #pragma once
 
-// FIFO ASR scheduler:
-//   HTTP submit -> serial SMT encoder -> decoder ready FIFO -> native
-//   continuous-batching generation.  The decoder thread is the sole owner of
-//   its llama_context, so KV sequences and samplers cannot race.
-
 #include "multi-asr-common.h"
 #include "multi-asr-decoder.h"
 #include "multi-asr-encoder.h"
@@ -24,6 +19,7 @@ struct multi_asr_job {
     std::condition_variable cv;
     bool finished = false;
     int64_t t_submit_ms = 0;
+    int64_t deadline_ms = 0;
     int slot_id = -1;
 };
 

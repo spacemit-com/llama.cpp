@@ -581,8 +581,6 @@ class spine_mem_pool_shared_mem final : public spine_mem_pool_manager {
 
         const int fd = open(SPINE_MEM_POOL_TCM_SYNC_MEM_DEV, O_RDWR | O_SYNC);
         if (fd < 0) {
-            GGML_LOG_ERROR("CPU_RISCV64_SPACEMIT: %s: open(%s) failed, errno=%d\n", __func__,
-                           SPINE_MEM_POOL_TCM_SYNC_MEM_DEV, errno);
             return false;
         }
 
