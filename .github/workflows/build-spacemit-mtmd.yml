@@ -9,14 +9,19 @@ on:
       - mtmd-backend
   workflow_dispatch:
     inputs:
+      publish_release:
+        description: "Publish VERSION_NUMBER as a GitHub release (mtmd-backend only)"
+        type: boolean
+        required: false
+        default: false
       build_ohos:
         description: "Also run the OHOS (OpenHarmony, musl) build job"
         required: false
         default: "true"
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
-  cancel-in-progress: true
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: write
@@ -91,7 +96,7 @@ jobs:
 
       - name: Decide whether to publish a new release
         id: release_guard
-        if: ${{ github.event_name == 'push' }}
+        if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_release) }}
         shell: bash
         run: |
           set -euo pipefail
@@ -100,20 +105,27 @@ jobs:
           current_commit="${{ github.sha }}"
           release_tag="${{ steps.vars.outputs.release_tag }}"
 
-          if [[ "${before_commit}" == "0000000000000000000000000000000000000000" ]]; then
-            before_commit="$(git rev-list --max-count=1 "${current_commit}^" 2>/dev/null || true)"
-          fi
+          version_number_changed=false
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            if [[ "${GITHUB_REF}" != "refs/heads/mtmd-backend" ]]; then
+              echo "::error::Manual release publishing requires the mtmd-backend branch."
+              exit 1
+            fi
+          else
+            if [[ "${before_commit}" == "0000000000000000000000000000000000000000" ]]; then
+              before_commit="$(git rev-list --max-count=1 "${current_commit}^" 2>/dev/null || true)"
+            fi
 
-          if [[ -z "${before_commit}" ]]; then
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "reason=no_previous_commit_to_compare" >> "$GITHUB_OUTPUT"
-            exit 0
+            if [[ -z "${before_commit}" ]]; then
+              echo "should_publish=false" >> "$GITHUB_OUTPUT"
+              echo "reason=no_previous_commit_to_compare" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
           fi
 
           git fetch --force --prune --prune-tags --tags origin
 
-          version_number_changed=false
-          if ! git diff --quiet "${before_commit}" "${current_commit}" -- VERSION_NUMBER; then
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]] && ! git diff --quiet "${before_commit}" "${current_commit}" -- VERSION_NUMBER; then
             version_number_changed=true
           fi
 
@@ -125,7 +137,7 @@ jobs:
               exit 0
             fi
 
-            if [[ "${version_number_changed}" != "true" ]]; then
+            if [[ "${GITHUB_EVENT_NAME}" == "push" && "${version_number_changed}" != "true" ]]; then
               echo "should_publish=false" >> "$GITHUB_OUTPUT"
               echo "reason=version_number_unchanged_release_tag_exists" >> "$GITHUB_OUTPUT"
               exit 0
@@ -136,14 +148,16 @@ jobs:
           fi
 
           echo "should_publish=true" >> "$GITHUB_OUTPUT"
-          if [[ "${version_number_changed}" == "true" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "reason=manual_dispatch" >> "$GITHUB_OUTPUT"
+          elif [[ "${version_number_changed}" == "true" ]]; then
             echo "reason=version_number_changed" >> "$GITHUB_OUTPUT"
           else
             echo "reason=release_tag_missing" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Explain skipped release publish
-        if: ${{ github.event_name == 'push' && steps.release_guard.outputs.should_publish != 'true' }}
+        if: ${{ steps.release_guard.outcome == 'success' && steps.release_guard.outputs.should_publish != 'true' }}
         shell: bash
         run: |
           echo "Skipping GitHub release publish: ${{ steps.release_guard.outputs.reason }}"
@@ -290,7 +304,7 @@ jobs:
           popd >/dev/null
 
       - name: Pack artifacts
-        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && steps.release_guard.outputs.should_publish == 'true') }}
+        if: ${{ github.event_name == 'pull_request' || steps.release_guard.outputs.should_publish == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -309,7 +323,7 @@ jobs:
           tar -czf "release/${ASSET_NAME}" -C release "${SPACEMIT_MTMD_PACKAGE_NAME}"
 
       - name: Inspect package
-        if: ${{ github.event_name == 'pull_request' || (github.event_name == 'push' && steps.release_guard.outputs.should_publish == 'true') }}
+        if: ${{ github.event_name == 'pull_request' || steps.release_guard.outputs.should_publish == 'true' }}
         shell: bash
         run: |
           set -euo pipefail
@@ -330,7 +344,7 @@ jobs:
           retention-days: 7
 
       - name: Publish GitHub release
-        if: ${{ github.event_name == 'push' && steps.release_guard.outputs.should_publish == 'true' }}
+        if: ${{ steps.release_guard.outputs.should_publish == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -350,10 +364,8 @@ jobs:
   build-ohos:
     name: Build and Publish SpacemiT MTMD (OHOS)
     runs-on: ubuntu-24.04
-    # Runs alongside the glibc `build` job on push / pull_request (and manual
-    # dispatch). It depends on `build` so that, on a release push, the glibc job
-    # creates the GitHub release first and this job then attaches its OHOS
-    # package to the same tag.
+    # Wait for the glibc build to create the release before attaching the
+    # OHOS package, including when publishing through workflow_dispatch.
     needs: build
     if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.build_ohos == 'true' }}
 
@@ -590,7 +602,7 @@ jobs:
           retention-days: 7
 
       - name: Publish GitHub release (OHOS)
-        if: ${{ github.event_name == 'push' && needs.build.outputs.should_publish == 'true' }}
+        if: ${{ needs.build.outputs.should_publish == 'true' }}
         uses: softprops/action-gh-release@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
