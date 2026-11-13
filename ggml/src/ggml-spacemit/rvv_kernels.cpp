@@ -1,5 +1,6 @@
 #include "rvv_kernels.h"
 
+
 #include "common.h"
 #include "spacemit-env.h"
 #include "ggml.h"
@@ -1911,6 +1912,524 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
         ir += tile_rows;
     }
 }
+
+#ifdef GGML_SPACEMIT_FA_IME2
+// ---------------------------------------------------------------------------------------------------------------
+// Flash attention with the IME2 fp16 engine (smepilot-riscv P4, v2).
+//
+// The A100's vector unit is decoupled: every vector->scalar dependency (vcpop/vfmv.f.s feeding a branch or scalar
+// math) waits for the whole vector/IME queue to drain.  The per-row softmax of the RVV kernel does hundreds of those
+// per tile, which dominates its time.  This kernel therefore works in the transposed domain:
+//   S^T = K * Q^T      (IME2: A = K tile [KT x DK], B = Q tile [QT x DK], C = S^T [KT][QT])
+//   O^T += V^T * P^T   (IME2: A = V^T [DV x KT], B = P [QT x KT],         C = PV^T [DV][QT])
+// so every per-query statistic (running max, sum, rescale) is a vector over the QT queries of the tile, and the
+// tile loop has no vector->scalar dependency at all.  Packing uses strided segment loads/stores only.
+// ---------------------------------------------------------------------------------------------------------------
+#ifndef GGML_SPACEMIT_FA_IME2_TCM
+#    define GGML_SPACEMIT_FA_IME2_TCM 0
+#endif
+
+namespace {
+
+constexpr int64_t FA_IME2_QT = ggml_fa_tile_config::Q;   // queries per tile (one e32m2 vector at VLEN 1024)
+constexpr int64_t FA_IME2_KT = ggml_fa_tile_config::KV;  // kv per tile
+static_assert(FA_IME2_QT == 64, "IME2 FA v2 keeps one query tile in one e32m2 vector");
+static_assert(FA_IME2_KT % 16 == 0, "IME2 FA v2 needs KV tiles in M16 blocks");
+
+// IME2 f16 x f16 -> f32 tile: C[m][n] = sum_k A[m][k] * B[n][k] for a full M16 x N32 tile, A and B in the native
+// [K/8][M16|N32][K8] layouts, C row-major with ldc floats per row.  Copied from ime2::gemm_kernel_f16f16f32_m16_vfwmadot
+// (PR #51) and restricted to full tiles without accumulation, so that this file also builds on branches without #51.
+inline void fa_ime2_gemm_m16n32(size_t gemm_k, const _Float16 * b, const _Float16 * a, float * c, size_t ldc) {
+    const _Float16 * a0         = a;
+    const _Float16 * a1         = a + 64;
+    const _Float16 * b0         = b;
+    const _Float16 * b1         = b + 64;
+    const _Float16 * b2         = b + 128;
+    const _Float16 * b3         = b + 192;
+    size_t           kc         = gemm_k / 8;
+    float *          out        = c;
+    const size_t     out_stride = ldc * sizeof(float);
+    const size_t     count_n    = 32;
+    asm volatile(
+        "vsetvli t0, zero, e32, m8, tu, mu\n\t"
+        "vxor.vv v16, v16, v16\n\t"
+        "vxor.vv v24, v24, v24\n\t"
+        "vsetvli t0, zero, e16, m1, tu, mu\n\t"
+        "1:\n\t"
+        "vle16.v v0,  (%[a0])\n\t"
+        "vle16.v v1,  (%[a1])\n\t"
+        "vle16.v v8,  (%[b0])\n\t"
+        "vle16.v v9,  (%[b1])\n\t"
+        "vle16.v v10, (%[b2])\n\t"
+        "vle16.v v11, (%[b3])\n\t"
+        "vfwmadot v16, v0, v8\n\t"
+        "vfwmadot v18, v0, v9\n\t"
+        "vfwmadot v20, v0, v10\n\t"
+        "vfwmadot v22, v0, v11\n\t"
+        "vfwmadot v24, v1, v8\n\t"
+        "vfwmadot v26, v1, v9\n\t"
+        "vfwmadot v28, v1, v10\n\t"
+        "vfwmadot v30, v1, v11\n\t"
+        "addi %[a0], %[a0], 256\n\t"
+        "addi %[a1], %[a1], 256\n\t"
+        "addi %[b0], %[b0], 512\n\t"
+        "addi %[b1], %[b1], 512\n\t"
+        "addi %[b2], %[b2], 512\n\t"
+        "addi %[b3], %[b3], 512\n\t"
+        "addi %[kc], %[kc], -1\n\t"
+        "bnez %[kc], 1b\n\t"
+        // IME2 accumulator unpack: the eight 8x8 dot-product tiles into 16 row-major N32 vectors.
+        "vsetvli t0, zero, e32, m1, tu, mu\n\t"
+        "vpack.vv v0,  v16, v18, 2\n\t"
+        "vpack.vv v2,  v20, v22, 2\n\t"
+        "vpack.vv v4,  v17, v19, 2\n\t"
+        "vpack.vv v6,  v21, v23, 2\n\t"
+        "vpack.vv v8,  v24, v26, 2\n\t"
+        "vpack.vv v10, v28, v30, 2\n\t"
+        "vpack.vv v12, v25, v27, 2\n\t"
+        "vpack.vv v14, v29, v31, 2\n\t"
+        "vpack.vv v16, v0,  v2,  3\n\t"
+        "vpack.vv v18, v1,  v3,  3\n\t"
+        "vpack.vv v20, v4,  v6,  3\n\t"
+        "vpack.vv v22, v5,  v7,  3\n\t"
+        "vpack.vv v24, v8,  v10, 3\n\t"
+        "vpack.vv v26, v9,  v11, 3\n\t"
+        "vpack.vv v28, v12, v14, 3\n\t"
+        "vpack.vv v30, v13, v15, 3\n\t"
+        "vsetvli t0, %[count_n], e32, m1, tu, mu\n\t"
+        "vse32.v v16, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v17, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v18, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v19, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v20, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v21, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v22, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v23, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v24, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v25, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v26, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v27, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v28, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v29, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v30, (%[out])\n\t" "add %[out], %[out], %[out_stride]\n\t"
+        "vse32.v v31, (%[out])\n\t"
+        : [a0] "+r"(a0), [a1] "+r"(a1), [b0] "+r"(b0), [b1] "+r"(b1), [b2] "+r"(b2), [b3] "+r"(b3), [kc] "+r"(kc),
+          [out] "+r"(out)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_stride)
+        : "cc", "memory", "t0", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+          "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",
+          "v30", "v31", "vl", "vtype");
+}
+
+inline size_t fa_ime2_align(size_t v) { return (v + 127) & ~size_t{ 127 }; }
+
+inline size_t fa_ime2_scratch_bytes(int64_t DK, int64_t DV) {
+    return fa_ime2_align(FA_IME2_QT * DK * sizeof(_Float16)) +            // Qb: [QT/32][DK/8][32][8]
+           fa_ime2_align(FA_IME2_KT * DK * sizeof(_Float16)) +            // Ka: [KT/16][DK/8][16][8]
+           fa_ime2_align(FA_IME2_QT * FA_IME2_KT * sizeof(_Float16)) +    // Pb: [QT/32][KT/8][32][8]
+           fa_ime2_align(FA_IME2_KT * DV * sizeof(_Float16)) +            // Va: [DV/16][KT/8][16][8]
+           fa_ime2_align(FA_IME2_KT * FA_IME2_QT * sizeof(float)) +       // St: S^T [KT][QT]
+           fa_ime2_align(FA_IME2_KT * FA_IME2_QT * sizeof(float)) +       // Mt: mask^T [KT][QT]
+           fa_ime2_align(DV * FA_IME2_QT * sizeof(float)) +               // Ot: O^T [DV][QT]
+           fa_ime2_align(DV * FA_IME2_QT * sizeof(float)) +               // PVt: (P V)^T [DV][QT]
+           fa_ime2_align(3 * FA_IME2_QT * sizeof(float)) + 128;           // M, L, alpha; base alignment
+}
+
+inline size_t fa_ime2_rvv_slice_bytes(int64_t DK, int64_t DV) {
+    return sizeof(float) * (FA_IME2_QT * DK + 2 * FA_IME2_QT * FA_IME2_KT + FA_IME2_QT * DV + FA_IME2_KT * DV +
+                            FA_IME2_KT * DK + ggml::spacemit::cache_line_size_f32);
+}
+
+// exp(x) without the early-out of rvv_expf_approx_f32m2 (whose vcpop is a vector->scalar sync); -inf -> 0.
+inline vfloat32m2_t fa_ime2_exp(vfloat32m2_t x, size_t vl) {
+    const vfloat32m2_t r  = __riscv_vfmv_v_f_f32m2(0x1.8p23f, vl);
+    const vfloat32m2_t z  = __riscv_vfmacc_vf_f32m2(r, 0x1.715476p+0f, x, vl);
+    const vfloat32m2_t n  = __riscv_vfsub_vv_f32m2(z, r, vl);
+    const vfloat32m2_t b  = __riscv_vfnmsac_vf_f32m2(__riscv_vfnmsac_vf_f32m2(x, 0x1.62e4p-1f, n, vl), 0x1.7f7d1cp-20f, n, vl);
+    const vuint32m2_t  e  = __riscv_vsll_vx_u32m2(__riscv_vreinterpret_v_f32m2_u32m2(z), 23, vl);
+    const vfloat32m2_t k  = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(e, 0x3f800000, vl));
+    const vbool16_t    c  = __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 126.0f, vl);
+    const vfloat32m2_t u  = __riscv_vfmul_vv_f32m2(b, b, vl);
+    const vfloat32m2_t j  = __riscv_vfmacc_vv_f32m2(
+        __riscv_vfmul_vf_f32m2(b, 0x1.ffffecp-1f, vl),
+        __riscv_vfmacc_vv_f32m2(
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.fffdb6p-2f, vl), 0x1.555e66p-3f, b, vl),
+            __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(0x1.573e2ep-5f, vl), 0x1.0e4020p-7f, b, vl), u, vl),
+        u, vl);
+    const vbool16_t    dm = __riscv_vmfle_vf_f32m2_b16(n, 0.0f, vl);
+    const vuint32m2_t  d  = __riscv_vmerge_vxm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), 0x82000000, dm, vl);
+    const vfloat32m2_t s1 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vadd_vx_u32m2(d, 0x7f000000, vl));
+    const vfloat32m2_t s2 = __riscv_vreinterpret_v_u32m2_f32m2(__riscv_vsub_vv_u32m2(e, d, vl));
+    const vfloat32m2_t r1 = __riscv_vmerge_vvm_f32m2(__riscv_vfmacc_vv_f32m2(k, k, j, vl),
+                                                    __riscv_vfmul_vv_f32m2(__riscv_vfmacc_vv_f32m2(s2, s2, j, vl), s1, vl),
+                                                    c, vl);
+    return __riscv_vmerge_vvm_f32m2(r1, __riscv_vfmul_vv_f32m2(s1, s1, vl),
+                                    __riscv_vmfgt_vf_f32m2_b16(__riscv_vfabs_v_f32m2(n, vl), 192.0f, vl), vl);
+}
+
+// softcap * tanh(x), branch-free (uses fa_ime2_exp).
+inline vfloat32m2_t fa_ime2_softcap(vfloat32m2_t x, float softcap, size_t vl) {
+    const vfloat32m2_t e    = fa_ime2_exp(__riscv_vfmul_vf_f32m2(__riscv_vfabs_v_f32m2(x, vl), -2.0f, vl), vl);
+    const vfloat32m2_t t    = __riscv_vfdiv_vv_f32m2(__riscv_vfrsub_vf_f32m2(e, 1.0f, vl),
+                                                     __riscv_vfadd_vf_f32m2(e, 1.0f, vl), vl);   // tanh(|x|)
+    const vfloat32m2_t sgnd = __riscv_vfsgnj_vv_f32m2(t, x, vl);
+    return __riscv_vfmul_vf_f32m2(sgnd, softcap, vl);
+}
+
+// Q tile (f32, scaled, rows q0.. with stride) -> Qb: [QT/32][DK/8][32][8] f16.  Rows >= nrows are zero.
+void fa_ime2_pack_q(_Float16 * Qb, const char * q0, size_t q_stride, int64_t nrows, int64_t DK, float scale) {
+    for (int64_t blk = 0; blk < FA_IME2_QT / 32; ++blk) {
+        const int64_t rows = std::max<int64_t>(0, std::min<int64_t>(32, nrows - blk * 32));
+        _Float16 *    dst  = Qb + blk * 32 * DK;
+        if (rows < 32) {
+            memset(dst, 0, 32 * DK * sizeof(_Float16));
+        }
+        if (rows == 0) {
+            continue;
+        }
+        const char * src = q0 + blk * 32 * q_stride;
+        for (int64_t g = 0; g < DK / 8; ++g) {
+            const vfloat32m1x8_t t = __riscv_vlsseg8e32_v_f32m1x8((const float *) src + 8 * g, q_stride, rows);
+#define FA_IME2_CVT(i) __riscv_vfncvt_f_f_w_f16mf2(__riscv_vfmul_vf_f32m1(__riscv_vget_v_f32m1x8_f32m1(t, i), scale, rows), rows)
+            const vfloat16mf2x8_t h = __riscv_vcreate_v_f16mf2x8(FA_IME2_CVT(0), FA_IME2_CVT(1), FA_IME2_CVT(2),
+                                                                  FA_IME2_CVT(3), FA_IME2_CVT(4), FA_IME2_CVT(5),
+                                                                  FA_IME2_CVT(6), FA_IME2_CVT(7));
+#undef FA_IME2_CVT
+            __riscv_vsseg8e16_v_f16mf2x8(dst + g * 256, h, rows);
+        }
+    }
+}
+
+// K tile (f16 rows with stride) -> Ka: [KT/16][DK/8][16][8].  Rows >= nrows are zero.
+void fa_ime2_pack_k(_Float16 * Ka, const char * k0, size_t k_stride, int64_t nrows, int64_t DK) {
+    for (int64_t blk = 0; blk < FA_IME2_KT / 16; ++blk) {
+        const int64_t rows = std::max<int64_t>(0, std::min<int64_t>(16, nrows - blk * 16));
+        _Float16 *    dst  = Ka + blk * 16 * DK;
+        if (rows < 16) {
+            memset(dst, 0, 16 * DK * sizeof(_Float16));
+        }
+        if (rows == 0) {
+            continue;
+        }
+        const char * src = k0 + blk * 16 * k_stride;
+        for (int64_t g = 0; g < DK / 8; ++g) {
+            const vuint64m1x2_t t =
+                __riscv_vlsseg2e64_v_u64m1x2((const uint64_t *) (src + 16 * g), k_stride, rows);
+            __riscv_vsseg2e64_v_u64m1x2((uint64_t *) (dst + g * 128), t, rows);
+        }
+    }
+}
+
+// V tile (f16 rows c with stride, DV columns) -> Va = V^T as A: [DV/16][KT/8][16][8].  Rows >= nrows are zero.
+void fa_ime2_pack_v(_Float16 * Va, const char * v0, size_t v_stride, int64_t nrows, int64_t DV) {
+    const size_t       vl   = 16;
+    const vfloat16mf4_t zero = __riscv_vfmv_v_f_f16mf4((_Float16) 0.0f, vl);
+    for (int64_t g = 0; g < FA_IME2_KT / 8; ++g) {
+        const _Float16 * row[8];
+        for (int kk = 0; kk < 8; ++kk) {
+            const int64_t c = 8 * g + kk;
+            row[kk]         = c < nrows ? (const _Float16 *) (v0 + c * v_stride) : nullptr;
+        }
+        for (int64_t blk = 0; blk < DV / 16; ++blk) {
+#define FA_IME2_LD(i) (row[i] ? __riscv_vle16_v_f16mf4(row[i] + 16 * blk, vl) : zero)
+            const vfloat16mf4x8_t t = __riscv_vcreate_v_f16mf4x8(FA_IME2_LD(0), FA_IME2_LD(1), FA_IME2_LD(2),
+                                                                  FA_IME2_LD(3), FA_IME2_LD(4), FA_IME2_LD(5),
+                                                                  FA_IME2_LD(6), FA_IME2_LD(7));
+#undef FA_IME2_LD
+            __riscv_vsseg8e16_v_f16mf4x8(Va + blk * 16 * FA_IME2_KT + g * 128, t, vl);
+        }
+    }
+}
+
+// True when some mask entry of rows [0, nrows) x cols [c0, c0 + ncols) is not -inf.  Reads the mask tensor (memory
+// written before this op), so it is a scalar loop without any vector->scalar dependency.
+// Kept scalar on purpose: a vectorized early-exit loop would turn into vcpop + branch, i.e. a queue drain.
+__attribute__((optimize("no-tree-vectorize"))) bool fa_ime2_tile_active(const ggml_tensor * mask, const char * row0,
+                                                                         int64_t nrows, int64_t c0, int64_t ncols) {
+    for (int64_t r = nrows - 1; r >= 0; --r) {
+        const ggml_fp16_t * m = (const ggml_fp16_t *) (row0 + r * mask->nb[1]) + c0;
+#pragma GCC novector
+        for (int64_t c = 0; c < ncols; ++c) {
+            if (m[c] != 0xFC00) {   // f16 -inf
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+}  // namespace
+
+bool flash_attn_ext_f16_tiled_ime2_supported(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    if (q == nullptr || k == nullptr || v == nullptr || q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 ||
+        v->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (dst->src[3] != nullptr && dst->src[3]->type != GGML_TYPE_F16) {
+        return false;
+    }
+    const int64_t DK = k->ne[0];
+    const int64_t DV = v->ne[0];
+    if (DK <= 0 || DK % 8 != 0 || DK > 256 || DV <= 0 || DV % 16 != 0 || DV > 256) {
+        return false;
+    }
+    if (k->nb[0] != sizeof(_Float16) || v->nb[0] != sizeof(_Float16) || q->nb[0] != sizeof(float) ||
+        k->nb[1] % 8 != 0) {
+        return false;
+    }
+    return fa_ime2_scratch_bytes(DK, DV) <= fa_ime2_rvv_slice_bytes(DK, DV);
+}
+
+void forward_flash_attn_ext_f16_tiled_ime2(ggml::spacemit::context & ctx, ggml_tensor * dst, int ir0, int ir1) {
+    const ggml_tensor * q     = dst->src[0];
+    const ggml_tensor * k     = dst->src[1];
+    const ggml_tensor * v     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    GGML_TENSOR_LOCALS(int64_t, neq, q, ne)
+    GGML_TENSOR_LOCALS(size_t, nbq, q, nb)
+    GGML_TENSOR_LOCALS(int64_t, nek, k, ne)
+    GGML_TENSOR_LOCALS(size_t, nbk, k, nb)
+    GGML_TENSOR_LOCALS(int64_t, nev, v, ne)
+    GGML_TENSOR_LOCALS(size_t, nbv, v, nb)
+    GGML_TENSOR_LOCALS(int64_t, ne, dst, ne)
+    GGML_TENSOR_LOCALS(size_t, nb, dst, nb)
+
+    const int64_t DK = nek0;
+    const int64_t DV = nev0;
+    const int64_t N  = neq1;
+
+    GGML_ASSERT(flash_attn_ext_f16_tiled_ime2_supported(dst));
+    GGML_ASSERT(ne0 == DV);
+    GGML_ASSERT(ne2 == N);
+    GGML_ASSERT(neq0 == DK);
+    GGML_ASSERT(nb0 == sizeof(float));
+    GGML_ASSERT(nb0 <= nb1);
+    GGML_ASSERT(nb1 <= nb2);
+    GGML_ASSERT(nb2 <= nb3);
+
+    const int64_t rk2 = neq2 / nek2;
+    const int64_t rk3 = neq3 / nek3;
+    const int64_t rv2 = neq2 / nev2;
+    const int64_t rv3 = neq3 / nev3;
+
+    float * param_list    = (float *) dst->op_params;
+    float   scale         = param_list[0];
+    float   max_bias      = param_list[1];
+    float   logit_softcap = param_list[2];
+    if (logit_softcap != 0) {
+        scale /= logit_softcap;
+    }
+
+    const uint32_t n_head      = neq2;
+    const uint32_t n_head_log2 = 1u << (uint32_t) floor(log2(n_head));
+    const float    m0          = powf(2.0f, -(max_bias) / n_head_log2);
+    const float    m1          = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
+
+    constexpr int64_t QT = FA_IME2_QT;
+    constexpr int64_t KT = FA_IME2_KT;
+    const size_t      vq = __riscv_vsetvl_e32m2(QT);
+    GGML_ASSERT((int64_t) vq == QT);
+
+    const size_t need = fa_ime2_scratch_bytes(DK, DV);
+    char *       raw;
+    if (GGML_SPACEMIT_FA_IME2_TCM && need <= ctx.shared.size && ctx.shared.data != nullptr) {
+        raw = (char *) ctx.shared.data;
+    } else {
+        raw = (char *) ctx.workspace + ctx.ith * fa_ime2_rvv_slice_bytes(DK, DV);
+    }
+    char * p    = (char *) (((uintptr_t) raw + 127) & ~(uintptr_t) 127);
+    auto   take = [&p](size_t bytes) {
+        char * r = p;
+        p += fa_ime2_align(bytes);
+        return r;
+    };
+    _Float16 * Qb    = (_Float16 *) take(QT * DK * sizeof(_Float16));
+    _Float16 * Ka    = (_Float16 *) take(KT * DK * sizeof(_Float16));
+    _Float16 * Pb    = (_Float16 *) take(QT * KT * sizeof(_Float16));
+    _Float16 * Va    = (_Float16 *) take(KT * DV * sizeof(_Float16));
+    float *    St    = (float *) take(KT * QT * sizeof(float));
+    float *    Mt    = (float *) take(KT * QT * sizeof(float));
+    float *    Ot    = (float *) take(DV * QT * sizeof(float));
+    float *    PVt   = (float *) take(DV * QT * sizeof(float));
+    float *    Mrow  = (float *) take(3 * QT * sizeof(float));
+    float *    Lrow  = Mrow + QT;
+    float *    Arow  = Mrow + 2 * QT;
+
+    int ir = ir0;
+    while (ir < ir1) {
+        const int iq3 = ir / (neq2 * neq1);
+        const int iq2 = (ir - iq3 * neq2 * neq1) / neq1;
+        const int iq1 = (ir - iq3 * neq2 * neq1 - iq2 * neq1);
+
+        const int tile_rows = MIN((int) QT, MIN((int) (ir1 - ir), (int) (neq1 - iq1)));
+        GGML_ASSERT(tile_rows > 0);
+
+        const uint32_t h = iq2;
+        const float    slope =
+            (max_bias > 0.0f) ? h < n_head_log2 ? powf(m0, h + 1) : powf(m1, 2 * (h - n_head_log2) + 1) : 1.0f;
+
+        const int ik3 = iq3 / rk3;
+        const int ik2 = iq2 / rk2;
+        const int iv3 = iq3 / rv3;
+        const int iv2 = iq2 / rv2;
+
+        fa_ime2_pack_q(Qb, (const char *) q->data + (iq1 * nbq1 + iq2 * nbq2 + iq3 * nbq3), nbq1, tile_rows, DK,
+                       scale);
+        __riscv_vse32_v_f32m2(Mrow, __riscv_vfmv_v_f_f32m2(-INFINITY, vq), vq);
+        __riscv_vse32_v_f32m2(Lrow, __riscv_vfmv_v_f_f32m2(0.0f, vq), vq);
+        for (int64_t d = 0; d < DV; ++d) {
+            __riscv_vse32_v_f32m2(Ot + d * QT, __riscv_vfmv_v_f_f32m2(0.0f, vq), vq);
+        }
+
+        const char * mrow0 = mask ? (const char *) mask->data + iq1 * mask->nb[1] + (iq2 % mask->ne[2]) * mask->nb[2] +
+                                        (iq3 % mask->ne[3]) * mask->nb[3]
+                                  : nullptr;
+
+        for (int64_t ic = 0; ic < nek1; ic += KT) {
+            const int64_t kv_tile = std::min((int64_t) KT, nek1 - ic);
+            if (mask && !fa_ime2_tile_active(mask, mrow0, tile_rows, ic, kv_tile)) {
+                continue;
+            }
+
+            // S^T = K * Q^T on the IME.
+            fa_ime2_pack_k(Ka, (const char *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1, kv_tile, DK);
+            for (int64_t mb = 0; mb < KT / 16; ++mb) {
+                for (int64_t nb_ = 0; nb_ < QT / 32; ++nb_) {
+                    fa_ime2_gemm_m16n32(DK, Qb + nb_ * 32 * DK, Ka + mb * 16 * DK, St + mb * 16 * QT + nb_ * 32, QT);
+                }
+            }
+
+            // mask^T: 8 kv columns at a time with a strided segment load over the query rows.
+            if (mask) {
+                for (int64_t c0 = 0; c0 < KT; c0 += 8) {
+                    if (c0 + 8 <= kv_tile) {
+                        const vfloat16m1x8_t t = __riscv_vlsseg8e16_v_f16m1x8(
+                            (const _Float16 *) mrow0 + ic + c0, mask->nb[1], tile_rows);
+#define FA_IME2_MT(i)                                                                                              \
+    __riscv_vse32_v_f32m2(Mt + (c0 + i) * QT,                                                                      \
+                          __riscv_vfmul_vf_f32m2(__riscv_vfwcvt_f_f_v_f32m2(__riscv_vget_v_f16m1x8_f16m1(t, i), tile_rows), slope, \
+                                                 tile_rows),                                                       \
+                          tile_rows)
+                        FA_IME2_MT(0); FA_IME2_MT(1); FA_IME2_MT(2); FA_IME2_MT(3);
+                        FA_IME2_MT(4); FA_IME2_MT(5); FA_IME2_MT(6); FA_IME2_MT(7);
+#undef FA_IME2_MT
+                    } else {
+                        for (int64_t c = c0; c < c0 + 8; ++c) {
+                            if (c < kv_tile) {
+                                const vfloat16m1_t mv = __riscv_vlse16_v_f16m1((const _Float16 *) mrow0 + ic + c,
+                                                                               mask->nb[1], tile_rows);
+                                __riscv_vse32_v_f32m2(Mt + c * QT,
+                                                      __riscv_vfmul_vf_f32m2(__riscv_vfwcvt_f_f_v_f32m2(mv, tile_rows),
+                                                                             slope, tile_rows),
+                                                      tile_rows);
+                            } else {
+                                __riscv_vse32_v_f32m2(Mt + c * QT, __riscv_vfmv_v_f_f32m2(-INFINITY, vq), vq);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Pass 1: softcap and mask, column max over kv (vectors over the queries).
+            vfloat32m2_t mx = __riscv_vfmv_v_f_f32m2(-INFINITY, vq);
+            for (int64_t c = 0; c < KT; ++c) {
+                vfloat32m2_t s = __riscv_vle32_v_f32m2(St + c * QT, vq);
+                if (logit_softcap != 0.0f) {
+                    s = fa_ime2_softcap(s, logit_softcap, vq);
+                }
+                if (mask) {
+                    s = __riscv_vfadd_vv_f32m2(s, __riscv_vle32_v_f32m2(Mt + c * QT, vq), vq);
+                } else if (c >= kv_tile) {
+                    s = __riscv_vfmv_v_f_f32m2(-INFINITY, vq);
+                }
+                __riscv_vse32_v_f32m2(St + c * QT, s, vq);
+                mx = __riscv_vfmax_vv_f32m2(mx, s, vq);
+            }
+            const vfloat32m2_t m_old = __riscv_vle32_v_f32m2(Mrow, vq);
+            const vfloat32m2_t m_new = __riscv_vfmax_vv_f32m2(m_old, mx, vq);
+            // Queries with no finite score yet keep M = -inf; use 0 as the shift so exp(-inf - 0) = 0, no NaN.
+            const vbool16_t    live  = __riscv_vmfne_vf_f32m2_b16(m_new, -INFINITY, vq);
+            const vfloat32m2_t shift = __riscv_vmerge_vvm_f32m2(__riscv_vfmv_v_f_f32m2(0.0f, vq), m_new, live, vq);
+            const vbool16_t    had   = __riscv_vmfne_vf_f32m2_b16(m_old, -INFINITY, vq);
+            const vfloat32m2_t alpha = __riscv_vmerge_vvm_f32m2(
+                __riscv_vfmv_v_f_f32m2(1.0f, vq), fa_ime2_exp(__riscv_vfsub_vv_f32m2(m_old, shift, vq), vq), had, vq);
+            __riscv_vse32_v_f32m2(Mrow, m_new, vq);
+            __riscv_vse32_v_f32m2(Arow, alpha, vq);
+
+            // Pass 2: P = exp(S - M), row sums, and P packed as B: [QT/32][KT/8][32][8] f16.
+            vfloat32m2_t lsum = __riscv_vfmul_vv_f32m2(__riscv_vle32_v_f32m2(Lrow, vq), alpha, vq);
+            auto prow = [&](int64_t c) {
+                const vfloat32m2_t pv =
+                    fa_ime2_exp(__riscv_vfsub_vv_f32m2(__riscv_vle32_v_f32m2(St + c * QT, vq), shift, vq), vq);
+                lsum = __riscv_vfadd_vv_f32m2(lsum, pv, vq);
+                return __riscv_vfncvt_f_f_w_f16m1(pv, vq);
+            };
+            for (int64_t g = 0; g < KT / 8; ++g) {
+                const vfloat16m1_t p0 = prow(8 * g + 0), p1 = prow(8 * g + 1), p2 = prow(8 * g + 2),
+                                   p3 = prow(8 * g + 3), p4 = prow(8 * g + 4), p5 = prow(8 * g + 5),
+                                   p6 = prow(8 * g + 6), p7 = prow(8 * g + 7);
+                __riscv_vsseg8e16_v_f16m1x8(Pb + g * 256, __riscv_vcreate_v_f16m1x8(p0, p1, p2, p3, p4, p5, p6, p7), 32);
+#define FA_IME2_HI(x) __riscv_vslidedown_vx_f16m1(x, 32, vq)
+                __riscv_vsseg8e16_v_f16m1x8(Pb + 32 * KT + g * 256,
+                                            __riscv_vcreate_v_f16m1x8(FA_IME2_HI(p0), FA_IME2_HI(p1), FA_IME2_HI(p2),
+                                                                      FA_IME2_HI(p3), FA_IME2_HI(p4), FA_IME2_HI(p5),
+                                                                      FA_IME2_HI(p6), FA_IME2_HI(p7)),
+                                            32);
+#undef FA_IME2_HI
+            }
+            __riscv_vse32_v_f32m2(Lrow, lsum, vq);
+
+            // O^T = O^T * alpha + V^T * P^T on the IME.
+            fa_ime2_pack_v(Va, (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3, nbv1, kv_tile, DV);
+            for (int64_t mb = 0; mb < DV / 16; ++mb) {
+                for (int64_t nb_ = 0; nb_ < QT / 32; ++nb_) {
+                    fa_ime2_gemm_m16n32(KT, Pb + nb_ * 32 * KT, Va + mb * 16 * KT, PVt + mb * 16 * QT + nb_ * 32, QT);
+                }
+            }
+            const vfloat32m2_t a = __riscv_vle32_v_f32m2(Arow, vq);
+            for (int64_t d = 0; d < DV; ++d) {
+                __riscv_vse32_v_f32m2(Ot + d * QT,
+                                      __riscv_vfmacc_vv_f32m2(__riscv_vle32_v_f32m2(PVt + d * QT, vq), a,
+                                                              __riscv_vle32_v_f32m2(Ot + d * QT, vq), vq),
+                                      vq);
+            }
+        }
+
+        // Sinks, normalization and the strided store back to [q][DV] rows.
+        vfloat32m2_t       l   = __riscv_vle32_v_f32m2(Lrow, vq);
+        const vfloat32m2_t mfn = __riscv_vle32_v_f32m2(Mrow, vq);
+        vfloat32m2_t       oscale = __riscv_vfmv_v_f_f32m2(1.0f, vq);
+        if (sinks) {
+            const float        s    = ((const float *) sinks->data)[h];
+            const vfloat32m2_t mnew = __riscv_vfmax_vf_f32m2(mfn, s, vq);
+            const vbool16_t    had  = __riscv_vmfne_vf_f32m2_b16(mfn, -INFINITY, vq);
+            const vfloat32m2_t ms   = __riscv_vmerge_vvm_f32m2(
+                __riscv_vfmv_v_f_f32m2(0.0f, vq), fa_ime2_exp(__riscv_vfsub_vv_f32m2(mfn, mnew, vq), vq), had, vq);
+            const vfloat32m2_t vs = fa_ime2_exp(__riscv_vfrsub_vf_f32m2(mnew, s, vq), vq);
+            l      = __riscv_vfmacc_vv_f32m2(vs, l, ms, vq);
+            oscale = ms;
+        }
+        const vbool16_t    nz  = __riscv_vmfne_vf_f32m2_b16(l, 0.0f, vq);
+        const vfloat32m2_t inv = __riscv_vmerge_vvm_f32m2(
+            __riscv_vfmv_v_f_f32m2(0.0f, vq), __riscv_vfrdiv_vf_f32m2(l, 1.0f, vq), nz, vq);
+        const vfloat32m2_t fs = __riscv_vfmul_vv_f32m2(inv, oscale, vq);
+
+        float *         dst_ptr  = (float *) ((char *) dst->data + (iq3 * ne2 * ne1 + iq2 + (iq1) *ne1) * nb1);
+        const ptrdiff_t q_stride = (ptrdiff_t) (nb1 * ne1);
+        for (int64_t d = 0; d < DV; ++d) {
+            const vfloat32m2_t o = __riscv_vfmul_vv_f32m2(__riscv_vle32_v_f32m2(Ot + d * QT, vq), fs, vq);
+            __riscv_vsse32_v_f32m2(dst_ptr + d, q_stride, o, tile_rows);
+        }
+
+        ir += tile_rows;
+    }
+}
+#endif  // GGML_SPACEMIT_FA_IME2
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];

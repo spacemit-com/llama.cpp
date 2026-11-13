@@ -79,6 +79,11 @@ if (GGML_BUILD_PROFILE)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_BUILD_PROFILE)
 endif()
 
+option(GGML_SPACEMIT_FA_IME2 "ggml-spacemit: flash attention on the IME2 fp16 engine (experimental)" OFF)
+if (GGML_SPACEMIT_FA_IME2)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_SPACEMIT_FA_IME2)
+endif()
+
 # Pass the full march string to the backend target.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb")
