@@ -1,88 +1,72 @@
-# Contributors
+# SpacemiT contributions
 
-The project differentiates between 3 levels of contributors:
+These guidelines apply to contributions in `spacemit-com/llama.cpp` and its development forks. Read the [contribution harness](.agents/README.md) and the relevant development, acceptance, and delivery guides alongside this document.
 
-- Contributors: people who have contributed before (no special privileges)
-- Collaborators (Triage): people with significant contributions, who may be responsible for some parts of the code, and are expected to maintain and review contributions for the code they own
-- Maintainers: responsible for reviewing and merging PRs, after approval from the code owners
+## Scope
 
-# AI Usage Policy
+The primary source paths are `ggml/src/ggml-spacemit/**` and the maintained multimodal integration in `tools/mtmd/**`, `tools/smt-mtmd/**`, and media-related `tools/server/**` paths. Other `tools/**` paths may be changed when they are part of the same feature; narrow and explain those paths in the PR.
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. You are 100% responsible for every line, however it was produced.
->
-> Undisclosed AI usage may result in your account being permanently banned from contributing to the project.
->
-> Detailed information regarding permissible and restricted uses of AI can be found in the [AGENTS.md](AGENTS.md) file.
+Changes elsewhere in the repository are possible but strongly discouraged. For every such path, the PR must explain why the task cannot be completed without it, which alternatives were considered and why they fail, why the exact change is necessary, and how that path was validated.
 
-If AI is used to generate any portion of the code, contributors must adhere to the following requirements:
+The legacy `ggml/src/ggml-cpu/spacemit/**` backend is retired. Do not add backend features or optimizations there; all SpacemiT backend optimization belongs in `ggml/src/ggml-spacemit/**`.
 
-1. Explicitly disclose the manner in which AI was employed.
-2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request. A proper code review usually takes something like one hour per 200-400 LOC and you should be spending **at least that much time on code review alone**.
-4. Be prepared to explain every line of code you submit when asked about it by a maintainer.
-5. It is strictly prohibited to use AI to write your posts for you (bug reports, feature requests, pull request descriptions, Github discussions, responding to humans, ...).
+## Before implementation
 
-For more info, please refer to the [AGENTS.md](AGENTS.md) file.
+- Search existing issues and pull requests to avoid duplicate work.
+- New features must begin with an issue describing the problem and proposed direction. Discuss the scope with maintainers before implementing the feature.
+- Bug fixes must identify a reproducible failure and include a regression test.
+- Keep each pull request focused on one feature or fix. Do not combine unrelated cleanup with the required change.
+- New CLI or public API additions need a clear justification for why existing mechanisms are insufficient.
 
-# Pull requests (for contributors & collaborators)
+## Validation
 
-### Before you start
+- Select build and test requirements from the affected paths and behavior using [the acceptance matrix](.agents/acceptance.md). Full repository CI and unrelated backends are not required for every change.
+- Run and report the relevant build, correctness, dispatch, platform, and performance checks. A performance claim requires comparable measurements and artifact identity.
+- For source changes under `ggml/src/ggml-spacemit/**`, run end-to-end correctness and model-level performance checks on the relevant model or models that exercise the changed path. Operator or kernel tests alone are insufficient; record `NOT RUN` with the reason if the model check is unavailable.
+- Record unavailable, skipped, failing, or inconclusive validation explicitly. Do not present missing evidence as a pass.
+- Bug-fix regression tests must demonstrate failure before the change and pass after it.
 
-- Search for existing discussions and PRs first - duplicates will likely be closed without questions.
-- Features must begin with an issue, not a PR - let interest accumulate before writing code; niche features may only land as an example/tool, or on a private fork.
-- Bug-fix PRs must include a reproducible issue and a regression test that fails before your change and passes after. Fixes without a test may be closed without review.
-- New CLI or public API additions carry a **higher bar** than internal changes - justify why an existing mechanism doesn't suffice.
-- Meeting all of the above still doesn't guarantee a merge - see [Pull requests (for maintainers)](#pull-requests-for-maintainers).
-- If you are a new contributor
-    - Limit your open PRs to 1
-    - Do not submit trivial fixes (e.g. typos, formatting changes)
+## AI assistance and contributor responsibility
 
-### Preparing your PR
+AI may assist with implementation, analysis, testing, evidence preparation, and PR drafting. Contributors must fully understand the submitted code, be able to debug it independently, explain it to reviewers without AI assistance, and take responsibility for its maintenance.
 
-- llama.cpp uses the ggml tensor library for model evaluation. If you are unfamiliar with ggml, consider taking a look at the [examples in the ggml repository](https://github.com/ggml-org/ggml/tree/master/examples/). [simple](https://github.com/ggml-org/ggml/tree/master/examples/simple) shows the bare minimum for using ggml. [gpt-2](https://github.com/ggml-org/ggml/tree/master/examples/gpt-2) has minimal implementations for language model inference using GPT-2. [mnist](https://github.com/ggml-org/ggml/tree/master/examples/mnist) demonstrates how to train and evaluate a simple image classifier
-- Test your changes:
-  - Execute [the full CI locally on your machine](ci/README.md) before publishing
-  - Verify that the perplexity and the performance are not affected negatively by your changes (use `llama-perplexity` and `llama-bench`)
-  - If you modified the `ggml` source, run the `test-backend-ops` tool to check whether different backend implementations of the `ggml` operators produce consistent results (this requires access to at least two different `ggml` backends)
-  - If you modified a `ggml` operator or added a new one, add the corresponding test cases to `test-backend-ops`
-- Create separate PRs for each feature or fix:
-  - Avoid combining unrelated changes in a single PR
-  - When adding support for a new model or feature, focus on **CPU support only** in the initial PR unless you have a good reason not to. Add support for other backends like CUDA in follow-up PRs
-  - In particular, adding new data types (extension of the `ggml_type` enum) carries with it a disproportionate maintenance burden. As such, to add a new quantization type you will need to meet the following *additional* criteria *at minimum*:
-    - convert a small model to GGUF using the new type and upload it to HuggingFace
-    - provide [perplexity](https://github.com/ggml-org/llama.cpp/tree/master/tools/perplexity) comparisons to FP16/BF16 (whichever is the native precision) as well as to types of similar size
-    - provide KL divergence data calculated vs. the FP16/BF16 (whichever is the native precision) version for both the new type as well as types of similar size
-    - provide [performance data](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench) for the new type in comparison to types of similar size on pure CPU
-- Consider allowing write access to your branch for faster reviews, as reviewers can push commits directly
+AI may draft a PR description when it follows the required [GitHub PR format](.github/pull_request_template.md) and the detailed [SpacemiT PR template](.agents/templates/pull-request.md). The contributor must review the text and verify every factual claim before submission. Disclose meaningful AI assistance in the PR template.
 
-### After submitting your PR
+AI must not automatically submit replies to code review comments. Contributors own and review their responses. An agent may not publish messages, create a PR, push, or merge without the user's explicit instruction.
 
-- Expect requests for modifications to ensure the code meets llama.cpp's standards for quality and long-term maintainability
-- Maintainers will rely on your insights and approval when making a final decision to approve and merge a PR
-- If your PR becomes stale, rebase it on top of latest `master` to get maintainers attention
-- Consider adding yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for fixing related issues and reviewing related PRs
+## Preparing and maintaining a PR
 
-# Pull requests (for maintainers)
-
-- Squash-merge PRs
-- Use the following format for the squashed commit title: `<module> : <commit title> (#<issue_number>)`. For example: `utils : fix typo in utils.py (#1234)`
-- Optionally pick a `<module>` from here: https://github.com/ggml-org/llama.cpp/wiki/Modules
-- Let other maintainers merge their own PRs
-- When merging a PR, make sure you have a good understanding of the changes
-- If a PR does not warrant a new release, add `[no release]` in the squashed commit to spare CI resources
-- Be mindful of maintenance: most of the work going into a feature happens after the PR is merged. If the PR author is not committed to contribute long-term, someone else needs to take responsibility (you)
-- Add the ["merge ready"](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr+is%3Aopen+draft%3Ano+sort%3Aupdated-desc+label%3A%22merge+ready%22+) label to a PR to indicate when a PR can be fast-merged without waiting for 2 independent reviews. [(more info)](https://github.com/ggml-org/llama.cpp/pull/26178)
-- Wait for CI results before merging
-
-Maintainers reserve the right to decline review or close pull requests for any reason, without any questions, particularly under any of the following conditions:
-- The proposed change is already mentioned in the roadmap or an existing issue, and it has been assigned to someone.
-- The pull request duplicates an existing one.
-- The contributor fails to adhere to this contributing guide or the AI policy.
-- The change doesn't fit the existing architecture, or is too complex to justify its benefit.
+- Explain the problem and trigger, the minimum necessary change, the affected paths, the selected validation, and any remaining limitations.
+- Link reviewer-accessible evidence using the validation record and PR templates in `.agents/templates/`.
+- Respond to review feedback, update the implementation or evidence when needed, and remain available to maintain the contribution after merge.
+- Maintainers decide whether a change fits the architecture and has sufficient evidence; required CI checks and review approvals must pass before merge.
 
 # Coding guidelines
+
+These guidelines apply to all contributors, including those using AI assistance.
+
+## Implementation and writing standards
+
+These points are extremely important - failing to follow them won't necessarily get your PR rejected, but it will make reviewing take significantly longer. Please follow them carefully:
+
+- Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
+- Code comments:
+    - Keep code comments concise (usually 1-2 lines)
+    - Avoid redundant or excessive inline commentary
+    - Avoid hard-wrapping it to a fixed column width - that hurts readability
+    - Use ASD-STE100 Simplified Technical English, simple wordings (write like cavemen if needed)
+    - Note: Remind yourself of this point regularly, as it often gets lost between context compactions
+- Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
+- Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
+- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
+
+Common mistakes that AI agents usually make:
+- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
+- Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
+
+Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
+
+## General code style
 
 - Avoid adding third-party dependencies, extra files, extra headers, etc.
 - Always consider cross-compatibility with other operating systems and architectures
@@ -110,6 +94,83 @@ Maintainers reserve the right to decline review or close pull requests for any r
 - Matrix multiplication is unconventional: [`C = ggml_mul_mat(ctx, A, B)`](https://github.com/ggml-org/llama.cpp/blob/880e352277fc017df4d5794f0c21c44e1eae2b84/ggml.h#L1058-L1064) means $C^T = A B^T \Leftrightarrow C = B A^T.$
 
 ![matmul](media/matmul.png)
+
+## Code comment examples
+
+```cpp
+// GOOD (code is self-explanatory, no comment needed)
+
+n_ctx = read_metadata("context_length", 1024);
+
+
+// BAD (too verbose, restates what the code already says)
+
+// Populate the n_ctx from metadata key name "context_length", default to 1024 if the key doesn't exist
+n_ctx = read_metadata("context_length", 1024);
+```
+
+```cpp
+// GOOD (explains a non-obvious invariant)
+
+accept();
+bool has_client = listen(idle_interval);
+if (has_client) {
+  task_queue->on_idle(); // also signal child disconnection
+}
+
+
+// BAD (too verbose, restates what the code already says)
+
+// Instead of blocking indefinitely on accept(), the server polls the listening socket with idle_interval as a timeout. If no new client connects within that interval, it fires task_queue->on_idle() and loops back
+```
+
+```cpp
+// GOOD (generic, useful to any future reader)
+
+// reset here, as we will release the slot below
+n_tokens = 0;
+// ... (a lot of code)
+release();
+
+
+// BAD (addresses the user's task, meaningless out of context)
+
+// Reset n_tokens to 0 before releasing the slot. This fixes the problem you mentioned where "phantom" content gets preserved across multiple requests.
+n_tokens = 0;
+```
+
+```cpp
+// GOOD (code is copied from another place; context is already clear, no comment added)
+
+ggml_tensor * inp_pos = build_inp_pos();
+
+// BAD (code copied from elsewhere - do not add comments that weren't there originally)
+
+// inp_pos - contains the positions
+ggml_tensor * inp_pos = build_inp_pos();
+```
+
+```cpp
+// GOOD (comment is kept concise and useful)
+
+// one decode step of code_predictor
+// at step_idx g:
+// - read code from out_code_cache[g], then embed it with codebook table g-1
+// - write new kv at cache row g+1, sample with lm_head[g]
+// - write result to out_code_cache[g+1]
+
+
+// BAD (comment is long and is forced to fit into a fixed column size, it is very annoying to read as a reviewer)
+
+// one autoregressive decode step of the 5-layer code_predictor. See the
+// comment in models.h for the cache/tensor conventions this relies on.
+//
+// index mapping (derived from the reference pipeline-tts.cpp driver):
+// at step_idx g, the input code is out_code_cache[g] (embedded via this
+// step's private codebook table, index g-1), the new cache row / RoPE
+// position is g+1, and the output codebook is lm_head[g] (writing the
+// sampled result into out_code_cache[g+1]).
+```
 
 # Naming guidelines
 

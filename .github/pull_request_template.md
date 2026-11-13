@@ -1,16 +1,42 @@
 ## Overview
 
-<!-- Describe what this PR does and why. Be concise but complete -->
+<!-- For ggml/src/ggml-spacemit or maintained tools/** contributions, use .agents/templates/pull-request.md as the detailed checklist. -->
 
-## Additional information
+- Problem and trigger:
+- Resulting behavior:
+- Related issue or discussion:
 
-<!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
+## Scope and design
 
-## Requirements
+- Changed paths and why each is necessary:
+- Paths outside ggml/src/ggml-spacemit and relevant tools paths, if any:
+- Code-path evidence they are necessary and alternatives considered:
+- No new development or optimization in the retired ggml/src/ggml-cpu/spacemit backend:
+- Minimum necessary change and key tradeoffs:
 
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
+## Validation
 
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
+- Base / candidate revisions and artifact identity:
+- Build and configuration:
+- Correctness evidence and independent reference:
+- Performance evidence, or why performance is not claimed:
+- Detailed validation record and reviewer-accessible logs:
 
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+| Check | Status (PASS / FAIL / NOT RUN / N/A) | Result and evidence |
+| --- | --- | --- |
+| Build |  |  |
+| Correctness |  |  |
+| Performance |  |  |
+| Platform coverage |  |  |
+
+## Risks and limits
+
+- Untested paths, known failures, and inconclusive results:
+- Evidence unavailable to reviewers:
+- Follow-up work:
+
+## AI assistance and responsibility
+
+- AI assistance and scope (code, tests, analysis, report, PR text):
+- Contributor review of code and evidence:
+- I understand and take responsibility for the submitted code and claims.
