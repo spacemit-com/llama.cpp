@@ -14,6 +14,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 // clang-format off
@@ -39,6 +40,48 @@
 #endif
 
 // clang-format on
+
+// ---------------------------------------------------------------------------
+// Load-time repacking of a quantised tensor is pure, row-block-local work: row
+// block r reads rows [32r, 32r+32) of the source and writes its own contiguous
+// slice of t->data.  Doing it on one thread makes model loading single-threaded
+// (measured: ~106 s of the 120 s it takes to load a 21 GiB Q4_K_M model on a
+// SpacemiT K3, with the other cores idle).  This helper spreads the row blocks
+// over the cores; with GGML_SPACEMIT_REPACK_MT off it runs the original single
+// call and the code path is unchanged.
+// ---------------------------------------------------------------------------
+#ifdef GGML_SPACEMIT_REPACK_MT
+template <typename F> static void spacemit_repack_parallel_for(int64_t n, F fn) {
+    if (n <= 1) {
+        fn(0, n);
+        return;
+    }
+    const unsigned hw  = std::thread::hardware_concurrency();
+    const int64_t  cap = 8;   // one cluster's worth of cores
+    int64_t        nth = std::min<int64_t>(n, hw ? std::min<int64_t>(hw, cap) : 1);
+    if (nth <= 1) {
+        fn(0, n);
+        return;
+    }
+    const int64_t            chunk = (n + nth - 1) / nth;
+    std::vector<std::thread> threads;
+    threads.reserve((size_t) nth - 1);
+    for (int64_t k = 1; k < nth; k++) {
+        const int64_t lo = std::min(n, chunk * k);
+        const int64_t hi = std::min(n, lo + chunk);
+        if (lo >= hi) {
+            break;
+        }
+        threads.emplace_back([&fn, lo, hi] { fn(lo, hi); });
+    }
+    fn(0, std::min(n, chunk));
+    for (auto & t : threads) {
+        t.join();
+    }
+}
+#else
+template <typename F> static void spacemit_repack_parallel_for(int64_t n, F fn) { fn(0, n); }
+#endif
 
 template <int K> constexpr int QK_0() {
     if constexpr (K == 4) {
@@ -1023,17 +1066,18 @@ static int repack_q4_k_to_q4_1_32_bl(ggml_tensor *              t,
 
     constexpr int nrows_interleaved = 32;
 
-    block_q4_1x32 *    dst = (block_q4_1x32 *) t->data;
-    const block_q4_K * src = (const block_q4_K *) data;
-    block_q4_1         dst_tmp[32];
-    int                nrow    = ggml_nrows(t);
-    int                nblocks = t->ne[0] / QK_K;
+    const int nrow    = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
 
     if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_K != 0) {
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    spacemit_repack_parallel_for(nrow / nrows_interleaved, [&](int64_t rb0, int64_t rb1) {
+      for (int64_t rb = rb0; rb < rb1; rb++) {
+        block_q4_1x32 *    dst = (block_q4_1x32 *) t->data + rb * (int64_t) nblocks * 8;
+        const block_q4_K * src = (const block_q4_K *) data + rb * (int64_t) nrows_interleaved * nblocks;
+        block_q4_1         dst_tmp[32];
         for (int64_t x = 0; x < nblocks; x++) {
             for (int j = 0; j < 8; j++) {
                 for (int i = 0; i < nrows_interleaved; i++) {
@@ -1063,8 +1107,8 @@ static int repack_q4_k_to_q4_1_32_bl(ggml_tensor *              t,
                 *dst++ = make_block_q4_1x32(dst_tmp, interleave_block);
             }
         }
-        src += nrows_interleaved * nblocks;
-    }
+      }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
@@ -1080,19 +1124,21 @@ static int repack_q6_k_to_q8_0_32_bl_ref(ggml_tensor *              t,
 
     constexpr int nrows_interleaved = 32;
 
-    block_q8_0x32 *    dst = (block_q8_0x32 *) t->data;
-    const block_q6_K * src = (const block_q6_K *) data;
-    block_q8_0         dst_tmp[32];
-    int8_t             aux8[QK4_1];
-    int                nrow    = ggml_nrows(t);
-    int                nblocks = t->ne[0] / QK_K;
+    const int nrow    = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
 
     if (t->ne[0] % QK_K != 0) {
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
-        int64_t nrow_real = std::min((int64_t) nrow - b, (int64_t) nrows_interleaved);
+    const int64_t nrow_blocks = (nrow + nrows_interleaved - 1) / nrows_interleaved;
+    spacemit_repack_parallel_for(nrow_blocks, [&](int64_t rb0, int64_t rb1) {
+      for (int64_t rb = rb0; rb < rb1; rb++) {
+        block_q8_0x32 *    dst = (block_q8_0x32 *) t->data + rb * (int64_t) nblocks * 8;
+        const block_q6_K * src = (const block_q6_K *) data + rb * (int64_t) nrows_interleaved * nblocks;
+        block_q8_0         dst_tmp[32];
+        int8_t             aux8[QK4_1];
+        int64_t nrow_real = std::min((int64_t) nrow - rb * nrows_interleaved, (int64_t) nrows_interleaved);
         for (int64_t x = 0; x < nblocks; x++) {
             for (int bi = 0; bi < 8; bi++) {
                 int i = 0;
@@ -1164,8 +1210,8 @@ static int repack_q6_k_to_q8_0_32_bl_ref(ggml_tensor *              t,
                 *dst++ = make_block_q8_0x32(dst_tmp, interleave_block);
             }
         }
-        src += nrows_interleaved * nblocks;
-    }
+      }
+    });
     return 0;
 
     GGML_UNUSED(data_size);
@@ -1635,17 +1681,19 @@ static int repack_q5_k_to_q5_1_32_bl(ggml_tensor *              t,
 
     constexpr int nrows_interleaved = 32;
 
-    spacemit_kernels::nrow_block_q5_1<32> * dst = (spacemit_kernels::nrow_block_q5_1<32> *) t->data;
-    const block_q5_K *                      src = (const block_q5_K *) data;
-    spacemit_kernels::nrow_block_q5_1<1>    dst_tmp[32];
-    int                                     nrow    = ggml_nrows(t);
-    int                                     nblocks = t->ne[0] / QK_K;
+    const int nrow    = ggml_nrows(t);
+    const int nblocks = t->ne[0] / QK_K;
 
     if (t->ne[1] % nrows_interleaved != 0 || t->ne[0] % QK_K != 0) {
         return -1;
     }
 
-    for (int b = 0; b < nrow; b += nrows_interleaved) {
+    spacemit_repack_parallel_for(nrow / nrows_interleaved, [&](int64_t rb0, int64_t rb1) {
+      for (int64_t rb = rb0; rb < rb1; rb++) {
+        spacemit_kernels::nrow_block_q5_1<32> * dst =
+            (spacemit_kernels::nrow_block_q5_1<32> *) t->data + rb * (int64_t) nblocks * 8;
+        const block_q5_K * src = (const block_q5_K *) data + rb * (int64_t) nrows_interleaved * nblocks;
+        spacemit_kernels::nrow_block_q5_1<1> dst_tmp[32];
         for (int64_t x = 0; x < nblocks; x++) {
             for (int j = 0; j < 8; j++) {
                 for (int i = 0; i < nrows_interleaved; i++) {
@@ -1698,8 +1746,8 @@ static int repack_q5_k_to_q5_1_32_bl(ggml_tensor *              t,
                 *dst++ = make_block_q5_1x32(dst_tmp, interleave_block);
             }
         }
-        src += nrows_interleaved * nblocks;
-    }
+      }
+    });
     return 0;
 }
 
