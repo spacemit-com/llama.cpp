@@ -221,7 +221,7 @@ Adjacent data-shape rule: empty string is not a valid "unset" initial state - us
 
 ## General (always)
 
-Enforce the `AGENTS.md` / `CONTRIBUTING.md` coding and naming guidelines on every changed line - this is a distinct pass from checking that the code works, and matters just as much for review speed:
+Enforce the `CONTRIBUTING.md` coding and naming guidelines on every changed line - this is a distinct pass from checking that the code works, and matters just as much for review speed:
 
 - ASCII only in code and comments - no emdash, unicode arrows, `x`, `...` used as unicode; use `-`, `->`, `x`, `...` ASCII equivalents.
 - Comments are concise and explain non-obvious *why*, not *what*. Flag verbose comments, comments that restate the code, comments that reference the current task/PR, and comments hard-wrapped to a fixed column width.
@@ -233,7 +233,7 @@ Enforce the `AGENTS.md` / `CONTRIBUTING.md` coding and naming guidelines on ever
 - Keep it simple: a simpler change doing 90% is often preferable to a complex one doing 100%. Flag unnecessary templates/fancy STL; basic `for` loops are fine here.
 - Every added line should be something the contributor can explain and defend to a reviewer without AI help - flag anything that looks copied-in without understanding.
 - `Co-authored-by:` must be reserved for human co-authors; AI contributions (claude, cursor, codex, etc.) must use `Assisted-by:`; if this point is violated, it's a blocking finding.
-- Any mentions of Minja must be treated as blocking; see `AGENTS.md` for why.
+- Any mentions of Minja must be treated as blocking; see the [implementation and writing standards](../../CONTRIBUTING.md#implementation-and-writing-standards) for why.
 
 ## Reporting
 

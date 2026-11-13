@@ -64,7 +64,7 @@ Hardware specialization is appropriate when its capability, vector length, type,
 Keep unsupported inputs on a valid existing fallback or reject them through the appropriate support predicate.
 Do not use model names, file paths, or benchmark identities as substitutes for technical dispatch conditions.
 Separate compiler instruction support from runtime hardware support when selecting IME1, IME2, or RVV code.
-Explain non-obvious layout, arithmetic, or ordering requirements with concise comments near the relevant code.
+Explain non-obvious layout, arithmetic, or ordering requirements near the relevant code, following the [comment standards and examples](../CONTRIBUTING.md#coding-guidelines).
 
 ## Preserve numerical and layout contracts
 
