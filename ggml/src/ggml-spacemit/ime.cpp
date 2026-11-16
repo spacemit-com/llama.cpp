@@ -35,6 +35,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <typeinfo>
 #include <unordered_map>
 #include <vector>
 // clang-format off
@@ -242,7 +243,6 @@ struct gemm_path_f16 {
 };
 
 using q41_zero_point_mode = mlir::speir::spekernel::ime2::q41_zero_point_mode;
-using spe_data_type = mlir::speir::spekernel::spe_data_type;
 
 template <typename BLOC_TYPE, size_t NB, size_t KB, q41_zero_point_mode Mode>
 static gemm_path_f16 resolve_gemm_f16() {
@@ -257,11 +257,11 @@ static gemm_path_f16 resolve_gemm_f16() {
 
     gemm_path_f16 o;
     o.castpack_a = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
-        march.value, spe_data_type::f32, spe_data_type::f16, 1, 1, 16, 8);
+        march.value, typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8);
     o.dequantpack_b = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
-        march.value, spe_data_type::q41_32x32, spe_data_type::f16, NB, KB, NB, 8, Mode);
+        march.value, typeid(BLOC_TYPE), typeid(_spe_fp16_), NB, KB, NB, 8, Mode);
     o.reducesum = mlir::speir::spekernel::rvv::get_spe_reducesum_mxn_function(
-        march.value, spe_data_type::f16, spe_data_type::f32, 16, 32, 1, 1);
+        march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
     o.quantize_a_gemv = &spacemit_kernels::rvv::quantize_a_i8_r1;
     o.dot_gemv        = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41;
     o.dot_f16acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot;
