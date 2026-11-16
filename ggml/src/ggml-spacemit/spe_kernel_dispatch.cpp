@@ -2,7 +2,6 @@
 #include "ime_kernels.h"
 #include "spe_kernels_core.h"
 
-#include <typeindex>
 #include <vector>
 
 namespace mlir::speir::spekernel {
@@ -163,8 +162,8 @@ static void spe_pack_cast_q41(void *  in,
 namespace mlir::speir::spekernel::ime2 {
 
 spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         march,
-                                                      const std::type_info & in_type,
-                                                      const std::type_info & out_type,
+                                                      const spe_data_type    in_type,
+                                                      const spe_data_type    out_type,
                                                       const size_t           src_mb,
                                                       const size_t           src_kb,
                                                       const size_t           dst_mb,
@@ -177,7 +176,7 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
     }
 
     if (mode == q41_zero_point_mode::fixed_8) {
-        if (in_type == typeid(Q41Block<32, 32, 2>) && out_type == typeid(_spe_fp16_) &&
+        if (in_type == spe_data_type::q41_32x32 && out_type == spe_data_type::f16 &&
             src_mb == 32 && src_kb == 32 && dst_mb == 32 && dst_kb == 8) {
             return spe_pack_cast_q41<q41_zero_point_mode::fixed_8>;
         }
@@ -188,8 +187,8 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
     }
 
     struct dispatch_entry_t {
-        std::type_index            in_type;
-        std::type_index            out_type;
+        spe_data_type              in_type;
+        spe_data_type              out_type;
         size_t                     src_mb;
         size_t                     src_kb;
         size_t                     dst_mb;
@@ -199,18 +198,15 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
 
     // clang-format off
     static const std::vector<dispatch_entry_t> func_table = {
-        { typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8> },
-        { typeid(float), typeid(_spe_fp16_), 1, 1, 32, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8> },
-        { typeid(Q41Block<32, 32, 2>), typeid(_spe_fp16_), 32, 32, 32, 8,
+        { spe_data_type::f32, spe_data_type::f16, 1, 1, 16, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 16, 8> },
+        { spe_data_type::f32, spe_data_type::f16, 1, 1, 32, 8, spe_pack_cast<float, _spe_fp16_, 1, 1, 32, 8> },
+        { spe_data_type::q41_32x32, spe_data_type::f16, 32, 32, 32, 8,
           spe_pack_cast_q41<q41_zero_point_mode::per_row> },
     };
     // clang-format on
 
-    const std::type_index in_type_index(in_type);
-    const std::type_index out_type_index(out_type);
-
     for (const auto & entry : func_table) {
-        if (entry.in_type == in_type_index && entry.out_type == out_type_index && entry.src_mb == src_mb &&
+        if (entry.in_type == in_type && entry.out_type == out_type && entry.src_mb == src_mb &&
             entry.src_kb == src_kb && entry.dst_mb == dst_mb && entry.dst_kb == dst_kb) {
             return entry.func;
         }
@@ -282,8 +278,8 @@ void spe_reducesum_mxn<_spe_fp16_, float, 16, 32, 1, 1>(void *  in,
 namespace mlir::speir::spekernel::rvv {
 
 spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t         march,
-                                                              const std::type_info & in_type,
-                                                              const std::type_info & out_type,
+                                                              const spe_data_type    in_type,
+                                                              const spe_data_type    out_type,
                                                               const size_t           src_mb,
                                                               const size_t           src_nb,
                                                               const size_t           dst_mb,
@@ -295,8 +291,8 @@ spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t    
     }
 
     struct dispatch_entry_t {
-        std::type_index                in_type;
-        std::type_index                out_type;
+        spe_data_type                  in_type;
+        spe_data_type                  out_type;
         size_t                         src_mb;
         size_t                         src_nb;
         size_t                         dst_mb;
@@ -305,14 +301,11 @@ spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t    
     };
 
     static const std::vector<dispatch_entry_t> func_table = {
-        {typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1, spe_reducesum_mxn<_spe_fp16_, float, 16, 32, 1, 1>},
+        {spe_data_type::f16, spe_data_type::f32, 16, 32, 1, 1, spe_reducesum_mxn<_spe_fp16_, float, 16, 32, 1, 1>},
     };
 
-    const std::type_index in_type_index(in_type);
-    const std::type_index out_type_index(out_type);
-
     for (const auto & entry : func_table) {
-        if (entry.in_type == in_type_index && entry.out_type == out_type_index && entry.src_mb == src_mb &&
+        if (entry.in_type == in_type && entry.out_type == out_type && entry.src_mb == src_mb &&
             entry.src_nb == src_nb && entry.dst_mb == dst_mb && entry.dst_nb == dst_nb) {
             return entry.func;
         }

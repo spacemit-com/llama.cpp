@@ -2,7 +2,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <typeinfo>
 
 constexpr uint64_t SpineInvalidCoreID = 0xFFFFFFFF;
 
@@ -39,6 +38,9 @@ union SpineArchInfoDef {
 };
 
 namespace mlir::speir::spekernel {
+
+// OHOS libc++ does not provide RTTI for _Float16.
+enum class spe_data_type { f32, f16, q41_32x32 };
 
 using spe_pack_cast_function_def = std::function<void(void *  in,
                                                       int64_t in_offset,
@@ -80,8 +82,8 @@ namespace mlir::speir::spekernel::ime2 {
 enum class q41_zero_point_mode { per_row, fixed_8 };
 
 spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         march,
-                                                      const std::type_info & in_type,
-                                                      const std::type_info & out_type,
+                                                      const spe_data_type    in_type,
+                                                      const spe_data_type    out_type,
                                                       const size_t           src_mb,
                                                       const size_t           src_kb,
                                                       const size_t           dst_mb,
@@ -91,8 +93,8 @@ spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         mar
 
 namespace mlir::speir::spekernel::rvv {
 spe_reducesum_mxn_function_def get_spe_reducesum_mxn_function(const uint64_t         march,
-                                                              const std::type_info & in_type,
-                                                              const std::type_info & out_type,
+                                                              const spe_data_type    in_type,
+                                                              const spe_data_type    out_type,
                                                               const size_t           src_mb,
                                                               const size_t           src_nb,
                                                               const size_t           dst_mb,
