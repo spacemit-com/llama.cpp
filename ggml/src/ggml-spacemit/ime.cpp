@@ -1763,6 +1763,96 @@ private:
         return true;
     }
 
+    bool compute_forward_fused(ggml::spacemit::context & ctx, const spacemit_opnode & node) const override {
+        const bool with_swiglu = node.opcode == SPACEMIT_OP_MUL_MAT_FFN_SWIGLU;
+        if ((node.opcode != SPACEMIT_OP_MUL_MAT_FFN && !with_swiglu) ||
+            node.fused.size() != (with_swiglu ? 2u : 1u)) {
+            return false;
+        }
+        ggml_tensor * first = node.fused[0];
+        ggml_tensor * second = node.node;
+        ggml_tensor * glu = with_swiglu ? node.fused[1] : nullptr;
+        // On a cached graph, recheck actual buffers/traits before any worker writes.
+        if (!ggml_spacemit_ffn_f16_eligible(first, second) ||
+            ctx.workspace_size < SPACEMIT_FFN_PACK_WORKSPACE) {
+            if (!ggml_spacemit_compute_forward(ctx, first)) {
+                return false;
+            }
+            ctx.sync();
+            if (!ggml_spacemit_compute_forward(ctx, second)) {
+                return false;
+            }
+            if (glu) {
+                ctx.sync();
+                return ggml_spacemit_compute_forward(ctx, glu);
+            }
+            return true;
+        }
+        const ggml_tensor * input = first->src[1];
+        const size_t M = input->ne[1];
+        const size_t K = input->ne[0];
+        const size_t N = first->ne[0];
+        const size_t m_pad = GGML_PAD(M, F16_M_TILE);
+        const size_t mt_count = m_pad / F16_M_TILE;
+        const size_t nt_count = N / F16_N_TILE;
+        const size_t ith = ctx.ith;
+        const size_t nth = ctx.nth;
+        auto * packed = reinterpret_cast<_Float16 *>((reinterpret_cast<uintptr_t>(ctx.workspace) + 63) & ~uintptr_t{63});
+        // All workers cast disjoint M16 tiles exactly once for both projections.
+        for (size_t mt = ith; mt < mt_count; mt += nth) {
+            ops_.castpack_a(input->data, static_cast<int64_t>(mt * F16_M_TILE * input->nb[1]),
+                            static_cast<int64_t>(input->nb[1]),
+                            packed + mt * F16_M_TILE * K, 0,
+                            static_cast<int64_t>(K * F16_M_TILE * sizeof(_Float16)),
+                            static_cast<int64_t>(std::min(F16_M_TILE, M - mt * F16_M_TILE)),
+                            static_cast<int64_t>(K), 1, static_cast<int64_t>(K / 8));
+        }
+        ctx.sync(); // publish the shared pack before any projection reads it
+
+        GGML_ASSERT(ctx.shared.data && ctx.shared.size > 0);
+        const size_t tcm_size = static_cast<size_t>(ctx.shared.size);
+        const size_t kb = std::min(K, (tcm_size / ((m_pad + F16_N_TILE) * sizeof(_Float16))) & ~(KB - 1));
+        GGML_ASSERT(kb >= KB);
+        auto * a = reinterpret_cast<_Float16 *>(ctx.shared.data);
+        auto * b = a + m_pad * kb;
+        const size_t b_row_stride = (K / KB) * KB_BYTES;
+        ggml_tensor * projections[2] = { first, second };
+        // Each worker owns independent (projection, N32) columns. K chunks retain
+        // the existing F32 accumulation order; neither vfwmadot kernel is changed.
+        for (size_t k0 = 0; k0 < K; k0 += kb) {
+            const size_t kk = std::min(kb, K - k0);
+            for (size_t mt = 0; mt < mt_count; ++mt) {
+                memcpy(a + mt * F16_M_TILE * kb,
+                       packed + mt * F16_M_TILE * K + k0 * F16_M_TILE,
+                       kk * F16_M_TILE * sizeof(_Float16));
+            }
+            for (size_t task = ith; task < 2 * nt_count; task += nth) {
+                const size_t nt = task % nt_count;
+                ggml_tensor * dst = projections[task / nt_count];
+                auto * weights = static_cast<uint8_t *>(dst->src[0]->data);
+                ops_.dequantpack_b(weights + nt * b_row_stride + (k0 / KB) * KB_BYTES,
+                                   0, static_cast<int64_t>(b_row_stride), b, 0,
+                                   static_cast<int64_t>((kk / 8) * 512),
+                                   1, static_cast<int64_t>(kk / KB), 1, static_cast<int64_t>(kk / 8));
+                for (size_t mt = 0; mt < mt_count; ++mt) {
+                    const size_t m0 = mt * F16_M_TILE;
+                    auto * out = reinterpret_cast<float *>(static_cast<uint8_t *>(dst->data) + m0 * dst->nb[1]) +
+                                 nt * F16_N_TILE;
+                    ops_.dot_f32acc(kk, b, a + mt * F16_M_TILE * kb, out,
+                                    std::min(F16_M_TILE, M - m0), F16_N_TILE, N, k0 != 0);
+                }
+            }
+        }
+        if (glu) {
+            // Projection columns are spread over workers: publish both complete
+            // matrices before the existing RVV SwiGLU kernel partitions its rows.
+            ctx.sync();
+            spacemit_kernels::rvv::forward_glu_swiglu_f32(ctx, glu);
+        }
+        // The graph executor synchronizes before consumers or workspace reuse.
+        return true;
+    }
+
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
@@ -2664,6 +2754,61 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
     }
 
     return std::max(nbytes, ggml_nbytes(tensor));
+}
+
+// Validate exact Q41/FP16 format identity, 2D layouts, bounded shapes and allocated
+// byte ranges. Called after graph allocation; reject every input/output overlap.
+bool ggml_spacemit_ffn_f16_eligible(const ggml_tensor * first, const ggml_tensor * second) {
+    using namespace ggml::cpu::riscv64_spacemit;
+    if (!first || !second || first->op != GGML_OP_MUL_MAT || second->op != GGML_OP_MUL_MAT ||
+        !first->src[0] || !second->src[0] || !first->src[1] || first->src[1] != second->src[1] ||
+        first->view_src || second->view_src ||
+        ((first->flags | second->flags) & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT)) ||
+        first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32 ||
+        !ggml_are_same_shape(first, second) || !ggml_is_contiguous(first) || !ggml_is_contiguous(second)) {
+        return false;
+    }
+    const ggml_tensor * x = first->src[1];
+    const ggml_tensor * w0 = first->src[0];
+    const ggml_tensor * w1 = second->src[0];
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1 ||
+        x->ne[0] < 32 || x->ne[0] > 1024 || x->ne[0] % 32 || x->ne[1] < 2 || x->ne[1] > 128 ||
+        first->ne[2] != 1 || first->ne[3] != 1 || first->ne[0] <= 0 || first->ne[0] % 32 ||
+        w0->type != GGML_TYPE_Q4_0 || w1->type != GGML_TYPE_Q4_0 || w0->view_src || w1->view_src ||
+        w0->op != GGML_OP_NONE || w1->op != GGML_OP_NONE ||
+        !ggml_is_contiguous(w0) || !ggml_is_contiguous(w1) ||
+        ggml_n_dims(w0) != 2 || !ggml_are_same_shape(w0, w1) ||
+        w0->ne[0] != x->ne[0] || w0->ne[1] != first->ne[0] || first->ne[1] != x->ne[1] ||
+        !use_f16_link(w0) || !use_f16_link(w1)) {
+        return false;
+    }
+    const auto * expected = &f16_traits<q41_zero_point_mode::fixed_8>();
+    if (w0->extra != expected || w1->extra != expected ||
+        ggml_spacemit_get_tensor_traits(first) != expected || ggml_spacemit_get_tensor_traits(second) != expected) {
+        return false;
+    }
+    const ggml_tensor * tensors[] = { first, second, x, w0, w1 };
+    uintptr_t begin[5], end[5];
+    for (size_t i = 0; i < 5; ++i) {
+        if (!tensors[i]->data) {
+            return false;
+        }
+        begin[i] = reinterpret_cast<uintptr_t>(tensors[i]->data);
+        const size_t bytes = i < 3 ? ggml_nbytes(tensors[i]) :
+                             (size_t(tensors[i]->ne[0]) / 32) * size_t(tensors[i]->ne[1]) * sizeof(Q41Block<32, 32, 2>) / 32;
+        if (bytes > UINTPTR_MAX - begin[i]) {
+            return false;
+        }
+        end[i] = begin[i] + bytes;
+    }
+    for (size_t output = 0; output < 2; ++output) {
+        for (size_t other = output + 1; other < 5; ++other) {
+            if (begin[output] < end[other] && begin[other] < end[output]) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_opnode & node) {

@@ -15,9 +15,11 @@
 #include "llama.h"
 
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
@@ -28,6 +30,76 @@
 //
 // llama_context
 //
+
+// LLAMA_GRAPH_DUMP is a file prefix; its parent directory must already exist.
+// Save topology before scheduling rewrites sources to backend copies.
+static std::string llama_dump_graph_begin(ggml_cgraph * gf, uint32_t n_tokens) {
+    const char * prefix = std::getenv("LLAMA_GRAPH_DUMP");
+    if (!prefix || !prefix[0]) {
+        return {};
+    }
+
+    static std::atomic<uint64_t> sequence{0};
+    const std::string base = std::string(prefix) + ".graph-" + std::to_string(sequence.fetch_add(1)) +
+                            ".tokens-" + std::to_string(n_tokens);
+    const std::string dot_path = base + ".dot";
+
+    LLAMA_LOG_INFO("%s: %s (%d nodes, %u tokens)\n", __func__, base.c_str(), ggml_graph_n_nodes(gf), n_tokens);
+    ggml_graph_print(gf);
+
+    // ggml_graph_dump_dot asserts on fopen failure, so check the path first.
+    FILE * fp = ggml_fopen(dot_path.c_str(), "w");
+    if (fp) {
+        std::fclose(fp);
+        ggml_graph_dump_dot(gf, nullptr, dot_path.c_str());
+    } else {
+        LLAMA_LOG_WARN("%s: cannot open %s\n", __func__, dot_path.c_str());
+    }
+    return base;
+}
+
+// Backend assignments and rewritten source references describe the allocated graph.
+static void llama_dump_graph_end(ggml_cgraph * gf, ggml_backend_sched_t sched, uint32_t n_tokens, const std::string & base) {
+    if (base.empty()) {
+        return;
+    }
+    const std::string text_path = base + ".txt";
+    FILE * fp = ggml_fopen(text_path.c_str(), "w");
+    if (fp) {
+        std::unordered_map<const ggml_tensor *, int> indices;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            indices.emplace(ggml_graph_node(gf, i), i);
+        }
+        std::fprintf(fp, "# tokens=%u nodes=%d; after scheduler allocation; dimensions use GGML ne[0..3] order\n", n_tokens, ggml_graph_n_nodes(gf));
+        std::fprintf(fp, "index\tname\top\ttype\tne0\tne1\tne2\tne3\tbackend\tsources (node index or leaf:name)\n");
+        for (int i = 0; i < ggml_graph_n_nodes(gf); ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched, node);
+            std::fprintf(fp, "%d\t%s\t%s\t%s\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%" PRId64 "\t%s\t",
+                    i, node->name, ggml_op_name(node->op), ggml_type_name(node->type),
+                    node->ne[0], node->ne[1], node->ne[2], node->ne[3], backend ? ggml_backend_name(backend) : "unassigned");
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * src = node->src[j];
+                if (!src) {
+                    continue;
+                }
+                const auto it = indices.find(src);
+                if (it == indices.end()) {
+                    std::fprintf(fp, "src%d=leaf:%s;", j, src->name);
+                } else {
+                    std::fprintf(fp, "src%d=%d:%s;", j, it->second, src->name);
+                }
+            }
+            std::fprintf(fp, "\n");
+        }
+        if (std::ferror(fp)) {
+            LLAMA_LOG_WARN("%s: failed to write %s\n", __func__, text_path.c_str());
+        }
+        std::fclose(fp);
+    } else {
+        LLAMA_LOG_WARN("%s: cannot open %s\n", __func__, text_path.c_str());
+    }
+}
 
 // check that each folded weight in the graph gets its Hadamard transform, and each latent lookup gets the inverse
 // without this check, an arch that skips the transform helpers loads and computes wrong results
@@ -1732,11 +1804,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        const auto graph_dump_path = llama_dump_graph_begin(gf, ubatch.n_tokens);
+
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        llama_dump_graph_end(gf, sched.get(), ubatch.n_tokens, graph_dump_path);
 
         gf_res_prev_active = res;
     }

@@ -44,6 +44,8 @@ endif()
 # from spert::backend_info() and GGML_SPACEMIT_WORKERS.
 ggml_add_backend_library(${TARGET_NAME}
     ggml-spacemit.cpp
+    spacemit-graph.cpp
+    spacemit-graph.h
     ime.cpp
     ime1_kernels.cpp
     ime2_kernels.cpp
