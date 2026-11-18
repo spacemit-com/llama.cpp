@@ -38,6 +38,28 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <vector>
+// The transpose kernel uses one shared batch stride and writes dense rows.
+// Equal element counts alone do not guarantee either layout property.
+static bool spacemit_cpy_dense_transpose_supported(const ggml_tensor * op) {
+    const ggml_tensor * src = op->src[0];
+    if (!src || op->type != src->type || !ggml_are_same_shape(op, src) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 &&
+        op->type != GGML_TYPE_I32 && op->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    const size_t element_size = ggml_type_size(op->type);
+    if (src->nb[1] != element_size || src->nb[0] == src->nb[1] ||
+        src->nb[0] != src->ne[1] * element_size) {
+        return false;
+    }
+    if (src->ne[2] * src->ne[3] > 1 && src->nb[2] != op->nb[2]) {
+        return false;
+    }
+    return src->ne[3] <= 1 || src->nb[3] == src->ne[2] * src->nb[2];
+}
+
 // clang-format off
 #if defined(__riscv)
 
@@ -1510,8 +1532,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     if (ggml_nelements(op) == 0) {
                         return true;
                     }
-                    if (op->type == src0->type && op->nb[0] == src0->nb[1] && src0->nb[0] != src0->nb[1] &&
-                        ggml_nelements(src0) == ggml_nelements(op)) {
+                    if (spacemit_cpy_dense_transpose_supported(op)) {
                         spacemit_kernels::rvv::forward_cpy_with_permute(ctx, op);
                         return true;
                     }
@@ -2880,8 +2901,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             if (op->src[0] && ggml_nelements(op) == 0) {
                 return common;
             }
-            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
-                op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+            if (spacemit_cpy_dense_transpose_supported(op)) {
                 return common;
             }
             if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
