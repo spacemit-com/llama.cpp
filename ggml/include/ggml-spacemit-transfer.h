@@ -20,6 +20,7 @@ enum ggml_spacemit_transfer_status {
     GGML_SPACEMIT_TRANSFER_INVALID,
     GGML_SPACEMIT_TRANSFER_UNAVAILABLE,
     GGML_SPACEMIT_TRANSFER_ERROR,
+    GGML_SPACEMIT_TRANSFER_CANCELLED,
 };
 
 enum ggml_spacemit_transfer_state {
@@ -27,6 +28,7 @@ enum ggml_spacemit_transfer_state {
     GGML_SPACEMIT_TRANSFER_PENDING,
     GGML_SPACEMIT_TRANSFER_COMPLETE,
     GGML_SPACEMIT_TRANSFER_FAILED,
+    GGML_SPACEMIT_TRANSFER_CANCELLED_STATE,
 };
 
 struct ggml_spacemit_transfer_config {
@@ -48,7 +50,8 @@ GGML_BACKEND_API ggml_spacemit_transfer_t ggml_spacemit_transfer_create(
         const struct ggml_spacemit_transfer_config * config,
         enum ggml_spacemit_transfer_status * status);
 
-// Stops submissions and joins workers, draining ALL accepted copies. The caller
+// Stops submissions and joins workers, finishing all accepted requests (including
+// cancellation acknowledgments). Does not implicitly cancel work. The caller
 // must quiesce producers first; no concurrent API call may use this engine.
 GGML_BACKEND_API void ggml_spacemit_transfer_free(ggml_spacemit_transfer_t transfer);
 
@@ -71,10 +74,37 @@ GGML_BACKEND_API enum ggml_spacemit_transfer_status ggml_spacemit_transfer_submi
         const struct ggml_spacemit_transfer_request * request,
         ggml_spacemit_transfer_event_t event);
 
+// Asynchronously read one byte from every OS page intersecting [src, src+size).
+// Reuses the bounded queue/events and the same nonblocking submission rules.
+// Does not allocate a second payload, change tensor pointers, or pin pages.
+// COMPLETE means every page was touched; the OS may subsequently evict pages.
+// Concurrent readers are allowed. Keep the CPU-readable mapping and event alive
+// until terminal acknowledgment (or drain); no concurrent unmap or writes.
+// A zero-size request may use NULL. Payload reads occur only on provider workers.
+GGML_BACKEND_API enum ggml_spacemit_transfer_status ggml_spacemit_transfer_prefetch(
+        ggml_spacemit_transfer_t transfer, const void * src, size_t size,
+        ggml_spacemit_transfer_event_t event);
+
+// Request cooperative cancellation without waiting. OK means accepted (or already
+// CANCELLED_STATE), NOT that the worker has stopped. BUSY means event-lock
+// contention; retry later. NULL, IDLE, COMPLETE and FAILED return INVALID.
+// A queued request is skipped when dequeued; its queue slot is not freed early.
+// An active provider operation finishes its current chunk (at most 64 KiB)
+// first; cancellation does not interrupt an outstanding kernel page fault.
+// Keep event/src/dst alive and free of conflicting accesses until query reports
+// a terminal state or wait returns. A cancelled destination may be partly or
+// fully written; never consume it as a successful copy. Cancellation accepted
+// before terminal publication wins over completion/failure. Reuse requires all
+// old observers/cancellers to leave, just like submission; no generation handle.
+GGML_BACKEND_API enum ggml_spacemit_transfer_status ggml_spacemit_transfer_cancel(
+        ggml_spacemit_transfer_event_t event);
+
 // Acquire observation of COMPLETE publishes the copied bytes to the observer.
+// CANCELLED_STATE also acknowledges that all buffer accesses have stopped.
 GGML_BACKEND_API enum ggml_spacemit_transfer_state ggml_spacemit_transfer_query(
         ggml_spacemit_transfer_event_t event);
-// Wait only at the consumption boundary. IDLE/NULL returns INVALID.
+// Wait only at the consumption boundary. IDLE/NULL returns INVALID;
+// acknowledged cancellation returns CANCELLED (never OK).
 GGML_BACKEND_API enum ggml_spacemit_transfer_status ggml_spacemit_transfer_wait(
         ggml_spacemit_transfer_event_t event);
 // Wait until queue and in-flight work are empty. Does not prevent new submissions.

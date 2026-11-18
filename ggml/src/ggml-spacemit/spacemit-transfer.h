@@ -14,6 +14,8 @@
 bool spacemit_transfer_provider_available_cpus(std::vector<int> & cpus);
 bool spacemit_transfer_provider_bind(const std::vector<int> & cpus);
 bool spacemit_transfer_provider_copy(void * dst, const void * src, size_t size);
+// Read-only page touching, also restricted to bound workers.
+bool spacemit_transfer_provider_prefetch(const void * src, size_t size);
 
 void * spacemit_transfer_get_proc_address(const char * name);
 

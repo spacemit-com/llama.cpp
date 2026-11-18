@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: MIT
 #include "spacemit-transfer.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <condition_variable>
 #include <cstring>
 #include <memory>
@@ -11,6 +13,7 @@
 
 struct ggml_spacemit_transfer_event {
     std::atomic<ggml_spacemit_transfer_state> state{GGML_SPACEMIT_TRANSFER_IDLE};
+    std::atomic<bool> cancel_requested{false};
     std::mutex mutex;
     std::condition_variable done;
 };
@@ -19,6 +22,7 @@ struct ggml_spacemit_transfer {
     struct job {
         ggml_spacemit_transfer_request request{};
         ggml_spacemit_transfer_event_t event = nullptr;
+        bool prefetch = false;
     };
 
     std::mutex mutex;
@@ -66,14 +70,39 @@ struct ggml_spacemit_transfer {
                 --queued;
                 ++active;
             }
-            const bool ok = next.request.size == 0 || spacemit_transfer_provider_copy(
-                    next.request.dst, next.request.src, next.request.size);
+            // Preserve memmove semantics across chunk boundaries: when dst starts
+            // inside src at a higher address, copy from the end toward the start.
+            // Integer comparisons avoid ordering unrelated C++ pointers.
+            const auto dst_addr = reinterpret_cast<uintptr_t>(next.request.dst);
+            const auto src_addr = reinterpret_cast<uintptr_t>(next.request.src);
+            const bool backwards = !next.prefetch && dst_addr > src_addr && dst_addr - src_addr < next.request.size;
+            constexpr size_t chunk_size = 64 * 1024;
+            size_t remaining = next.request.size;
+            bool ok = true;
+            while (remaining && !next.event->cancel_requested.load(std::memory_order_acquire)) {
+                const size_t bytes = std::min(remaining, chunk_size);
+                const size_t offset = backwards ? remaining - bytes : next.request.size - remaining;
+                const auto * source = static_cast<const unsigned char *>(next.request.src) + offset;
+                const bool chunk_ok = next.prefetch
+                        ? spacemit_transfer_provider_prefetch(source, bytes)
+                        : spacemit_transfer_provider_copy(
+                                static_cast<unsigned char *>(next.request.dst) + offset, source, bytes);
+                if (!chunk_ok) {
+                    ok = false;
+                    break;
+                }
+                remaining -= bytes;
+            }
             {
                 // Notify while holding the event lock: event_free/wait cannot
                 // destroy the condition variable before notification finishes.
                 std::lock_guard<std::mutex> lock(next.event->mutex);
-                next.event->state.store(ok ? GGML_SPACEMIT_TRANSFER_COMPLETE : GGML_SPACEMIT_TRANSFER_FAILED,
-                                        std::memory_order_release);
+                // Serialize acknowledgment with cancel(): after terminal publication
+                // no cancellation can be accepted and no buffer access remains.
+                const auto state = next.event->cancel_requested.load(std::memory_order_acquire)
+                        ? GGML_SPACEMIT_TRANSFER_CANCELLED_STATE
+                        : (ok ? GGML_SPACEMIT_TRANSFER_COMPLETE : GGML_SPACEMIT_TRANSFER_FAILED);
+                next.event->state.store(state, std::memory_order_release);
                 next.event->done.notify_all();
             }
             // Do not touch the event again: its owner may already have freed it.
@@ -137,10 +166,11 @@ void ggml_spacemit_transfer_event_free(ggml_spacemit_transfer_event_t event) {
     delete event;
 }
 
-ggml_spacemit_transfer_status ggml_spacemit_transfer_submit(
+static ggml_spacemit_transfer_status enqueue(
         ggml_spacemit_transfer_t transfer, const ggml_spacemit_transfer_request * request,
-        ggml_spacemit_transfer_event_t event) {
-    if (!transfer || !request || !event || (request->size && (!request->src || !request->dst))) {
+        ggml_spacemit_transfer_event_t event, bool prefetch) {
+    if (!transfer || !request || !event ||
+        (request->size && (!request->src || (!prefetch && !request->dst)))) {
         return GGML_SPACEMIT_TRANSFER_INVALID;
     }
     std::unique_lock<std::mutex> lock(transfer->mutex, std::try_to_lock);
@@ -151,11 +181,36 @@ ggml_spacemit_transfer_status ggml_spacemit_transfer_submit(
     if (!event_lock.owns_lock() || event->state.load(std::memory_order_acquire) == GGML_SPACEMIT_TRANSFER_PENDING) {
         return GGML_SPACEMIT_TRANSFER_BUSY;
     }
-    transfer->queue[transfer->tail] = {*request, event};
+    transfer->queue[transfer->tail] = {*request, event, prefetch};
     transfer->tail = (transfer->tail + 1) % transfer->queue.size();
     ++transfer->queued;
+    event->cancel_requested.store(false, std::memory_order_relaxed);
     event->state.store(GGML_SPACEMIT_TRANSFER_PENDING, std::memory_order_release);
     transfer->work.notify_one();
+    return GGML_SPACEMIT_TRANSFER_OK;
+}
+
+ggml_spacemit_transfer_status ggml_spacemit_transfer_submit(
+        ggml_spacemit_transfer_t transfer, const ggml_spacemit_transfer_request * request,
+        ggml_spacemit_transfer_event_t event) {
+    return enqueue(transfer, request, event, false);
+}
+
+ggml_spacemit_transfer_status ggml_spacemit_transfer_prefetch(
+        ggml_spacemit_transfer_t transfer, const void * src, size_t size,
+        ggml_spacemit_transfer_event_t event) {
+    const ggml_spacemit_transfer_request request{nullptr, src, size};
+    return enqueue(transfer, &request, event, true);
+}
+
+ggml_spacemit_transfer_status ggml_spacemit_transfer_cancel(ggml_spacemit_transfer_event_t event) {
+    if (!event) { return GGML_SPACEMIT_TRANSFER_INVALID; }
+    std::unique_lock<std::mutex> lock(event->mutex, std::try_to_lock);
+    if (!lock.owns_lock()) { return GGML_SPACEMIT_TRANSFER_BUSY; }
+    const auto state = event->state.load(std::memory_order_acquire);
+    if (state == GGML_SPACEMIT_TRANSFER_CANCELLED_STATE) { return GGML_SPACEMIT_TRANSFER_OK; }
+    if (state != GGML_SPACEMIT_TRANSFER_PENDING) { return GGML_SPACEMIT_TRANSFER_INVALID; }
+    event->cancel_requested.store(true, std::memory_order_release);
     return GGML_SPACEMIT_TRANSFER_OK;
 }
 
@@ -170,6 +225,7 @@ ggml_spacemit_transfer_status ggml_spacemit_transfer_wait(ggml_spacemit_transfer
         return event->state.load(std::memory_order_acquire) != GGML_SPACEMIT_TRANSFER_PENDING;
     });
     switch (event->state.load(std::memory_order_acquire)) {
+        case GGML_SPACEMIT_TRANSFER_CANCELLED_STATE: return GGML_SPACEMIT_TRANSFER_CANCELLED;
         case GGML_SPACEMIT_TRANSFER_COMPLETE: return GGML_SPACEMIT_TRANSFER_OK;
         case GGML_SPACEMIT_TRANSFER_FAILED:   return GGML_SPACEMIT_TRANSFER_ERROR;
         default:                            return GGML_SPACEMIT_TRANSFER_INVALID;
@@ -189,6 +245,8 @@ void * spacemit_transfer_get_proc_address(const char * name) {
     TRANSFER_PROC(ggml_spacemit_transfer_event_create)
     TRANSFER_PROC(ggml_spacemit_transfer_event_free)
     TRANSFER_PROC(ggml_spacemit_transfer_submit)
+    TRANSFER_PROC(ggml_spacemit_transfer_prefetch)
+    TRANSFER_PROC(ggml_spacemit_transfer_cancel)
     TRANSFER_PROC(ggml_spacemit_transfer_query)
     TRANSFER_PROC(ggml_spacemit_transfer_wait)
     TRANSFER_PROC(ggml_spacemit_transfer_drain)

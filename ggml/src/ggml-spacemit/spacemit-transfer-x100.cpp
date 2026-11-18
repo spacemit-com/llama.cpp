@@ -15,6 +15,7 @@
 #if defined(__linux__)
 #include <pthread.h>
 #include <sched.h>
+#include <unistd.h>
 
 namespace {
 std::string trim(const std::string & s) {
@@ -152,4 +153,29 @@ bool spacemit_transfer_provider_copy(void * dst, const void * src, size_t size) 
     // Only ordinary CPU-accessible memory. No TCM mapping/coherency assumption.
     std::memmove(dst, src, size);
     return true;
+}
+
+bool spacemit_transfer_provider_prefetch(const void * src, size_t size) {
+#if defined(__linux__)
+    // Initialized on a worker, never on the submitting A100 thread.
+    static const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) { return false; }
+    const size_t page = static_cast<size_t>(page_size);
+    const auto * bytes = static_cast<const volatile unsigned char *>(src);
+    size_t offset = 0;
+    while (offset < size) {
+        // Volatile preserves the read even though only its page-fault side
+        // effect is needed. Never read outside an unaligned caller range.
+        const unsigned char value = bytes[offset];
+        (void) value;
+        const size_t step = page - ((reinterpret_cast<uintptr_t>(src) + offset) % page);
+        if (step >= size - offset) { break; }
+        offset += step;
+    }
+    return true;
+#else
+    (void) src;
+    (void) size;
+    return false;
+#endif
 }
