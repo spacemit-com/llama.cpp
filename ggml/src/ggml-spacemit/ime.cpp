@@ -235,7 +235,7 @@ struct gemm_path_f16 {
     // Decode uses INT32 GEMV directly over Q41Block.
     spacemit_kernels::quantize_a_row_def quantize_a_gemv;
     using dot_gemv_def   = decltype(&spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41);
-    using dot_f16acc_def = decltype(&spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot);
+    using dot_f16acc_def = decltype(&spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot_tile8);
     using dot_f32acc_def = decltype(&spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot);
     dot_gemv_def   dot_gemv;
     dot_f16acc_def dot_f16acc;  // F16 partial output.
@@ -260,11 +260,10 @@ static gemm_path_f16 resolve_gemm_f16() {
         march.value, typeid(float), typeid(_spe_fp16_), 1, 1, 16, 8);
     o.dequantpack_b = mlir::speir::spekernel::ime2::get_spe_pack_cast_function(
         march.value, typeid(BLOC_TYPE), typeid(_spe_fp16_), NB, KB, NB, 8, Mode);
-    o.reducesum = mlir::speir::spekernel::rvv::get_spe_reducesum_mxn_function(
-        march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
+    o.reducesum       = &spacemit_kernels::ime2::reducesum_f16f32_m16n32_tile8;
     o.quantize_a_gemv = &spacemit_kernels::rvv::quantize_a_i8_r1;
     o.dot_gemv        = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41;
-    o.dot_f16acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot;
+    o.dot_f16acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot_tile8;
     o.dot_f32acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot;
     if (!o.castpack_a || !o.dequantpack_b || !o.reducesum) {
         GGML_ABORT("f16 link: spe dispatch getter returned null (pack=%d q41=%d reduce=%d)",
@@ -2130,9 +2129,8 @@ private:
                             const size_t nc = std::min(n_tile, N - nt * n_tile);
                             for (size_t mt = 0; mt < m_tiles; ++mt) {
                                 const size_t tm0 = row0 + mt * m_tile;
-                                _Float16 *     c_blk =
-                                    partials_h + ((tm0 / m_tile) * nt_count + nt) * m_tile * g * n_tile +
-                                    group * n_tile;
+                                _Float16 * c_blk = partials_h + ((tm0 / m_tile) * nt_count + nt) * m_tile * g * n_tile +
+                                                   group * m_tile * n_tile;
                                 ops.dot_f16acc(
                                     ks, b_blk + (j % slots) * b_slot, a_blk + mt * m_tile * ks, c_blk,
                                     std::min(m_tile, rows_t - mt * m_tile), nc, g * n_tile, false);
@@ -2144,9 +2142,9 @@ private:
                             const size_t nc = std::min(n_tile, N - nt_s * n_tile);
                             for (size_t mt = 0; mt < m_tiles; ++mt) {
                                 const size_t tm0 = row0 + mt * m_tile;
-                                _Float16 *     c_blk =
-                                    partials_h + ((tm0 / m_tile) * nt_count + nt_s) * m_tile * g * n_tile +
-                                    group * n_tile;
+                                _Float16 *   c_blk = partials_h +
+                                                   ((tm0 / m_tile) * nt_count + nt_s) * m_tile * g * n_tile +
+                                                   group * m_tile * n_tile;
                                 ops.dot_f16acc(
                                     ks, sib_b_blk + (j % slots) * b_slot, a_blk + mt * m_tile * ks, c_blk,
                                     std::min(m_tile, rows_t - mt * m_tile), nc, g * n_tile, false);
@@ -2298,10 +2296,9 @@ private:
                     for (size_t i = 0; i < m_tiles; ++i) {
                         const size_t mt  = (i + skew) % m_tiles;
                         const size_t tm0 = m0 + mt * m_tile;
-                        // Partials use [M/16][nc][16][s_count][32]; each slice row occupies 64B.
-                        _Float16 * c_blk = partials +
-                                           ((tm0 / m_tile) * nc_count + nt) * m_tile * s_count * n_tile +
-                                           static_cast<size_t>(ith) * n_tile;
+                        // Partials use [M/16][nc][s_count][2][4][8][8].
+                        _Float16 *   c_blk = partials + ((tm0 / m_tile) * nc_count + nt) * m_tile * s_count * n_tile +
+                                           static_cast<size_t>(ith) * m_tile * n_tile;
                         ops.dot_f16acc(
                             ks, b_blk, a_blk + mt * m_tile * ks, c_blk, std::min(m_tile, M - tm0), nc,
                             s_count * n_tile, false);

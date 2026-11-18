@@ -196,6 +196,29 @@ void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
                                         size_t           ldc,
                                         bool             accumulate);
 
+// Private FP16 split-K partials: each slice occupies a full [2][4][8][8] tile.
+void gemm_kernel_f16f16f16_m16_vfwmadot_tile8(size_t           gemm_k,
+                                              const _Float16 * b,
+                                              _Float16 *       a,
+                                              _Float16 *       c,
+                                              size_t           m,
+                                              size_t           n,
+                                              size_t           ldc,
+                                              bool             accumulate);
+
+void reducesum_f16f32_m16n32_tile8(void *  in,
+                                   int64_t lhs_offset,
+                                   int64_t lhs_stride0,
+                                   int64_t lhs_stride1,
+                                   void *  out,
+                                   int64_t out_offset,
+                                   int64_t out_stride,
+                                   int64_t src_mc,
+                                   int64_t src_nc,
+                                   int64_t nth,
+                                   int64_t dst_mc,
+                                   int64_t dst_nc);
+
 // Same packed A/B layouts; accumulate seeds the F32 result from C.
 void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
                                         const _Float16 * b_f16_k8,
