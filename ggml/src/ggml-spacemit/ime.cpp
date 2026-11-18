@@ -2957,7 +2957,8 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             break;
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2) {
+            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 ||
+                ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1) {
                 return common;
             }
             break;
