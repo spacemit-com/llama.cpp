@@ -139,6 +139,29 @@ int main() {
    if(z*w>1) { bs=s; bs.nb[2]+=ggml_type_size(type); run(bs,d,false); }
    if(w>1) { bs=s; bs.nb[3]+=ggml_type_size(type); run(bs,d,false); }
  }
+ // Independently vary BOTH tensors' batch strides. Contiguity ignores
+ // singleton destination strides; the shared kernel batch stride must not.
+ size_t stride_cases=0;
+ for(int type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_I32,GGML_TYPE_BF16})
+ for(int z:{1,2}) for(int w:{1,2})
+ for(int s2:{0,1,2,3}) for(int s3:{0,1,2,3})
+ for(int d2:{0,1,2,3}) for(int d3:{0,1,2,3}) {
+   auto s=permute(dense(type,{3,2,z,w}),{1,0,2,3}); auto d=dense(type,s.ne);
+   size_t plane=6*ggml_type_size(type);
+   s.nb[2]=s2*plane; s.nb[3]=s3*z*plane;
+   d.nb[2]=d2*plane; d.nb[3]=d3*z*plane;
+   bool expect=(z==1 || d2==1) && (w==1 || d3==1) &&
+               (z*w==1 || s2==1) && (w==1 || s3==1);
+   run(s,d,expect); ++stride_cases;
+ }
+ // Reviewer reproducer: valid padded source and dense destination, with
+ // misleading matching nb[2] on a singleton axis. Old helper accepted this.
+ auto singleton_src=dense(GGML_TYPE_F32,{2,3,1,2});
+ singleton_src.nb={12,4,48,48};
+ auto singleton_dst=dense(GGML_TYPE_F32,{2,3,1,2});
+ singleton_dst.nb={4,8,48,24};
+ run(singleton_src,singleton_dst,false);
+ printf("%zu paired batch-stride configurations PASS; singleton reproducer rejected\n",stride_cases);
  // Ordinary copies must not accidentally enter the transpose path. They retain
  // the existing F32 generic/conversion paths or are already unsupported.
  for(int type:{GGML_TYPE_F32,GGML_TYPE_F16,GGML_TYPE_I32,GGML_TYPE_BF16}) {
@@ -165,3 +188,14 @@ with tempfile.TemporaryDirectory(prefix='spacemit-cpy-bounds-') as tmp:
     result = subprocess.run([str(binary)], capture_output=True)
     assert result.returncode != 0, 'upstream dimension-swap mutation unexpectedly passed'
     print('Upstream dimension-swap mutation: rejected by address oracle as expected')
+
+    # Preserve the independent review regression: the first repair's guard
+    # must fail the newly added paired singleton-stride tests.
+    prior_source = source.replace('src->nb[2] != plane_size', 'src->nb[2] != op->nb[2]')
+    assert prior_source != source
+    cpp.write_text(prior_source)
+    subprocess.run(['c++', '-std=c++17', '-O2', str(cpp), '-o', str(binary)], check=True)
+    result = subprocess.run([str(binary)], capture_output=True, text=True)
+    assert result.returncode != 0, 'prior singleton-stride guard unexpectedly passed'
+    print('Prior 882d1e7 singleton-stride guard: rejected as expected')
+    print(result.stderr.strip())

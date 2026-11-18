@@ -54,7 +54,10 @@ static bool spacemit_cpy_dense_transpose_supported(const ggml_tensor * op) {
         src->nb[0] != src->ne[1] * element_size) {
         return false;
     }
-    if (src->ne[2] * src->ne[3] > 1 && src->nb[2] != op->nb[2]) {
+    // Singleton destination axes can have arbitrary strides, even when the
+    // tensor is contiguous. Compare against the physical dense plane size.
+    const size_t plane_size = op->ne[0] * op->ne[1] * element_size;
+    if (src->ne[2] * src->ne[3] > 1 && src->nb[2] != plane_size) {
         return false;
     }
     return src->ne[3] <= 1 || src->nb[3] == src->ne[2] * src->nb[2];
