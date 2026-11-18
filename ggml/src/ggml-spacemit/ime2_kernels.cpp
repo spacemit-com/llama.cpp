@@ -3941,16 +3941,19 @@ static void gemm_kernel_i8i8_m4(const uint8_t * quant_a_ptr,
             "vfcvt.f.x.v    v18, v18              \n\t"
             "vfcvt.f.x.v    v19, v19              \n\t"
 
-            "vfmul.vv       v16, v16, v14         \n\t"
-            "vfmul.vv       v17, v17, v14         \n\t"
-            "vfmul.vv       v18, v18, v14         \n\t"
-            "vfmul.vv       v19, v19, v14         \n\t"
+            // Match M1's FP32 rounding: scale = sB*sA, then fma(scale, intdot, acc).
+            // Scaling intdot first changes logits at the four-row verification boundary.
+            // v0-v3 are dead after vpack and can hold the four per-row scales.
+            "vfmul.vf       v0, v14, fa0          \n\t"
+            "vfmul.vf       v1, v14, fa1          \n\t"
+            "vfmul.vf       v2, v14, fa2          \n\t"
+            "vfmul.vf       v3, v14, fa3          \n\t"
 
             "addi           %[BK], %[BK], -1      \n\t"
-            "vfmacc.vf      v28, fa0, v16         \n\t"
-            "vfmacc.vf      v29, fa1, v17         \n\t"
-            "vfmacc.vf      v30, fa2, v18         \n\t"
-            "vfmacc.vf      v31, fa3, v19         \n\t"
+            "vfmacc.vv      v28, v0, v16         \n\t"
+            "vfmacc.vv      v29, v1, v17         \n\t"
+            "vfmacc.vv      v30, v2, v18         \n\t"
+            "vfmacc.vv      v31, v3, v19         \n\t"
 
             "bgtz           %[BK], BLK_LOOP%=     \n\t"
 
