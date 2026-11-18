@@ -2617,7 +2617,12 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &ggml::cpu::riscv64_spacemit::traits_instance<ggml::cpu::riscv64_spacemit::tensor_traits_q8_0_ime2>();
+                    // Dense matrices and contiguous expert weights have packed
+                    // kernels. Other shapes must keep their canonical strides.
+                    if (!cur->view_src && ggml_is_contiguous(cur) &&
+                        (ggml_n_dims(cur) == 2 || ggml_n_dims(cur) == 3)) {
+                        return &traits_instance<ggml::cpu::riscv64_spacemit::tensor_traits_q8_0_ime2>();
+                    }
                 }
 #endif
             }
@@ -2732,6 +2737,9 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
             break;
         case GGML_TYPE_Q8_0:
+            if (!ggml_spacemit_get_optimal_repack_type(tensor)) {
+                return ggml_nbytes(tensor);
+            }
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);
             break;
         case GGML_TYPE_Q2_K:
@@ -2806,6 +2814,19 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {
     if (op == nullptr) {
         return nullptr;
+    }
+
+    // Views use logical byte offsets. An alias of a packed weight cannot
+    // directly feed either the dense IME or canonical scalar dot path.
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+        op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[0]->view_src) {
+        const ggml_tensor * base = op->src[0]->view_src;
+        while (base->view_src) {
+            base = base->view_src;
+        }
+        if (base->extra || ggml_spacemit_get_optimal_repack_type(base)) {
+            return nullptr;
+        }
     }
 
     const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
@@ -3086,6 +3107,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_MUL_MAT:
             // Generic CPU dot fallback for dense or unsupported quantized
             // layouts which do not have a repacked Spacemit trait.
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 &&
+                (op->src[0]->extra || ggml_spacemit_get_optimal_repack_type(op->src[0]))) {
+                break;
+            }
             if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
                 ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
                 return common;
