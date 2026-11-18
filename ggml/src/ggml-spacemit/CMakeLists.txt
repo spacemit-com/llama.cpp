@@ -45,6 +45,10 @@ endif()
 ggml_add_backend_library(${TARGET_NAME}
     ggml-spacemit.cpp
     spacemit-graph.cpp
+    spacemit-transfer.cpp
+    spacemit-transfer-x100.cpp
+    spacemit-transfer.h
+    ../../include/ggml-spacemit-transfer.h
     spacemit-graph.h
     ime.cpp
     ime1_kernels.cpp
@@ -64,7 +68,8 @@ set_target_properties(${TARGET_NAME} PROPERTIES
     C_VISIBILITY_PRESET hidden
     CXX_VISIBILITY_PRESET hidden)
 
-target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB})
+find_package(Threads REQUIRED)
+target_link_libraries(${TARGET_NAME} PRIVATE ${SPERT_LIB} Threads::Threads)
 target_link_directories(${TARGET_NAME} PUBLIC "${SPERT_DIR}/lib")
 target_link_options(${TARGET_NAME} PUBLIC "-Wl,-rpath-link,${SPERT_DIR}/lib")
 
@@ -90,4 +95,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
         set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb_xsmtvdotii")
     endif()
     target_compile_options(${TARGET_NAME} PRIVATE ${SPACEMIT_MARCH})
+endif()
+
+# Transfer workers run on X100, never compile their code for A100-only ISA.
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
+    set_property(SOURCE spacemit-transfer.cpp spacemit-transfer-x100.cpp
+        APPEND PROPERTY COMPILE_OPTIONS "-march=rv64gc")
 endif()

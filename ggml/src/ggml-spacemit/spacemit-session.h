@@ -1,7 +1,7 @@
 #ifndef SPACEMIT_SESSION_H
 #define SPACEMIT_SESSION_H
 
-#include "spacemit-opnode.h"
+#include "spacemit-graph.h"
 #include "spacemit-context.h"
 
 #include <cstdint>
@@ -30,7 +30,13 @@ struct spacemit_session {
     struct {
         uint64_t uid = 0;
         std::vector<spacemit_opnode> nodes;
+        bool prefetch_valid = false;
+        std::vector<spacemit_prefetch_point> prefetch;
     } cached_graph;
+
+    bool prefetch_enabled = false;
+    ggml_spacemit_prefetch_callback prefetch_callback = nullptr;
+    void * prefetch_user_data = nullptr;
 
     spacemit_session() = default;
     ~spacemit_session();

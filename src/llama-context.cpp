@@ -593,7 +593,7 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
-        // create a list of the set_n_threads functions in the backends
+        // Configure optional backend capabilities and collect thread-count setters.
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
             ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
@@ -601,6 +601,12 @@ llama_context::llama_context(
                 auto ggml_backend_set_n_threads_fn = (ggml_backend_set_n_threads_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_n_threads");
                 if (ggml_backend_set_n_threads_fn) {
                     set_n_threads_fns.emplace_back(backend.get(), ggml_backend_set_n_threads_fn);
+                }
+                // Optional backend capability; no dependency on a specific backend.
+                using set_prefetch_t = bool (*)(ggml_backend_t, bool);
+                auto set_prefetch = (set_prefetch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_prefetch");
+                if (set_prefetch && !set_prefetch(backend.get(), params.prefetch)) {
+                    throw std::runtime_error("failed to configure backend prefetch");
                 }
             }
         }
@@ -4370,6 +4376,7 @@ llama_context_params llama_context_default_params() {
         /*.offload_kqv                 =*/ true,
         /*.no_perf                     =*/ true,
         /*.op_offload                  =*/ true,
+        /*.prefetch                    =*/ false,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,

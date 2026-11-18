@@ -23,6 +23,7 @@
 #include "spacemit-opnode.h"
 #include "spacemit-context.h"
 #include "spacemit-graph.h"
+#include "spacemit-transfer.h"
 
 #include "ime.h"
 #include "repack.h"
@@ -373,6 +374,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     if (!(graph->uid != 0 && sess->cached_graph.uid == graph->uid)) {
         sess->cached_graph.uid = graph->uid;
         sess->cached_graph.nodes.clear();
+        sess->cached_graph.prefetch_valid = false;
         sess->cached_graph.nodes.reserve(graph->n_nodes);
         spacemit_graph_build_opnodes(graph, sess->cached_graph.nodes);
 
@@ -381,6 +383,13 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                        (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
     }
     const auto & opnodes = sess->cached_graph.nodes;
+    const auto prefetch_callback = sess->prefetch_enabled ? sess->prefetch_callback : nullptr;
+    void * const prefetch_user_data = sess->prefetch_user_data;
+    if (sess->prefetch_enabled && !sess->cached_graph.prefetch_valid) {
+        spacemit_graph_build_prefetch_plan(graph, opnodes, sess->cached_graph.prefetch);
+        sess->cached_graph.prefetch_valid = true;
+    }
+    const auto & prefetch = sess->cached_graph.prefetch;
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
@@ -421,7 +430,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     auto * contexts = sess->contexts.data();
     auto fut = stream.launch(
         spert::Grid{(uint32_t)n_threads},
-        [&opnodes, workspace_size = sess->workspace_size, workspace, contexts,
+        [&opnodes, &prefetch, prefetch_callback, prefetch_user_data,
+         workspace_size = sess->workspace_size, workspace, contexts,
          shared_mem_size = spert::backend_info().shared_mem_size](spert::Context * runtime) {
             // Match the old ggml-cpu/spacemit path: use the complete
             // worker-local TCM buffer directly.  alloc_shared() is a
@@ -437,8 +447,20 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             auto & ctx = contexts[ith];
             ctx.reset(*runtime, ith, runtime->grid_dim(0), workspace, workspace_size, shared);
 
-            for (const auto & node : opnodes) {
+            for (size_t index = 0; index < opnodes.size(); ++index) {
+                const auto & node = opnodes[index];
                 ggml_tensor * op = node.node;
+
+                if (prefetch_callback && !prefetch[index].before.empty()) {
+                    if (ith == 0) {
+                        for (const auto & event : prefetch[index].before) {
+                            prefetch_callback(&event, prefetch_user_data);
+                        }
+                    }
+                    // In particular, no core starts expert GEMM while worker 0
+                    // is still waiting for prefetched weights in EXPERTS BEGIN.
+                    ctx.sync();
+                }
 
                 ggml_profile_log_spacemit_op_begin(op, (int) ith, (int) runtime->grid_dim(0));
 
@@ -452,6 +474,17 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 // the next one. A bounded pointer look-ahead is not sufficient:
                 // dependencies can be farther away or hidden behind aliases/views.
                 ctx.sync();
+
+                if (prefetch_callback && !prefetch[index].after.empty()) {
+                    if (ith == 0) {
+                        for (const auto & event : prefetch[index].after) {
+                            prefetch_callback(&event, prefetch_user_data);
+                        }
+                    }
+                    // READY may read a transient top-k view. Keep its storage
+                    // live until the callback has copied the indices.
+                    ctx.sync();
+                }
             }
 
             ctx.clear();
@@ -738,9 +771,15 @@ static ggml_backend_dev_t ggml_backend_spacemit_reg_get_device(ggml_backend_reg_
 }
 
 static void * ggml_backend_spacemit_get_proc_address(ggml_backend_reg_t reg, const char * name) {
-    return NULL;
     GGML_UNUSED(reg);
-    GGML_UNUSED(name);
+    if (strcmp(name, "ggml_backend_set_prefetch") == 0 ||
+        strcmp(name, "ggml_backend_spacemit_set_prefetch") == 0) {
+        return (void *) ggml_backend_spacemit_set_prefetch;
+    }
+    if (strcmp(name, "ggml_backend_spacemit_set_prefetch_callback") == 0) {
+        return (void *) ggml_backend_spacemit_set_prefetch_callback;
+    }
+    return spacemit_transfer_get_proc_address(name);
 }
 
 static void ggml_spacemit_init(ggml_backend_reg * reg) {
@@ -793,6 +832,37 @@ ggml_backend_t ggml_backend_spacemit_init(void) {
     }
 
     return ggml_backend_spacemit_device_init(dev, nullptr);
+}
+
+bool ggml_backend_spacemit_set_prefetch(ggml_backend_t backend, bool enabled) {
+    if (!backend || !ggml_backend_is_spacemit(backend)) {
+        return false;
+    }
+    auto * sess = static_cast<spacemit_session *>(backend->context);
+    std::lock_guard<std::mutex> lock(sess->stream_mutex);
+    if (sess->prefetch_enabled != enabled) {
+        sess->prefetch_enabled = enabled;
+        sess->cached_graph.prefetch_valid = false;
+        sess->cached_graph.prefetch.clear();
+        GGML_LOG_INFO("ggml-spacemit: prefetch planning %s (weight transfers require a callback policy)\n",
+                      enabled ? "enabled" : "disabled");
+    }
+    return true;
+}
+
+bool ggml_backend_spacemit_set_prefetch_callback(
+        ggml_backend_t backend, ggml_spacemit_prefetch_callback callback, void * user_data) {
+    if (!backend || !ggml_backend_is_spacemit(backend)) {
+        return false;
+    }
+    auto * sess = static_cast<spacemit_session *>(backend->context);
+    std::lock_guard<std::mutex> lock(sess->stream_mutex);
+    sess->prefetch_enabled = callback != nullptr;
+    sess->prefetch_callback = callback;
+    sess->prefetch_user_data = user_data;
+    sess->cached_graph.prefetch_valid = false;
+    sess->cached_graph.prefetch.clear();
+    return true;
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_spacemit_reg)

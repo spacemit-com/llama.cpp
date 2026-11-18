@@ -2,6 +2,9 @@
 #include "ime.h"
 
 #include <algorithm>
+#include <climits>
+#include <map>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
@@ -284,4 +287,252 @@ int spacemit_graph_count_fused_opnodes(const std::vector<spacemit_opnode> & node
         }
     }
     return count;
+}
+
+namespace {
+
+struct module_name {
+    std::string stem;
+    int layer = -1;
+};
+
+// Scheduler copies use backend#original-name#copy-index. Parse an exact final
+// layer suffix rather than accepting a substring such as "Qcur" in any name.
+static module_name parse_module_name(const ggml_tensor * tensor) {
+    std::string name = tensor->name;
+    for (;;) {
+        const size_t first = name.find('#');
+        const size_t last = name.rfind('#');
+        if (first == std::string::npos || first == last) {
+            break;
+        }
+        name = name.substr(first + 1, last - first - 1);
+    }
+    const size_t dash = name.rfind('-');
+    if (dash == std::string::npos || dash + 1 == name.size()) {
+        return {};
+    }
+    int layer = 0;
+    for (size_t i = dash + 1; i < name.size(); ++i) {
+        const int digit = name[i] - '0';
+        if (digit < 0 || digit > 9 || layer > (INT_MAX - digit) / 10) {
+            return {};
+        }
+        layer = layer * 10 + digit;
+    }
+    return { name.substr(0, dash), layer };
+}
+
+using opnode_indices = std::unordered_map<const ggml_tensor *, size_t>;
+
+struct module_range {
+    size_t first = SIZE_MAX;
+    size_t last = 0;
+    const ggml_tensor * output = nullptr;
+};
+
+// Find a window from dependencies, not from the interval between two names.
+// A scheduler split may end before the named output: do not invent a complete
+// module in that case. Dependencies outside this split are never executed here.
+static module_range find_module_range(const ggml_tensor * output, int layer,
+                                      const char * input_name,
+                                      const std::unordered_set<const ggml_tensor *> & local,
+                                      const opnode_indices & indices,
+                                      bool require_attention) {
+    module_range range;
+    bool reached_input = false;
+    bool has_matmul = false;
+    bool has_attention = false;
+    std::vector<const ggml_tensor *> pending{output};
+    std::unordered_set<const ggml_tensor *> visited;
+    while (!pending.empty()) {
+        const ggml_tensor * tensor = pending.back();
+        pending.pop_back();
+        if (!tensor || !visited.insert(tensor).second) {
+            continue;
+        }
+        const auto name = parse_module_name(tensor);
+        if (name.layer == layer && name.stem == input_name) {
+            reached_input = true;
+            continue;
+        }
+        if ((name.layer >= 0 && name.layer != layer) || !local.count(tensor)) {
+            continue;
+        }
+        const auto it = indices.find(tensor);
+        if (it != indices.end()) {
+            range.first = std::min(range.first, it->second);
+            range.last = std::max(range.last, it->second);
+            has_matmul |= tensor->op == GGML_OP_MUL_MAT;
+            has_attention |= tensor->op == GGML_OP_FLASH_ATTN_EXT || tensor->op == GGML_OP_SOFT_MAX;
+        }
+        for (const auto * src : tensor->src) {
+            if (src) {
+                pending.push_back(src);
+            }
+        }
+    }
+    if (!reached_input || !has_matmul || (require_attention && !has_attention)) {
+        return {};
+    }
+    range.output = output;
+    return range;
+}
+
+static const ggml_tensor * find_topk(const ggml_tensor * ids) {
+    std::vector<const ggml_tensor *> pending{ids};
+    std::unordered_set<const ggml_tensor *> visited;
+    while (!pending.empty()) {
+        const ggml_tensor * tensor = pending.back();
+        pending.pop_back();
+        if (!tensor || !visited.insert(tensor).second) {
+            continue;
+        }
+        const auto name = parse_module_name(tensor);
+        if (name.layer >= 0 && name.stem == "ffn_moe_topk" && tensor->type == GGML_TYPE_I32) {
+            return tensor;
+        }
+        // Only trace the index dependency; never search an expert's weights.
+        for (const auto * src : tensor->src) {
+            if (src) {
+                pending.push_back(src);
+            }
+        }
+    }
+    return nullptr;
+}
+
+static void add_prefetch_event(std::vector<spacemit_prefetch_point> & points,
+                               size_t index, ggml_spacemit_module module,
+                               ggml_spacemit_prefetch_phase phase, int layer,
+                               const ggml_tensor * tensor) {
+    auto & events = phase == GGML_SPACEMIT_PREFETCH_BEGIN ? points[index].before : points[index].after;
+    events.push_back({ module, phase, layer, index, tensor });
+}
+
+} // namespace
+
+void spacemit_graph_build_prefetch_plan(const ggml_cgraph * graph,
+                                        const std::vector<spacemit_opnode> & nodes,
+                                        std::vector<spacemit_prefetch_point> & points) {
+    points.clear();
+    points.resize(nodes.size());
+    opnode_indices indices;
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        indices.emplace(nodes[i].node, i);
+        for (const auto * tensor : nodes[i].fused) {
+            indices.emplace(tensor, i);
+        }
+    }
+    std::unordered_set<const ggml_tensor *> local;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        local.insert(graph->nodes[i]);
+    }
+
+    std::map<std::pair<ggml_spacemit_module, int>, module_range> ranges;
+    const auto merge_range = [&](ggml_spacemit_module module, int layer, const module_range & range) {
+        if (range.first == SIZE_MAX) {
+            return;
+        }
+        auto & merged = ranges[{module, layer}];
+        merged.first = std::min(merged.first, range.first);
+        if (!merged.output || range.last >= merged.last) {
+            merged.last = range.last;
+            merged.output = range.output;
+        }
+    };
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * tensor = graph->nodes[i];
+        const auto name = parse_module_name(tensor);
+        if (name.layer < 0) {
+            continue;
+        }
+        const auto & stem = name.stem;
+        if (stem == "Qcur" || stem == "Kcur" || stem == "Vcur" || stem == "qkv" ||
+            stem == "q" || stem == "kv") {
+            merge_range(GGML_SPACEMIT_MODULE_QKV, name.layer,
+                        find_module_range(tensor, name.layer, "attn_norm", local, indices, false));
+        } else if (stem == "kqv_out" || stem == "attn_out") {
+            merge_range(GGML_SPACEMIT_MODULE_ATTENTION, name.layer,
+                        find_module_range(tensor, name.layer, "attn_norm", local, indices, true));
+        } else if (stem == "ffn_moe_topk" && tensor->type == GGML_TYPE_I32) {
+            merge_range(GGML_SPACEMIT_MODULE_ROUTER, name.layer,
+                        find_module_range(tensor, name.layer, "ffn_norm", local, indices, false));
+            // top-k can be a non-compute VIEW. Signal READY at its actual local
+            // producer, after the executor's existing all-worker barrier.
+            const ggml_tensor * producer = tensor;
+            std::unordered_set<const ggml_tensor *> visited;
+            while (producer && !indices.count(producer) && local.count(producer) &&
+                   ggml_op_is_empty(producer->op) && visited.insert(producer).second) {
+                producer = producer->view_src ? producer->view_src : producer->src[0];
+            }
+            const auto it = indices.find(producer);
+            if (it != indices.end()) {
+                add_prefetch_event(points, it->second, GGML_SPACEMIT_MODULE_ROUTER,
+                                   GGML_SPACEMIT_PREFETCH_READY, name.layer, tensor);
+            }
+        }
+
+        const auto it = indices.find(tensor);
+        if (it == indices.end()) {
+            continue;
+        }
+        if (tensor->op == GGML_OP_RMS_NORM) {
+            size_t last = it->second;
+            const ggml_tensor * output = tensor;
+            // Include the weight multiply, whether fused or a separate opnode.
+            for (int j = i + 1; j < graph->n_nodes; ++j) {
+                const ggml_tensor * next = graph->nodes[j];
+                if (!spacemit_graph_node_is_compute(graph->nodes[j])) {
+                    continue;
+                }
+                if (next->op == GGML_OP_MUL && (next->src[0] == tensor || next->src[1] == tensor)) {
+                    const auto next_it = indices.find(next);
+                    if (next_it != indices.end()) {
+                        last = next_it->second;
+                        output = next;
+                    }
+                }
+                break;
+            }
+            add_prefetch_event(points, it->second, GGML_SPACEMIT_MODULE_RMS_NORM,
+                               GGML_SPACEMIT_PREFETCH_BEGIN, name.layer, tensor);
+            add_prefetch_event(points, last, GGML_SPACEMIT_MODULE_RMS_NORM,
+                               GGML_SPACEMIT_PREFETCH_END, name.layer, output);
+        }
+    }
+
+    // Recognize routed expert work from MUL_MAT_ID and its index dependency,
+    // including scheduler copies. BEGIN is the place to wait for all weights
+    // required by this layer; no worker can begin the GEMM before it returns.
+    for (size_t i = 0; i < nodes.size(); ++i) {
+        const auto add_expert = [&](const ggml_tensor * tensor) {
+            if (tensor->op != GGML_OP_MUL_MAT_ID) {
+                return;
+            }
+            const auto * topk = find_topk(tensor->src[2]);
+            if (topk) {
+                merge_range(GGML_SPACEMIT_MODULE_EXPERTS, parse_module_name(topk).layer, {i, i, tensor});
+            }
+        };
+        add_expert(nodes[i].node);
+        for (const auto * tensor : nodes[i].fused) {
+            add_expert(tensor);
+        }
+    }
+    for (const auto & item : ranges) {
+        const auto & range = item.second;
+        add_prefetch_event(points, range.first, item.first.first, GGML_SPACEMIT_PREFETCH_BEGIN,
+                           item.first.second, nodes[range.first].node);
+        add_prefetch_event(points, range.last, item.first.first, GGML_SPACEMIT_PREFETCH_END,
+                           item.first.second, range.output);
+    }
+    // On one boundary, close windows before announcing available router IDs.
+    for (auto & point : points) {
+        std::stable_sort(point.after.begin(), point.after.end(),
+                         [](const ggml_spacemit_prefetch_event & a, const ggml_spacemit_prefetch_event & b) {
+                             return a.phase < b.phase;
+                         });
+    }
 }

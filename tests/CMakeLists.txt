@@ -339,6 +339,7 @@ llama_build_and_test(test-thread-safety.cpp  LABEL "main backend"  ARGS -m "${MO
 set_tests_properties(test-thread-safety PROPERTIES FIXTURES_REQUIRED test-download-model)
 
 llama_build_and_test(test-arg-parser.cpp  LABEL behavior)
+llama_build_and_test(test-prefetch-config.cpp LABEL behavior)
 llama_build_and_test(test-model-resolution.cpp  LABEL behavior)
 # the test serves its repos from an httplib server, and the library links it privately
 target_link_libraries(test-model-resolution PRIVATE cpp-httplib)
@@ -421,4 +422,41 @@ llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
+endif()
+
+# Compile the planner with trait stubs so boundary recognition is independent
+# of IME kernel eligibility. Reuse the backend's private header search paths.
+if (TARGET ggml-spacemit)
+    llama_build_and_test(test-spacemit-prefetch-plan.cpp
+        ../ggml/src/ggml-spacemit/spacemit-graph.cpp
+        LABEL "graph backend" LINK ggml-base)
+    target_include_directories(test-spacemit-prefetch-plan PRIVATE
+        "$<TARGET_PROPERTY:ggml-spacemit,INCLUDE_DIRECTORIES>")
+
+    llama_build_and_test(test-spacemit-prefetch-runtime.cpp
+        LABEL "graph backend" LINK ggml-spacemit ggml-cpu ggml-base)
+    target_include_directories(test-spacemit-prefetch-runtime PRIVATE
+        "${PROJECT_SOURCE_DIR}/ggml/src")
+endif()
+
+# The queue/event tests use a stub provider and can run on any host, even when
+# the actual SpacemiT backend is disabled. The hardware test uses the X100 driver.
+llama_build_and_test(test-spacemit-transfer.cpp
+    ../ggml/src/ggml-spacemit/spacemit-transfer.cpp
+    LABEL "backend" LINK Threads::Threads)
+target_include_directories(test-spacemit-transfer PRIVATE
+    "${PROJECT_SOURCE_DIR}/ggml/include"
+    "${PROJECT_SOURCE_DIR}/ggml/src/ggml-spacemit")
+
+if (TARGET ggml-spacemit)
+    add_executable(test-spacemit-transfer-x100 test-spacemit-transfer.cpp
+        ../ggml/src/ggml-spacemit/spacemit-transfer.cpp
+        ../ggml/src/ggml-spacemit/spacemit-transfer-x100.cpp)
+    target_compile_features(test-spacemit-transfer-x100 PRIVATE cxx_std_17)
+    target_compile_definitions(test-spacemit-transfer-x100 PRIVATE SPACEMIT_TRANSFER_TEST_REAL)
+    target_include_directories(test-spacemit-transfer-x100 PRIVATE
+        "${PROJECT_SOURCE_DIR}/ggml/include"
+        "${PROJECT_SOURCE_DIR}/ggml/src/ggml-spacemit")
+    target_link_libraries(test-spacemit-transfer-x100 PRIVATE Threads::Threads)
+    # Intentionally not a default CTest: hardware jobs must use the board queue.
 endif()

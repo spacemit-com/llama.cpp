@@ -374,6 +374,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             prefetch;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -420,6 +421,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* prefetch             */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -440,6 +442,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
+    printf("  --prefetch, --no-prefetch                    enable/disable backend prefetch planning (default: off; env: LLAMA_ARG_PREFETCH)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
     if (llama_supports_rpc()) {
@@ -538,7 +541,19 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.prefetch             = cmd_params_defaults.prefetch;
     params.offline              = cmd_params_defaults.offline;
+
+    if (const char * env = getenv("LLAMA_ARG_PREFETCH")) {
+        if (common_arg_utils::is_truthy(env)) {
+            params.prefetch = true;
+        } else if (common_arg_utils::is_falsey(env)) {
+            params.prefetch = false;
+        } else {
+            fprintf(stderr, "error: invalid boolean value for LLAMA_ARG_PREFETCH: %s\n", env);
+            exit(1);
+        }
+    }
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -1054,6 +1069,10 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.verbose = true;
             } else if (arg == "--progress") {
                 params.progress = true;
+            } else if (arg == "--prefetch") {
+                params.prefetch = true;
+            } else if (arg == "--no-prefetch") {
+                params.prefetch = false;
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
@@ -2325,6 +2344,7 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        cparams.prefetch = params.prefetch;
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
