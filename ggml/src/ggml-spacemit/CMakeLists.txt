@@ -79,6 +79,11 @@ if (GGML_BUILD_PROFILE)
     target_compile_definitions(${TARGET_NAME} PRIVATE GGML_BUILD_PROFILE)
 endif()
 
+option(GGML_SPACEMIT_REPACK_MT "ggml-spacemit: repack MoE expert weights in parallel on the X100 cores at load time" OFF)
+if (GGML_SPACEMIT_REPACK_MT)
+    target_compile_definitions(${TARGET_NAME} PRIVATE GGML_SPACEMIT_REPACK_MT)
+endif()
+
 # Pass the full march string to the backend target.
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "riscv")
     set(SPACEMIT_MARCH "-march=rv64gcv_zfh_zvfh_zba_zbb_zbs_zicbop_zihintpause_zawrs_zicond_zvbb")
