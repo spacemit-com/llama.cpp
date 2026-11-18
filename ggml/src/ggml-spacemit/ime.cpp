@@ -273,26 +273,36 @@ static gemm_path_f16 resolve_gemm_f16() {
     return o;
 }
 
-#ifdef GGML_SPACEMIT_REPACK_MT
-// Load-time repack of MoE expert weights on the X100 cores (spert backend "spacemit-k3-x100").
-//
-// A 3-D weight tensor holds ne[2] independent expert matrices. Every repack function walks a tensor as a stack of
-// 32-row blocks and writes the destination sequentially; with ne[1] % 32 == 0 no row block straddles two experts,
-// so repacking each expert into its own slab gives the same bytes as one call over the whole tensor -- provided the
-// slab is the stride the kernels address experts with (forward_mul_mat_id: ne01 * row_stride_b), which the caller
-// passes in. It is not the allocation divided by ne[2]: for Q4_1/Q4_K the allocation reserves more than the
-// repacked layout uses. Returns false, touching nothing, when the tensor does not fit these conditions or the X100
-// backend is unavailable; the caller then takes the serial path.
+#ifdef GGML_SPACEMIT_REPACK_PARALLEL
+// spert backend for the load-time repack: the X100 cores on K3, the AI cores on K1; nullptr elsewhere (serial repack)
+static const char * repack_parallel_backend() {
+    switch ((spine_core_arch_id) (uint16_t) spert::backend_info().core_arch_id) {
+        case spine_core_arch_id::core_arch_a100:
+            return "spacemit-k3-x100";
+        case spine_core_arch_id::core_arch_a60:
+            return "spacemit-k1";
+        default:
+            return nullptr;
+    }
+}
+
+// Repack a 3-D (MoE) weight with one spert tile per expert. With ne[1] % 32 == 0 no 32-row block straddles two experts, so the bytes equal one serial call.
+// dst_slab must be the expert stride of the kernels (forward_mul_mat_id), not allocation / ne[2]: Q4_1/Q4_K allocate more than the layout uses.
+// Returns false and writes nothing if the tensor does not fit or no backend is available; the caller then repacks serially.
 template <typename Fn>
-static bool repack_experts_on_x100(ggml_tensor * t, const void * data, size_t data_size, size_t dst_slab, const Fn & fn,
-                                   int & ret) {
+static bool repack_experts_parallel(ggml_tensor * t, const void * data, size_t data_size, size_t dst_slab, const Fn & fn,
+                                    int & ret) {
     const int64_t n_expert = t->ne[2] * t->ne[3];
     if (n_expert < 2 || t->ne[1] % 32 != 0 || t->nb[3] != t->ne[2] * t->nb[2] ||
         data_size != (size_t) n_expert * t->nb[2] || (size_t) n_expert * dst_slab > ggml_spacemit_nbytes(nullptr, t)) {
         return false;
     }
 
-    spert::Stream stream(spert::backend("spacemit-k3-x100"));
+    static const char * const backend_name = repack_parallel_backend();
+    if (backend_name == nullptr) {
+        return false;
+    }
+    spert::Stream stream(spert::backend(backend_name));
     if (!stream.valid()) {
         return false;
     }
@@ -1249,12 +1259,12 @@ private:
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
-#ifdef GGML_SPACEMIT_REPACK_MT
+#ifdef GGML_SPACEMIT_REPACK_PARALLEL
         // the expert stride the kernels use: ne01 * b_k_blks * repacked block size (forward_mul_mat_id)
         const size_t dst_slab = (size_t) t->ne[1] * (size_t) ((t->ne[0] + INTER_SIZE - 1) / INTER_SIZE) *
                                 get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
         int ret = 0;
-        if (repack_experts_on_x100(
+        if (repack_experts_parallel(
                 t, data, data_size, dst_slab,
                 [](ggml_tensor * v, const void * d, size_t n) {
                     return ggml::cpu::riscv64_spacemit::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(v, d, n);
