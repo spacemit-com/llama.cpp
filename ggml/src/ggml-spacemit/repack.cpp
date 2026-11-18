@@ -1848,6 +1848,30 @@ int repack_f32_to_q8_0_32(ggml_tensor * t, const void * data, size_t data_size) 
     return q8_0x32_finish(t, repack_q8_0_to_q8_0_32_bl(t, 32, q8.data(), q8.size() * sizeof(block_q8_0)));
 }
 
+// Exact inverse of Q8 N32 packing plus q8_0x32_lane_arrange; preserve half bits.
+int unpack_q8_0_32_to_q8_0(const ggml_tensor * t, void * data, size_t data_size) {
+    const int64_t nrows = ggml_nrows(t);
+    if (t->type != GGML_TYPE_Q8_0 || t->ne[0] <= 0 || t->ne[0] % QK8_0 != 0 ||
+        data_size != static_cast<size_t>(nrows) * (t->ne[0] / QK8_0) * sizeof(block_q8_0)) {
+        return -1;
+    }
+    const int64_t nblocks = t->ne[0] / QK8_0;
+    const auto * src = static_cast<const block_q8_0x32 *>(t->data);
+    auto * dst = static_cast<uint8_t *>(data);
+    for (int64_t row = 0; row < nrows; ++row) {
+        const int lane = row % 32;
+        for (int64_t kb = 0; kb < nblocks; ++kb) {
+            const auto & block = src[(row / 32) * nblocks + kb];
+            uint8_t * out = dst + (row * nblocks + kb) * sizeof(block_q8_0);
+            memcpy(out, &block.d[lane], sizeof(block.d[lane]));
+            const size_t q = (lane / 8) * 256 + (lane % 8) * 16;
+            memcpy(out + sizeof(block.d[lane]), block.qs + q, 16);
+            memcpy(out + sizeof(block.d[lane]) + 16, block.qs + q + 128, 16);
+        }
+    }
+    return 0;
+}
+
 int unpack_q8_0_32_to_f32(const ggml_tensor * t, void * data, size_t data_size) {
     const int64_t nrows = ggml_nrows(t);
     if (t->type != GGML_TYPE_F32 || t->ne[0] % QK8_0 != 0 || t->ne[1] % 32 != 0 ||

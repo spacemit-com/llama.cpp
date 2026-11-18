@@ -2461,6 +2461,14 @@ private:
     }
 };
 
+// Apply the exact inverse only to canonical Q8_0. Converted F32 and Q5_0
+// weights keep their own logical readback behavior.
+class tensor_traits_q8_0_ime2 : public tensor_traits<block_q8_0, 32, 32> {
+    void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
+        GGML_ASSERT(unpack_q8_0_32_to_q8_0(t, data, data_size) == 0);
+    }
+};
+
 // Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path
 class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
@@ -2609,7 +2617,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &i8_traits<block_q8_0, 32, 32>();
+                    return &ggml::cpu::riscv64_spacemit::traits_instance<ggml::cpu::riscv64_spacemit::tensor_traits_q8_0_ime2>();
                 }
 #endif
             }
