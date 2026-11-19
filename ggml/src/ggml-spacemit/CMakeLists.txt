@@ -45,8 +45,6 @@ endif()
 ggml_add_backend_library(${TARGET_NAME}
     ggml-spacemit.cpp
     ime.cpp
-    ime1_kernels.cpp
-    ime2_kernels.cpp
     rvv_kernels.cpp
     scalar_kernels.cpp
     repack.cpp
@@ -57,6 +55,13 @@ ggml_add_backend_library(${TARGET_NAME}
     spacemit-env.h
     spine_mem_pool.cpp
     ../../include/ggml-spacemit.h)
+
+if("RISCV64_SPACEMIT_IME1" IN_LIST RISCV64_SPACEMIT_IME_SPEC)
+    target_sources(${TARGET_NAME} PRIVATE ime1_kernels.cpp)
+endif()
+if("RISCV64_SPACEMIT_IME2" IN_LIST RISCV64_SPACEMIT_IME_SPEC)
+    target_sources(${TARGET_NAME} PRIVATE ime2_kernels.cpp)
+endif()
 
 set_target_properties(${TARGET_NAME} PROPERTIES
     C_VISIBILITY_PRESET hidden
