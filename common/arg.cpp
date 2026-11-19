@@ -1956,11 +1956,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--prefetch"},
         {"--no-prefetch"},
-        "enable backend prefetch planning (default: disabled; requires backend policy for weight transfers)",
+        "load ordinary weights into allocated buffers and lazily mmap routed experts; asynchronously warm expert pages or fill bounded expert slots on supported backends (default: disabled)",
         [](common_params & params, bool value) {
             params.prefetch = value;
         }
     ).set_env("LLAMA_ARG_PREFETCH"));
+    add_opt(common_arg(
+        {"--prefetch-expert-ratio"}, "RATIO",
+        "reserve floor(RATIO * total routed experts) complete host expert slots; 0..1, requires --prefetch (default: mmap page warmup without a separate buffer)",
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            const double ratio = std::stod(value, &end);
+            if (end != value.size() || !std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
+                throw std::invalid_argument("--prefetch-expert-ratio must be a finite number in [0, 1]");
+            }
+            params.prefetch_expert_ratio = ratio;
+        }
+    ).set_env("LLAMA_ARG_PREFETCH_EXPERT_RATIO"));
     add_opt(common_arg(
         {"--spm-infill"},
         string_format(

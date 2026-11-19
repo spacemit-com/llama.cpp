@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "llama-spacemit-prefetch.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -605,7 +606,12 @@ llama_context::llama_context(
                 // Optional backend capability; no dependency on a specific backend.
                 using set_prefetch_t = bool (*)(ggml_backend_t, bool);
                 auto set_prefetch = (set_prefetch_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_set_prefetch");
-                if (set_prefetch && !set_prefetch(backend.get(), params.prefetch)) {
+                // SpacemiT callbacks are shared by handles for a device. The
+                // owning warmup manager configures those sessions; another
+                // context must not disable or overwrite an active policy here.
+                const bool has_spacemit_callback = ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_spacemit_set_prefetch_callback") != nullptr;
+                if (set_prefetch && !has_spacemit_callback && !set_prefetch(backend.get(), params.prefetch)) {
                     throw std::runtime_error("failed to configure backend prefetch");
                 }
             }
@@ -725,11 +731,24 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // Install only after construction and graph reservation have succeeded.
+    // The manager borrows model mappings, which outlive this context.
+    if (params.prefetch && !hparams.vocab_only && !model.no_alloc()) {
+        expert_prefetch = std::make_unique<llama_spacemit_prefetch>(model, backends);
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // Stop callbacks before cancelling/draining their requests. Model mappings
+    // and backend handles must stay alive until all page reads have stopped.
+    if (expert_prefetch) {
+        expert_prefetch->stop();
+        expert_prefetch.reset();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {

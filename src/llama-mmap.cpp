@@ -479,7 +479,8 @@ struct llama_mmap::impl {
 #ifdef _POSIX_MAPPED_FILES
     std::vector<std::pair<size_t, size_t>> mapped_fragments;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            const llama_mmap::ranges & normal_ranges) {
         size = file->size();
         int fd = file->file_id();
         int flags = MAP_SHARED;
@@ -523,6 +524,13 @@ struct llama_mmap::impl {
                 LLAMA_LOG_WARN("warning: posix_madvise(.., POSIX_MADV_RANDOM) failed: %s\n",
                         strerror(errno));
             }
+        }
+
+        // Expert workers touch successive pages asynchronously. NORMAL keeps
+        // readahead available without populating the mapping during loading.
+        // Apply it after NUMA advice; all other lazy ranges retain RANDOM.
+        for (const auto & range : normal_ranges) {
+            advise(range.first, range.second, POSIX_MADV_NORMAL, "POSIX_MADV_NORMAL");
         }
 
         mapped_fragments.emplace_back(0, file->size());
@@ -586,8 +594,10 @@ struct llama_mmap::impl {
 #elif defined(_WIN32)
     HANDLE hMapping = nullptr;
 
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            const llama_mmap::ranges & normal_ranges) {
         GGML_UNUSED(numa);
+        GGML_UNUSED(normal_ranges); // Windows mappings already use the default paging policy.
 
         size = file->size();
 
@@ -655,11 +665,13 @@ struct llama_mmap::impl {
         }
     }
 #else
-    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges) {
+    impl(struct llama_file * file, size_t prefetch, bool numa, const llama_mmap::ranges & lazy_ranges,
+            const llama_mmap::ranges & normal_ranges) {
         GGML_UNUSED(file);
         GGML_UNUSED(prefetch);
         GGML_UNUSED(numa);
         GGML_UNUSED(lazy_ranges);
+        GGML_UNUSED(normal_ranges);
 
         throw std::runtime_error("mmap not supported");
     }
@@ -677,7 +689,8 @@ struct llama_mmap::impl {
 };
 
 llama_mmap::llama_mmap(struct llama_file * file, size_t prefetch, bool numa,
-        const ranges & lazy_ranges) : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges)) {}
+        const ranges & lazy_ranges, const ranges & normal_ranges)
+    : pimpl(std::make_unique<impl>(file, prefetch, numa, lazy_ranges, normal_ranges)) {}
 llama_mmap::~llama_mmap() = default;
 
 size_t llama_mmap::size() const { return pimpl->size; }

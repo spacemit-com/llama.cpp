@@ -348,6 +348,10 @@ extern "C" {
         // override key-value pairs of the model meta data
         const struct llama_model_kv_override * kv_overrides;
 
+        // -1: retain mmap page warmup; [0,1]: reserve floor(ratio * total routed
+        // experts) complete expert slots in one bounded host buffer. Requires prefetch.
+        double prefetch_expert_ratio;
+
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights
         bool check_tensors;   // validate model tensor data
@@ -355,6 +359,7 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+        bool prefetch;        // resident ordinary weights + lazy mmap routed expert weights; default false
     };
 
     struct llama_sampler_seq_config {

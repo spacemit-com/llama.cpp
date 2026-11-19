@@ -233,6 +233,25 @@ ggml_backend_dev_t ggml_backend_buft_get_device(ggml_backend_buffer_type_t buft)
 
 // backend buffer
 
+void ggml_backend_buffer_set_expert_resolver(ggml_backend_buffer_t buffer,
+        ggml_backend_expert_resolver resolver, void * user_data) {
+    GGML_ASSERT(buffer);
+    buffer->expert_resolver = resolver;
+    buffer->expert_resolver_data = user_data;
+}
+
+const void * ggml_backend_tensor_get_expert(const ggml_tensor * tensor, int64_t expert) {
+    GGML_ASSERT(expert >= 0 && expert < tensor->ne[2]);
+    if (tensor->buffer && tensor->buffer->expert_resolver) {
+        const void * data = tensor->buffer->expert_resolver(tensor, expert,
+                tensor->buffer->expert_resolver_data);
+        if (data) {
+            return data;
+        }
+    }
+    return static_cast<const char *>(tensor->data) + expert * tensor->nb[2];
+}
+
 ggml_backend_buffer_t ggml_backend_buffer_init(
                ggml_backend_buffer_type_t buft,
         struct ggml_backend_buffer_i      iface,
@@ -243,7 +262,9 @@ ggml_backend_buffer_t ggml_backend_buffer_init(
         /* .buft      = */ buft,
         /* .context   = */ context,
         /* .size      = */ size,
-        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY
+        /* .usage     = */ GGML_BACKEND_BUFFER_USAGE_ANY,
+        /* .expert_resolver      = */ nullptr,
+        /* .expert_resolver_data = */ nullptr
     };
 
     return buffer;

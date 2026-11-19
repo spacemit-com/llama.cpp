@@ -207,6 +207,8 @@ add_library(ggml-base
             ggml-quants.c
             ggml-quants.h
             ggml-profile.c
+            ggml-prefetch-debug.cpp
+            ggml-prefetch-debug.h
             ../include/ggml-profile.h
             gguf.cpp)
 

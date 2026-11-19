@@ -375,6 +375,7 @@ struct cmd_params {
     bool                             progress;
     bool                             no_warmup;
     bool                             prefetch;
+    double                           prefetch_expert_ratio;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -422,9 +423,19 @@ static const cmd_params cmd_params_defaults = {
     /* progress             */ false,
     /* no_warmup            */ false,
     /* prefetch             */ false,
+    /* prefetch_expert_ratio */ -1.0,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
+
+static double parse_expert_ratio(const std::string & value) {
+    size_t end = 0;
+    const double ratio = std::stod(value, &end);
+    if (end != value.size() || !std::isfinite(ratio) || ratio < 0.0 || ratio > 1.0) {
+        throw std::invalid_argument("prefetch expert ratio must be finite and in [0, 1]");
+    }
+    return ratio;
+}
 
 static void print_usage(int /* argc */, char ** argv) {
     printf("usage: %s [options]\n", argv[0]);
@@ -442,7 +453,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
-    printf("  --prefetch, --no-prefetch                    enable/disable backend prefetch planning (default: off; env: LLAMA_ARG_PREFETCH)\n");
+    printf("  --prefetch-expert-ratio <0..1>                reserve complete expert slots; requires --prefetch (env: LLAMA_ARG_PREFETCH_EXPERT_RATIO)\n");
+    printf("  --prefetch, --no-prefetch                    enable/disable hybrid expert mmap loading and asynchronous page warmup (default: off; env: LLAMA_ARG_PREFETCH)\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 0)\n");
     if (llama_supports_rpc()) {
@@ -542,6 +554,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.prefetch             = cmd_params_defaults.prefetch;
+    params.prefetch_expert_ratio = cmd_params_defaults.prefetch_expert_ratio;
     params.offline              = cmd_params_defaults.offline;
 
     if (const char * env = getenv("LLAMA_ARG_PREFETCH")) {
@@ -553,6 +566,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             fprintf(stderr, "error: invalid boolean value for LLAMA_ARG_PREFETCH: %s\n", env);
             exit(1);
         }
+    }
+
+    if (const char * env = getenv("LLAMA_ARG_PREFETCH_EXPERT_RATIO")) {
+        try { params.prefetch_expert_ratio = parse_expert_ratio(env); }
+        catch (const std::exception & e) { fprintf(stderr, "error: LLAMA_ARG_PREFETCH_EXPERT_RATIO: %s\n", e.what()); exit(1); }
     }
 
     if (const char * env = getenv("HF_TOKEN")) {
@@ -1073,6 +1091,9 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 params.prefetch = true;
             } else if (arg == "--no-prefetch") {
                 params.prefetch = false;
+            } else if (arg == "--prefetch-expert-ratio") {
+                if (++i >= argc) { invalid_param = true; break; }
+                params.prefetch_expert_ratio = parse_expert_ratio(argv[i]);
             } else if (arg == "--no-warmup") {
                 params.no_warmup = true;
             } else if (arg == "-fitt" || arg == "--fit-target") {
@@ -2344,6 +2365,8 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        mparams.prefetch = params.prefetch;
+        mparams.prefetch_expert_ratio = params.prefetch_expert_ratio;
         cparams.prefetch = params.prefetch;
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||

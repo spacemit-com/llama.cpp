@@ -460,3 +460,33 @@ if (TARGET ggml-spacemit)
     target_link_libraries(test-spacemit-transfer-x100 PRIVATE Threads::Threads)
     # Intentionally not a default CTest: hardware jobs must use the board queue.
 endif()
+
+if (TARGET ggml-spacemit AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    llama_build(test-spacemit-expert-prefetch.cpp LINK llama ggml-spacemit ggml-cpu ggml-base)
+    target_include_directories(test-spacemit-expert-prefetch PRIVATE "${PROJECT_SOURCE_DIR}/src")
+
+    llama_build(test-spacemit-hybrid-prefetch.cpp LINK llama ggml-spacemit ggml-cpu ggml-base)
+    target_include_directories(test-spacemit-hybrid-prefetch PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    # Requires an explicit model and exclusive board queue; never a default CTest.
+endif()
+
+# Real bounded buffer and CPU expert lookup tests, independent of board hardware.
+llama_build_and_test(test-spacemit-expert-slots.cpp
+    ../src/llama-spacemit-expert-cache.cpp
+    LABEL "backend" LINK llama ggml-cpu ggml-base)
+target_include_directories(test-spacemit-expert-slots PRIVATE "${PROJECT_SOURCE_DIR}/src")
+
+
+if (TARGET ggml-cpu)
+    llama_build(test-prefetch-debug-ideal.cpp LINK ggml-cpu ggml-base Threads::Threads)
+    target_include_directories(test-prefetch-debug-ideal PRIVATE ../ggml/src)
+    add_test(NAME test-prefetch-debug-ideal-off COMMAND test-prefetch-debug-ideal disabled)
+    set_tests_properties(test-prefetch-debug-ideal-off PROPERTIES
+        ENVIRONMENT "GGML_PREFETCH_DEBUG_IDEAL=0;GGML_PREFETCH_DEBUG_IDEAL_US=0")
+    add_test(NAME test-prefetch-debug-ideal-zero COMMAND test-prefetch-debug-ideal enabled)
+    set_tests_properties(test-prefetch-debug-ideal-zero PROPERTIES
+        ENVIRONMENT "GGML_PREFETCH_DEBUG_IDEAL=1;GGML_PREFETCH_DEBUG_IDEAL_US=0")
+    add_test(NAME test-prefetch-debug-ideal-delay COMMAND test-prefetch-debug-ideal enabled)
+    set_tests_properties(test-prefetch-debug-ideal-delay PROPERTIES
+        ENVIRONMENT "GGML_PREFETCH_DEBUG_IDEAL=1;GGML_PREFETCH_DEBUG_IDEAL_US=50000")
+endif()

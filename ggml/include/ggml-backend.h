@@ -69,6 +69,13 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t     ggml_backend_buffer_get_type      (ggml_backend_buffer_t buffer);
     GGML_API void                           ggml_backend_buffer_reset         (ggml_backend_buffer_t buffer);
 
+    // Optional host expert indirection. Install/remove only while all users of the
+    // buffer are idle; callback/user_data must outlive every tensor computation.
+    // A NULL callback result means use the original tensor's expert slice.
+    typedef const void * (*ggml_backend_expert_resolver)(const struct ggml_tensor * tensor, int64_t expert, void * user_data);
+    GGML_API void ggml_backend_buffer_set_expert_resolver(ggml_backend_buffer_t buffer, ggml_backend_expert_resolver resolver, void * user_data);
+    GGML_API const void * ggml_backend_tensor_get_expert(const struct ggml_tensor * tensor, int64_t expert);
+
     // tensor copy between different backends
     GGML_API void ggml_backend_tensor_copy  (const struct ggml_tensor * src, struct ggml_tensor * dst);
     GGML_API void ggml_backend_tensor_copy_n(const struct ggml_tensor * const * srcs, struct ggml_tensor * const * dsts, size_t n_tensors);

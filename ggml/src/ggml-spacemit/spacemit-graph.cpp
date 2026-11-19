@@ -1,4 +1,5 @@
 #include "spacemit-graph.h"
+#include "ggml-prefetch-debug.h"
 #include "ime.h"
 
 #include <algorithm>
@@ -272,7 +273,7 @@ void spacemit_graph_build_opnodes(const ggml_cgraph * graph,
         if (!spacemit_graph_node_is_compute(node)) {
             continue;
         }
-        if (try_fuse_node(graph, i, nodes, emitted)) {
+        if (!ggml_prefetch_debug_ideal_enabled() && try_fuse_node(graph, i, nodes, emitted)) {
             continue;
         }
         nodes.emplace_back(node);
@@ -296,9 +297,9 @@ struct module_name {
     int layer = -1;
 };
 
-// Scheduler copies use backend#original-name#copy-index. Parse an exact final
-// layer suffix rather than accepting a substring such as "Qcur" in any name.
-static module_name parse_module_name(const ggml_tensor * tensor) {
+// Scheduler copies use backend#original-name#copy-index. Preserve the original
+// name for both semantic layer suffixes and exact projection weight roles.
+static std::string original_tensor_name(const ggml_tensor * tensor) {
     std::string name = tensor->name;
     for (;;) {
         const size_t first = name.find('#');
@@ -308,6 +309,11 @@ static module_name parse_module_name(const ggml_tensor * tensor) {
         }
         name = name.substr(first + 1, last - first - 1);
     }
+    return name;
+}
+
+static module_name parse_module_name(const ggml_tensor * tensor) {
+    const std::string name = original_tensor_name(tensor);
     const size_t dash = name.rfind('-');
     if (dash == std::string::npos || dash + 1 == name.size()) {
         return {};
@@ -323,6 +329,30 @@ static module_name parse_module_name(const ggml_tensor * tensor) {
     return { name.substr(0, dash), layer };
 }
 
+// A backend split may contain the first projection GEMM but end before the
+// named q/kv output (e.g. DeepSeek RoPE on CPU). Anchor that local window to
+// the exact projection weight role, still validating its attn_norm dependency.
+static int qkv_projection_layer(const ggml_tensor * tensor) {
+    if (tensor->op != GGML_OP_MUL_MAT || !tensor->src[0]) { return -1; }
+    const std::string name = original_tensor_name(tensor->src[0]);
+    if (name.compare(0, 4, "blk.") != 0) { return -1; }
+    const size_t dot = name.find('.', 4);
+    if (dot == std::string::npos || dot == 4) { return -1; }
+    int layer = 0;
+    for (size_t i = 4; i < dot; ++i) {
+        const int digit = name[i] - '0';
+        if (digit < 0 || digit > 9 || layer > (INT_MAX - digit) / 10) { return -1; }
+        layer = layer * 10 + digit;
+    }
+    const std::string role = name.substr(dot + 1);
+    if (role == "attn_q.weight" || role == "attn_k.weight" || role == "attn_v.weight" ||
+        role == "attn_qkv.weight" || role == "attn_q_a.weight" || role == "attn_kv.weight" ||
+        role == "attn_kv_a_mqa.weight") {
+        return layer;
+    }
+    return -1;
+}
+
 using opnode_indices = std::unordered_map<const ggml_tensor *, size_t>;
 
 struct module_range {
@@ -332,8 +362,8 @@ struct module_range {
 };
 
 // Find a window from dependencies, not from the interval between two names.
-// A scheduler split may end before the named output: do not invent a complete
-// module in that case. Dependencies outside this split are never executed here.
+// A local projection may anchor an incomplete QKV window when the final named
+// output belongs to another split. Only locally mapped operations are included.
 static module_range find_module_range(const ggml_tensor * output, int layer,
                                       const char * input_name,
                                       const std::unordered_set<const ggml_tensor *> & local,
@@ -444,6 +474,11 @@ void spacemit_graph_build_prefetch_plan(const ggml_cgraph * graph,
 
     for (int i = 0; i < graph->n_nodes; ++i) {
         const ggml_tensor * tensor = graph->nodes[i];
+        const int projection_layer = qkv_projection_layer(tensor);
+        if (projection_layer >= 0) {
+            merge_range(GGML_SPACEMIT_MODULE_QKV, projection_layer,
+                        find_module_range(tensor, projection_layer, "attn_norm", local, indices, false));
+        }
         const auto name = parse_module_name(tensor);
         if (name.layer < 0) {
             continue;

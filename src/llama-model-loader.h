@@ -78,6 +78,7 @@ struct llama_model_loader {
 
     bool use_mmap = false;
     bool use_direct_io = false;
+    bool prefetch = false; // force only routed expert matrices into lazy mmap contexts
     bool check_tensors;
     bool no_alloc;
     bool load_mtp;
@@ -90,7 +91,7 @@ struct llama_model_loader {
 
         // decide whether this tensor is read lazily
         // pass w to also record it, or nullptr to only ask
-        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w);
+        bool add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force_expert = false);
 
         bool any() const {
             return !ranges.empty();
@@ -107,12 +108,24 @@ struct llama_model_loader {
             return it == ranges.end() ? none : it->second;
         }
 
+        bool is_expert(const ggml_tensor * t) const {
+            return expert_tensors.count(ggml_get_name(t)) > 0;
+        }
+
+        const llama_mmap::ranges & experts_for_file(uint32_t idx) const {
+            static const llama_mmap::ranges none;
+            const auto it = expert_ranges.find(idx);
+            return it == expert_ranges.end() ? none : it->second;
+        }
+
         // lazy tensors are gathered on the host, so no offload setting applies to them
         static ggml_backend_buffer_type_t buft();
 
     private:
         std::map<uint32_t, llama_mmap::ranges> ranges;
         std::set<std::string>                  tensors;
+        std::map<uint32_t, llama_mmap::ranges> expert_ranges;
+        std::set<std::string>                  expert_tensors;
     } lazy;
 
     llama_files files;

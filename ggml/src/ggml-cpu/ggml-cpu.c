@@ -15,6 +15,7 @@
 #include "ggml.h"
 #include "common.h"
 #include "ggml-profile.h"
+#include "ggml-prefetch-debug.h"
 #include "tiled/tiled.h"
 
 #ifdef GGML_USE_CPU_RISCV64_SPACEMIT
@@ -1714,7 +1715,7 @@ static void ggml_compute_forward_mul_mat_id(
             continue;
         }
 
-        const char * src0_cur = (const char *) src0->data + cur_a * nb02;
+        const char * src0_cur = (const char *) ggml_backend_tensor_get_expert(src0, cur_a);
         const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
         const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
@@ -1775,6 +1776,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
     GGML_ASSERT(params);
 
     if (tensor->op == GGML_OP_NONE || ggml_is_empty(tensor)) {
+        return;
+    }
+
+    if (ggml_prefetch_debug_ideal_compute(tensor, params->ith, params->nth)) {
         return;
     }
 
@@ -3185,7 +3190,8 @@ static void ggml_graph_compute_spert_kernel(int ith, int nth, void * user_data) 
         }
         
         // Execute the operator (all ops go through here, including IME-accelerated ones)
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        const int n_fused = ggml_prefetch_debug_ideal_enabled() ? 0 :
+            ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {
@@ -3240,7 +3246,8 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
 
         // TODO: move fused-op detection into ggml_graph_plan so fusion decisions are made once at planning time
         // Try fused ops, fall back to normal compute
-        const int n_fused = ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
+        const int n_fused = ggml_prefetch_debug_ideal_enabled() ? 0 :
+            ggml_cpu_try_fuse_ops(cgraph, node_n, &params, cplan);
         if (n_fused > 0) {
             node_n += n_fused;
         } else {

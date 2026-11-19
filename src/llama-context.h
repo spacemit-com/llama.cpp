@@ -19,6 +19,7 @@
 struct llama_model;
 class llama_batch_allocr;
 class llama_moe_cache;
+class llama_spacemit_prefetch;
 
 class llama_io_read_i;
 class llama_io_write_i;
@@ -405,6 +406,9 @@ private:
 
     ggml_backend_t backend_cpu = nullptr;
     std::vector<ggml_backend_ptr> backends;
+
+    // Declared after backends so constructor unwinding also stops warmup first.
+    std::unique_ptr<llama_spacemit_prefetch> expert_prefetch;
 
     // training
     ggml_opt_context_t opt_ctx = nullptr;

@@ -120,5 +120,28 @@ int main() {
     CHECK(count(plan, GGML_SPACEMIT_MODULE_ATTENTION, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
     CHECK(count(plan, GGML_SPACEMIT_MODULE_ROUTER, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
     std::puts("PASS: layer mismatch does not create semantic windows");
+    // A scheduler split can end at the first Q projection, with q/kv and
+    // RoPE on another backend. Exact weight roles plus a copied norm suffice.
+    auto * wq = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 32, 32);
+    ggml_set_name(wq, "SPACEMIT0#blk.3.attn_q_a.weight#0");
+    auto * norm_copy = ggml_dup(ctx, norm);
+    ggml_set_name(norm_copy, "SPACEMIT0#attn_norm-3#0");
+    auto * projection = ggml_mul_mat(ctx, wq, norm_copy);
+    auto * projection_graph = ggml_new_graph_custom(ctx, 128, false);
+    ggml_build_forward_expand(projection_graph, projection);
+    auto projection_split = *projection_graph;
+    projection_split.nodes += projection_graph->n_nodes - 1;
+    projection_split.n_nodes = 1;
+    spacemit_graph_build_prefetch_plan(&projection_split, {spacemit_opnode(projection)}, plan);
+    CHECK(count(plan, GGML_SPACEMIT_MODULE_QKV, GGML_SPACEMIT_PREFETCH_BEGIN) == 1);
+    CHECK(count(plan, GGML_SPACEMIT_MODULE_QKV, GGML_SPACEMIT_PREFETCH_END) == 1);
+    ggml_set_name(norm_copy, "attn_norm-4");
+    spacemit_graph_build_prefetch_plan(&projection_split, {spacemit_opnode(projection)}, plan);
+    CHECK(count(plan, GGML_SPACEMIT_MODULE_QKV, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
+    ggml_set_name(norm_copy, "attn_norm-3");
+    ggml_set_name(wq, "blk.3.attn_q_a.weight.extra");
+    spacemit_graph_build_prefetch_plan(&projection_split, {spacemit_opnode(projection)}, plan);
+    CHECK(count(plan, GGML_SPACEMIT_MODULE_QKV, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
+    std::puts("PASS: QKV projection in split, layer and exact weight role guards");
     ggml_free(ctx);
 }

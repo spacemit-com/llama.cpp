@@ -17,6 +17,7 @@
 #include "ggml-common.h"
 #include "ggml-impl.h"
 #include "ggml-spacemit.h"
+#include "ggml-prefetch-debug.h"
 
 #include "spacemit-session.h"
 #include "spacemit-kernels.h"
@@ -464,7 +465,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
                 ggml_profile_log_spacemit_op_begin(op, (int) ith, (int) runtime->grid_dim(0));
 
-                if (!ggml_spacemit_compute_opnode(ctx, node)) {
+                if (!ggml_prefetch_debug_ideal_compute(op, (int) ith, (int) runtime->grid_dim(0)) &&
+                    !ggml_spacemit_compute_opnode(ctx, node)) {
                     throw std::runtime_error(std::string("ggml-spacemit: failed to dispatch op ") +
                                              ggml_op_desc(op) + " (" + ggml_type_name(op->type) + ")");
                 }

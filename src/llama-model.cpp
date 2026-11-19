@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-spacemit-expert-cache.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -1437,6 +1438,7 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
 }
 
 llama_model::~llama_model() {
+    expert_cache.reset();
     for (auto * lora : loras) {
         delete lora;
     }
@@ -1686,6 +1688,27 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
+    if (!std::isfinite(params.prefetch_expert_ratio) ||
+            (params.prefetch_expert_ratio != -1.0 &&
+             (params.prefetch_expert_ratio < 0.0 || params.prefetch_expert_ratio > 1.0))) {
+        throw std::runtime_error("prefetch_expert_ratio must be -1 (mmap warmup) or in [0, 1]");
+    }
+    if (params.prefetch_expert_ratio >= 0.0 && !params.prefetch) {
+        throw std::runtime_error("prefetch_expert_ratio requires --prefetch");
+    }
+    ml.prefetch = params.prefetch;
+    if (params.prefetch) {
+        // Ordinary contexts allocate real backend buffers; only lazy contexts wrap
+        // the file. Keep lazy.mode unchanged so PLE retains its separate policy.
+        ml.use_mmap = false;
+        if (!ml.no_alloc && ml.files.empty()) {
+            throw std::runtime_error("prefetch requires a file-backed model for lazy mmap expert weights");
+        }
+    }
+    // A file-prefix mlock can span experts even when the tensor being locked is
+    // ordinary. Hybrid mode locks only the real buffers in the allocation path.
+    const bool use_mmap_mlock = use_mlock && !params.prefetch;
+
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
             ggml_backend_dev_props props;
@@ -1709,7 +1732,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    const char * load_mode_name = params.load_mode == LLAMA_LOAD_MODE_AUTO
+    const char * load_mode_name = params.prefetch ? "hybrid (resident ordinary weights, lazy mmap routed experts)"
+        : params.load_mode == LLAMA_LOAD_MODE_AUTO
         ? llama_load_mode_name(ml.use_mmap ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE)
         : llama_load_mode_name(params.load_mode);
 
@@ -1981,13 +2005,16 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            if (ml.lazy.is_expert(cur)) {
+                can_prefetch.insert(cur);
+            }
         }
     }
 
     // per-tensor activation precision policy
     prec_policy.load(ml, *this);
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    ml.init_mappings(true, use_mmap_mlock ? &pimpl->mlock_mmaps : nullptr);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -2026,6 +2053,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
+        if (params.prefetch && is_lazy_mapped && (!buffer_from_host_ptr_supported || !is_default_buft)) {
+            throw std::runtime_error("prefetch requires a CPU backend that can wrap lazy mmap buffers without copying");
+        }
 
         if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
             GGML_ASSERT(!ml.no_alloc);
@@ -2133,7 +2163,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // load tensor data
     for (auto & [ctx, bufs] : ctx_bufs) {
-        if (!ml.load_all_data(ctx, bufs, use_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
+        if (!ml.load_all_data(ctx, bufs, use_mmap_mlock ? &pimpl->mlock_mmaps : NULL, params.progress_callback, params.progress_callback_user_data)) {
             return false;
         }
     }
@@ -2146,6 +2176,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     load_tensors_hadamard();
 
+    if (params.prefetch_expert_ratio >= 0.0 && !ml.no_alloc) {
+        expert_cache = llama_spacemit_expert_cache_create(*this, params.prefetch_expert_ratio);
+    }
     return true;
 }
 
@@ -3539,12 +3572,14 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
+        /*.prefetch_expert_ratio       =*/ -1.0,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.prefetch                    =*/ false,
     };
 
     return result;

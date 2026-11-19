@@ -84,6 +84,8 @@ extern "C" {
         void * context;
         size_t size;
         enum ggml_backend_buffer_usage usage;
+        ggml_backend_expert_resolver expert_resolver;
+        void * expert_resolver_data;
     };
 
     GGML_API ggml_backend_buffer_t ggml_backend_buffer_init(

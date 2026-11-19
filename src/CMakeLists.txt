@@ -39,6 +39,10 @@ set(LLAMA_CORE_SOURCES
     llama-model.cpp
     llama-quant.cpp
     llama-sampler.cpp
+    llama-spacemit-expert-cache.cpp
+    llama-spacemit-expert-cache.h
+    llama-spacemit-prefetch.cpp
+    llama-spacemit-prefetch.h
     llama-vocab.cpp
     unicode-data.cpp
     unicode.cpp

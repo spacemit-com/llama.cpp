@@ -17,6 +17,7 @@
 struct llama_cparams;
 struct llama_ubatch;
 struct llama_model_loader;
+class llama_spacemit_expert_cache;
 struct llama_model;
 
 // available models
@@ -946,6 +947,9 @@ struct llama_model {
 
     // which tensors can be prefetched - driven by TENSOR_READ_LAZY
     std::unordered_set<const ggml_tensor *> can_prefetch;
+
+    // Outlives contexts and their asynchronous transfers. Destroy before model buffers.
+    std::unique_ptr<llama_spacemit_expert_cache> expert_cache;
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;

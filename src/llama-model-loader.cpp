@@ -1098,18 +1098,21 @@ ggml_backend_buffer_type_t llama_model_loader::lazy_read::buft() {
     return ggml_backend_dev_buffer_type(cpu_dev);
 }
 
-bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w) {
-    if (mode == LLAMA_LAZY_MODE_OFF) {
+bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_tensor * t, const llama_tensor_weight * w, bool force_expert) {
+    if (!force_expert && mode == LLAMA_LAZY_MODE_OFF) {
         return false;
     }
 
     // do not lazy-read small tensors, it has significant overhead and is not worth it
     constexpr size_t auto_min_size = 4ull * 1024 * 1024 * 1024;
-    if (mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
+    if (!force_expert && mode != LLAMA_LAZY_MODE_ON && ggml_nbytes(t) <= auto_min_size) {
         return false;
     }
 
     if (!llama_mmap::SUPPORTED) {
+        if (force_expert) {
+            throw std::runtime_error("prefetch requires mmap support for routed expert weights");
+        }
         LLAMA_LOG_WARN("%s: mmap is not available, so tensor %s (size = %zu MiB) is loaded into RAM in full\n",
                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
         return false;
@@ -1118,6 +1121,10 @@ bool llama_model_loader::lazy_read::add(const std::string & name, const ggml_ten
     if (w) {
         ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
         tensors.insert(name);
+        if (force_expert) {
+            expert_ranges[w->idx].emplace_back(w->offs, w->offs + ggml_nbytes(t));
+            expert_tensors.insert(name);
+        }
 
         LLAMA_LOG_INFO("%s: tensor %s (size = %zu MiB) lazy read enabled\n",
                 __func__, name.c_str(), ggml_nbytes(t)/1024/1024);
@@ -1131,6 +1138,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     // set below, before buft_for_tensor() runs
     bool is_lazy = false;
+
+    // Only routed matrix weights are forced lazy. Router/shared weights and expert
+    // biases/scales keep their ordinary policy. PLE/engrams still obey lazy.mode;
+    // changing that mode to ON here would accidentally force every marked tensor.
+    bool force_expert = false;
+    if (prefetch && tn.suffix != nullptr && strcmp(tn.suffix, "weight") == 0) {
+        switch (tn.tensor) {
+            case LLM_TENSOR_FFN_DOWN_EXPS:
+            case LLM_TENSOR_FFN_GATE_EXPS:
+            case LLM_TENSOR_FFN_UP_EXPS:
+            case LLM_TENSOR_FFN_GATE_UP_EXPS:
+            case LLM_TENSOR_FFN_DOWN_CHEXPS:
+            case LLM_TENSOR_FFN_GATE_CHEXPS:
+            case LLM_TENSOR_FFN_UP_CHEXPS:
+                force_expert = true;
+                break;
+            default:
+                break;
+        }
+    }
 
     auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
         const ctx_key key { buft, is_lazy };
@@ -1338,6 +1365,11 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_set_name(&t_meta, tn.str().c_str());
 
+        // Keep virtual memory-fit placement consistent with file-backed loading.
+        if (force_expert) {
+            is_lazy = lazy.add(tn.str(), &t_meta, nullptr, true);
+        }
+
         ggml_backend_buffer_type_t buft = buft_for_tensor(&t_meta);
         GGML_ASSERT(buft != nullptr);
         ggml_context * ctx = ctx_for_buft(buft);
@@ -1352,9 +1384,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         return NULL;
     }
 
-    if (flags & TENSOR_READ_LAZY) {
-        // the decision must not depend on the load mode, or the memory-fit pass (no_alloc, no mmap)
-        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()));
+    if (force_expert || (flags & TENSOR_READ_LAZY)) {
+        // Force routed experts even with lazy.mode OFF or below AUTO's 4 GiB limit.
+        // Other marked tensors retain the user's lazy.mode and size threshold.
+        is_lazy = lazy.add(tn.str(), cur, no_alloc ? nullptr : &require_weight(tn.str().c_str()), force_expert);
     }
 
     ggml_tensor t_meta = *cur;
@@ -1442,7 +1475,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), lazy.experts_for_file(idx));
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1726,7 +1759,15 @@ bool llama_model_loader::load_all_data(
                 }
             }
 
-            if (check_tensors) {
+            const bool lazy_expert = lazy.is_expert(cur);
+            if (lazy_expert && (!buf_mmap || cur->data != nullptr)) {
+                throw std::runtime_error(format("prefetch expert '%s' must wrap its mmap without copying", ggml_get_name(cur)));
+            }
+            if (check_tensors && lazy_expert) {
+                LLAMA_LOG_WARN("%s: skipping full validation of lazy expert '%s' to avoid loading it eagerly\n",
+                        __func__, ggml_get_name(cur));
+            }
+            if (check_tensors && !lazy_expert) {
                 validation_result.emplace_back(std::async(std::launch::async, [cur, data, n_size] {
                     return std::make_pair(cur, ggml_validate_row_data(cur->type, data, n_size));
                 }));
