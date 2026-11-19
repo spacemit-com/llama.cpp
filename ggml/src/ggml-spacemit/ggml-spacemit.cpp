@@ -571,12 +571,21 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
 
     // Build (or reuse) the opnode list for this graph. The graph uid identifies a
     // stable shape-class, so the list is only rebuilt when the topology changes.
+    // The scheduler gives each split its own uid and runs the splits in turn, so
+    // one list is kept per uid.
     // try_fuse_node folds matching patterns into fused opnodes and consumes their
     // nodes; non-matching nodes are appended as single ops.
-    if (!(graph->uid != 0 && sess->cached_graph.uid == graph->uid)) {
-        sess->cached_graph.uid = graph->uid;
-        sess->cached_graph.nodes.clear();
-        sess->cached_graph.nodes.reserve(graph->n_nodes);
+    std::vector<spacemit_opnode> uncached;
+    std::vector<spacemit_opnode> * cached = nullptr;
+    if (graph->uid != 0) {
+        auto it = sess->cached_graphs.find(graph->uid);
+        if (it != sess->cached_graphs.end()) {
+            cached = &it->second;
+        }
+    }
+    if (cached == nullptr) {
+        std::vector<spacemit_opnode> nodes;
+        nodes.reserve(graph->n_nodes);
         std::unordered_set<ggml_tensor *> emitted;  // nodes already emitted by try_fuse_node
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
@@ -585,22 +594,36 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted)) {
+            if (try_fuse_node(graph, i, nodes, emitted)) {
                 continue;
             }
-            sess->cached_graph.nodes.emplace_back(n);
+            nodes.emplace_back(n);
         }
 
         int n_fused = 0;
-        for (const auto & node : sess->cached_graph.nodes) {
+        for (const auto & node : nodes) {
             if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
                 n_fused++;
             }
         }
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
-                       (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+                       (unsigned long long) graph->uid, nodes.size(), n_fused);
+
+        if (graph->uid == 0) {
+            // graphs without uid are not reused
+            uncached = std::move(nodes);
+            cached   = &uncached;
+        } else {
+            // lists of graphs that are gone are kept until the cache is full
+            if (sess->n_cached_opnodes + nodes.size() > spacemit_session::max_cached_opnodes) {
+                sess->cached_graphs.clear();
+                sess->n_cached_opnodes = 0;
+            }
+            sess->n_cached_opnodes += nodes.size();
+            cached = &(sess->cached_graphs[graph->uid] = std::move(nodes));
+        }
     }
-    const auto & opnodes = sess->cached_graph.nodes;
+    const auto & opnodes = *cached;
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
