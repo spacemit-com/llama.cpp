@@ -38,6 +38,31 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <vector>
+// The transpose kernel uses one shared batch stride and writes dense rows.
+// Equal element counts alone do not guarantee either layout property.
+static bool spacemit_cpy_dense_transpose_supported(const ggml_tensor * op) {
+    const ggml_tensor * src = op->src[0];
+    if (!src || op->type != src->type || !ggml_are_same_shape(op, src) || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16 &&
+        op->type != GGML_TYPE_I32 && op->type != GGML_TYPE_BF16) {
+        return false;
+    }
+    const size_t element_size = ggml_type_size(op->type);
+    if (src->nb[1] != element_size || src->nb[0] == src->nb[1] ||
+        src->nb[0] != src->ne[1] * element_size) {
+        return false;
+    }
+    // Singleton destination axes can have arbitrary strides, even when the
+    // tensor is contiguous. Compare against the physical dense plane size.
+    const size_t plane_size = op->ne[0] * op->ne[1] * element_size;
+    if (src->ne[2] * src->ne[3] > 1 && src->nb[2] != plane_size) {
+        return false;
+    }
+    return src->ne[3] <= 1 || src->nb[3] == src->ne[2] * src->nb[2];
+}
+
 // clang-format off
 #if defined(__riscv)
 
@@ -1510,8 +1535,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     if (ggml_nelements(op) == 0) {
                         return true;
                     }
-                    if (op->type == src0->type && op->nb[0] == src0->nb[1] && src0->nb[0] != src0->nb[1] &&
-                        ggml_nelements(src0) == ggml_nelements(op)) {
+                    if (spacemit_cpy_dense_transpose_supported(op)) {
                         spacemit_kernels::rvv::forward_cpy_with_permute(ctx, op);
                         return true;
                     }
@@ -2437,6 +2461,14 @@ private:
     }
 };
 
+// Apply the exact inverse only to canonical Q8_0. Converted F32 and Q5_0
+// weights keep their own logical readback behavior.
+class tensor_traits_q8_0_ime2 : public tensor_traits<block_q8_0, 32, 32> {
+    void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
+        GGML_ASSERT(unpack_q8_0_32_to_q8_0(t, data, data_size) == 0);
+    }
+};
+
 // Q5_0 weights converted exactly to Q8_0 at load time and run on the Q8_0 IME path
 class tensor_traits_q5_0_as_q8_0 : public tensor_traits<block_q8_0, 32, 32> {
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
@@ -2585,7 +2617,12 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    return &i8_traits<block_q8_0, 32, 32>();
+                    // Dense matrices and contiguous expert weights have packed
+                    // kernels. Other shapes must keep their canonical strides.
+                    if (!cur->view_src && ggml_is_contiguous(cur) &&
+                        (ggml_n_dims(cur) == 2 || ggml_n_dims(cur) == 3)) {
+                        return &traits_instance<ggml::cpu::riscv64_spacemit::tensor_traits_q8_0_ime2>();
+                    }
                 }
 #endif
             }
@@ -2700,6 +2737,9 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             nbytes = remap_block_nbytes(sizeof(block_q6_K), sizeof(block_q8_0) * 8, 32);
             break;
         case GGML_TYPE_Q8_0:
+            if (!ggml_spacemit_get_optimal_repack_type(tensor)) {
+                return ggml_nbytes(tensor);
+            }
             nbytes = remap_block_nbytes(sizeof(block_q8_0), sizeof(block_q8_0), 32);
             break;
         case GGML_TYPE_Q2_K:
@@ -2774,6 +2814,19 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
 const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const ggml_tensor * op) {
     if (op == nullptr) {
         return nullptr;
+    }
+
+    // Views use logical byte offsets. An alias of a packed weight cannot
+    // directly feed either the dense IME or canonical scalar dot path.
+    if ((op->op == GGML_OP_MUL_MAT || op->op == GGML_OP_MUL_MAT_ID) &&
+        op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 && op->src[0]->view_src) {
+        const ggml_tensor * base = op->src[0]->view_src;
+        while (base->view_src) {
+            base = base->view_src;
+        }
+        if (base->extra || ggml_spacemit_get_optimal_repack_type(base)) {
+            return nullptr;
+        }
     }
 
     const auto * common = &ggml::cpu::riscv64_spacemit::rvv_impl;
@@ -2880,8 +2933,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             if (op->src[0] && ggml_nelements(op) == 0) {
                 return common;
             }
-            if (op->src[0] && op->type == op->src[0]->type && op->nb[0] == op->src[0]->nb[1] &&
-                op->src[0]->nb[0] != op->src[0]->nb[1] && ggml_nelements(op->src[0]) == ggml_nelements(op)) {
+            if (spacemit_cpy_dense_transpose_supported(op)) {
                 return common;
             }
             if (op->src[0] && op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
@@ -3055,6 +3107,10 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_MUL_MAT:
             // Generic CPU dot fallback for dense or unsupported quantized
             // layouts which do not have a repacked Spacemit trait.
+            if (op->src[0] && op->src[0]->type == GGML_TYPE_Q8_0 &&
+                (op->src[0]->extra || ggml_spacemit_get_optimal_repack_type(op->src[0]))) {
+                break;
+            }
             if (op->src[0] && op->src[1] && op->src[1]->type == GGML_TYPE_F32 &&
                 ggml_get_type_traits_cpu(op->src[0]->type)->vec_dot != nullptr) {
                 return common;
