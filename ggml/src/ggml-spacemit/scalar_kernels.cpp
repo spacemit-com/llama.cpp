@@ -450,7 +450,7 @@ void forward_flash_attn_ext(ggml::spacemit::context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mask = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    GGML_ASSERT(dst->op_params[3] == GGML_PREC_DEFAULT || dst->op_params[3] == GGML_PREC_F32);
+    GGML_ASSERT(dst->op_params[3] == GGML_PREC_UNDEFINED || dst->op_params[3] == GGML_PREC_F32);
     GGML_ASSERT((q->type == GGML_TYPE_F32 || q->type == GGML_TYPE_F16) &&
                 (k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16) &&
                 (v->type == GGML_TYPE_F32 || v->type == GGML_TYPE_F16));

@@ -5,6 +5,20 @@
 #include <typeindex>
 #include <vector>
 
+#if defined(__OHOS__) && defined(__riscv) && defined(__riscv_zfh)
+// Supply the missing _Float16 RTTI using the Itanium C++ ABI layout.
+extern "C" __attribute__((visibility("default")))
+void * _ZTVN10__cxxabiv123__fundamental_type_infoE[];
+extern "C" __attribute__((weak, visibility("default")))
+const char _ZTSDF16_[] = "DF16_";
+extern "C" __attribute__((weak, visibility("default")))
+void * _ZTIDF16_[] = {
+    // Skip the vtable's offset-to-top and RTTI pointer.
+    &_ZTVN10__cxxabiv123__fundamental_type_infoE[2],
+    const_cast<char *>(_ZTSDF16_),
+};
+#endif
+
 namespace mlir::speir::spekernel {
 
 // FP32 [M,K] -> FP16 [dst_mc,dst_kc,16,8]; offsets and strides are bytes.
