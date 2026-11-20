@@ -14,7 +14,7 @@ Existing build systems, test tools, model runners, and board procedures outside 
 Changes outside `ggml/src/ggml-spacemit/**` and the relevant `tools/**` paths are not categorically forbidden, but are strongly discouraged.
 Before making such a change, show why the task cannot be completed without it, which alternatives were considered, and the specific evidence that rules those alternatives out.
 Name the exact out-of-scope paths, explain why each one is necessary, and include their effects and tests in the delivery record and PR.
-This general exception does not apply to the retired CPU backend; changing its development status requires a separate explicit policy decision.
+This general exception does not apply to the retired CPU backend or permit submitting test code with these implementation PRs. Follow the [test-case policy](../CONTRIBUTING.md#test-case-policy): describe cases and local reproduction in the PR, keep test edits local, and use the separate SpacemiT suite for permanent backend-specific cases once it is available.
 
 ## Rule ownership
 
@@ -23,7 +23,7 @@ Use [CONTRIBUTING.md](../CONTRIBUTING.md) for contribution policy and coding/com
 ## Use the documents
 
 1. Read [development.md](development.md) before editing and map the change to the source responsibilities, affected execution paths, and model or feature behavior.
-2. Use [acceptance.md](acceptance.md) to select evidence for that impact, then record the plan in [templates/validation.md](templates/validation.md).
+2. Use [acceptance.md](acceptance.md) to distinguish execution-path changes from mechanical or build-only changes, select the required evidence for that impact, then record the plan in [templates/validation.md](templates/validation.md).
 3. Run the selected checks with existing tools and preserve each attempt's identity, raw output, and actual outcome in the validation record.
 4. Use [delivery.md](delivery.md) and [templates/pull-request.md](templates/pull-request.md) to derive review summaries from those records, checking every claim against its evidence.
 
@@ -38,6 +38,7 @@ Use the planning, delegation, and review capabilities of the agent tool availabl
 - Identify the exact source, binary, library, model, input, and runtime used for each claim.
 - Prefer an independent reference and preserve the baseline failure for a bug fix.
 - Report skipped, unavailable, contaminated, inconclusive, and known failing cases explicitly.
+- A missing required check remains a merge blocker unless a maintainer explicitly accepts the gap; a result status alone never grants an exception.
 - Keep raw commands and results in `.agents/workspace/`; put conclusions and reviewer-accessible links in the PR.
 
 The harness is guidance, not an automated acceptance gate. A green command or an agent report does not replace a human review of the code and evidence.

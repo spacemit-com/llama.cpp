@@ -18,27 +18,28 @@ Use reviewer-accessible links, not private workspace paths. -->
 - Approach and key tradeoff: <numerics/layout/lifetime/dispatch/fallback as applicable>
 - Retired ggml/src/ggml-cpu/spacemit backend development/optimization: none
 - Supporting harness changes or external dependencies: <details or none>
+- Impact classification: <execution-path / mechanical / documentation / build-only; justification and any runtime effects of build changes>
+- Submitted test-code changes: none; temporary local cases are excluded from the commit and PR diff
 
 ## Validation
 
 - Base / candidate: <commit IDs; uncommitted patch identity if applicable>
 - Environment / artifacts: <hardware, compiler, build flags, runtime, binary/library identities>
-- Regression check: <case/command link; observed baseline failure and candidate result>
-- End-to-end model correctness: <relevant model/input, expected behavior, candidate result; or NOT RUN with reason>
-- Model-level performance: <baseline/candidate comparison for the relevant model path; or NOT RUN with reason>
+- Case construction and reproduction: <operation/feature, inputs, shape/dtype/layout boundaries, reference or expected behavior, command and any minimal local test adaptation; no committed test sources>
+- Regression check: <observed baseline failure and candidate result; distinguish proposed from executed cases and identify any local test patch separately>
+- Required checks and exclusions: <map to actual impact; justify additional/optional checks and N/A>
+- Path execution and end-to-end model correctness: <required for execution-path changes; dispatch proof, relevant model/input, expected behavior and result; NOT RUN with reason if missing, or justified N/A>
+- Model-level performance: <required when execution cost may change or a benefit is claimed; comparable baseline/candidate result, NOT RUN with reason, or justified N/A>
 - Detailed validation record and logs: <reviewer-accessible links with check/run labels for each claim>
 - Evidence applicability to the final candidate: <rerun checks, justified carried-forward evidence, and remaining gaps>
 
-| Acceptance check / selected cases | Status | Observed result and evidence |
-| --- | --- | --- |
-| <build / execution / correctness; separate rows> | <PASS / FAIL / NOT RUN / N/A> | <run labels, counts, errors/tolerances/reference, raw evidence link; failure/unverified reason, or reason if NOT RUN or N/A> |
+| Acceptance check / selected cases | Applicability | Status | Observed result and evidence |
+| --- | --- | --- | --- |
+| <build / execution / correctness; separate rows> | <required / additional / not applicable; reason> | <PASS / FAIL / NOT RUN / N/A> | <run labels, counts, errors/tolerances/reference, raw evidence link; failure/unverified reason, or reason if NOT RUN or N/A> |
 
 ## Performance
 
-For source changes under `ggml/src/ggml-spacemit/**`, complete a model-level
-comparison even when no improvement is claimed. Use NOT RUN with a reason when
-the relevant model or environment is unavailable. For documentation, build-only,
-or tools-only changes, use N/A with a reason when no model comparison applies.
+Complete a comparable model-level performance check when execution cost may change or a performance benefit is claimed. Use `NOT RUN` when a required comparison cannot run, and `N/A` with an impact-based reason when none applies. An unmeasured improvement must not be claimed.
 
 - Case identity: <hardware; input/model hash + quantization; shape/tokens/context; backend; threads/workers/flags>
 - Protocol: <artifact IDs; run order; warmups; repeats; independent processes; frequency/affinity/load observations>
@@ -55,6 +56,8 @@ or tools-only changes, use N/A with a reason when no model comparison applies.
 - Untested paths / remaining risks: <details and impact>
 - Known failures: <baseline / new / unclassified; evidence links>
 - Evidence unavailable to reviewers: <what and how it limits the conclusion, or none>
+- Unresolved required checks and merge disposition: <none, or blocked pending evidence / explicit maintainer exception; NOT RUN alone does not allow merge>
+- Maintainer exception, if any: <decision link, covered checks/revision, accepted risk, follow-up owner/action; otherwise pending, not self-approved>
 
 ## AI assistance and contributor responsibility
 

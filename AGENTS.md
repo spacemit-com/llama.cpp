@@ -22,7 +22,8 @@ The contributor and agent guidance below applies to this SpacemiT fork.
 
 Every submitted change is a long-term maintenance commitment. The contributor is responsible for understanding the code, explaining the design and evidence to reviewers, and addressing issues after merge.
 
-Keep changes as small and simple as the task allows. New features must begin with an issue and design discussion. Bug fixes must include a reproducible regression test; see [CONTRIBUTING.md](CONTRIBUTING.md) for the contribution requirements.
+Keep changes as small and simple as the task allows. New features must begin with an issue and design discussion. Bug fixes need reproducible regression evidence in the PR, not committed test sources; follow the [test-case policy](CONTRIBUTING.md#test-case-policy).
+Keep temporary test cases and reproducers local and out of the submitted diff. Select validation by actual impact, and leave exceptions for missing required evidence to the maintainer under [the acceptance rules](.agents/acceptance.md#required-evidence-and-merge-decisions).
 
 ## AI Assistance
 

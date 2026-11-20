@@ -38,17 +38,15 @@ and logs. If the baseline was not executed, say so; do not infer a before/after
 result from a plausible explanation. Reuse an applicable existing check when it
 can expose the regression. Identify any missing regression coverage.
 
+Follow the [test-case policy](../CONTRIBUTING.md#test-case-policy): put case construction, inputs, boundaries, reference or expected behavior, commands, and any local test adaptation in the PR description. Keep added or modified test code out of the submitted diff, including temporary changes to existing tests. Identify local reproducer/test patches separately from production code, and distinguish proposed cases from executed results. Permanent backend-specific cases belong in the separate SpacemiT suite once it is available.
+
 For each applicable acceptance requirement, report PASS, FAIL, or NOT RUN;
 use N/A only with a reason. Separate build success, execution success, numerical
 correctness, and performance. Record actual executed, failed, and skipped cases.
 An empty selection, skipped case, or successful process exit alone is not a
 numerical pass. Identify the reference, tolerance, and observed error where used.
 
-For source changes under `ggml/src/ggml-spacemit/**`, include end-to-end
-correctness results for the relevant model or models and model-level performance
-results against the baseline. Operator or kernel results are supporting evidence
-and do not replace these model checks. If a model check cannot run, record `NOT
-RUN`, the reason, and the limit on the conclusion.
+State the impact classification and required checks. Execution-path changes need proof that the intended path ran and correctness results for affected models or media. Include comparable baseline/candidate model performance when execution cost may change or a benefit is claimed. Mechanical and build-only changes need checks matched to their impact, with a reason for any `N/A` model check. Missing required model or board evidence is `NOT RUN` and remains a merge blocker pending evidence or an explicit maintainer exception.
 
 Record the base and candidate commits, including any uncommitted patch identity,
 compiler/build configuration, runtime dependencies, and tested binary/library
@@ -56,12 +54,15 @@ identities. Name the actual hardware and backend path exercised. Distinguish
 source inspection and host checks from hardware execution. Follow the validation
 record for commands, inputs, raw outputs, and the limits of each result.
 
+Separate evidence status from merge disposition using [the acceptance decision rules](acceptance.md#required-evidence-and-merge-decisions). For each unresolved required check, report the reason, affected behavior, substitute evidence and limits, residual risk, and follow-up. Link any explicit maintainer exception and its covered revision/checks; otherwise state that the gap remains unresolved. Neither documenting a gap nor drafting a report grants an exception, and an exception cannot justify an unmeasured performance claim.
+
 ## Derive delivery summaries from evidence
 
 Prepare validation summaries and PR text from the recorded runs, using the existing templates. This applies equally to manual summaries, agent drafting, and any report-generation tool; no new runner or report command is required by this guide.
 
 - Map each correctness, coverage, or performance claim to a recorded check, run label, and raw evidence location. Include the source revision and artifact identity to which the claim applies, and reconcile the final changed responsibilities with the development-map impact note.
 - Preserve result status, execution counts, failures, exclusions, retries, regressions, and limitations. Required checks that lack evidence remain visible. Do not turn a successful report-generation command, a blank field, or an expected result into a validation pass.
+- Keep required/optional applicability and merge disposition separate from result status; carry forward only maintainer exceptions that still cover the candidate and affected checks.
 - Compute performance summaries only from identified raw samples under the comparison rules below. Preserve units, sample counts, aggregation and delta definitions, and exclusion reasons. If measurements cannot support a comparison, state that it is inconclusive.
 - Separate observed facts from interpretation. Design rationale, necessity of scope, reference independence, and the meaning of results require contributor review; template completion or an agent assertion does not prove them.
 - Before delivery, check that the evidence still applies to the final candidate. Update summaries after changed results, replace stale claims, and identify carried-forward evidence and its justification. Keep local raw records in `.agents/workspace/`; provide reviewer-accessible copies or summaries with explicit verification limits, as described below.

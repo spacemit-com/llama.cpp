@@ -14,7 +14,7 @@ The legacy `ggml/src/ggml-cpu/spacemit/**` backend is retired. Do not add backen
 
 - Search existing issues and pull requests to avoid duplicate work.
 - New features must begin with an issue describing the problem and proposed direction. Discuss the scope with maintainers before implementing the feature.
-- Bug fixes must identify a reproducible failure and include a regression test.
+- Bug fixes must identify a reproducible failure and provide regression evidence in the PR, following the test-case policy below.
 - Keep each pull request focused on one feature or fix. Do not combine unrelated cleanup with the required change.
 - Follow the harness principles for [choosing the approach before implementation](.agents/development.md#before-implementation-choose-the-approach) and [enforcing contracts during implementation](.agents/development.md#during-implementation-enforce-the-contracts). Apply them to the task and its affected paths.
 - New CLI or public API additions need a clear justification for why existing mechanisms are insufficient.
@@ -23,9 +23,19 @@ The legacy `ggml/src/ggml-cpu/spacemit/**` backend is retired. Do not add backen
 
 - Select build and test requirements from the affected paths and behavior using [the acceptance matrix](.agents/acceptance.md). Full repository CI and unrelated backends are not required for every change.
 - Run and report the relevant build, correctness, dispatch, platform, and performance checks. A performance claim requires comparable measurements and artifact identity.
-- For source changes under `ggml/src/ggml-spacemit/**`, run end-to-end correctness and model-level performance checks on the relevant model or models that exercise the changed path. Operator or kernel tests alone are insufficient; record `NOT RUN` with the reason if the model check is unavailable.
+- For execution-path changes, prove that the intended backend and dispatch path ran and validate the affected model or media behavior. Require comparable performance measurements when execution cost may change or a performance benefit is claimed. Purely mechanical or build-only changes need checks that cover their actual impact, with a reason when model checks are not applicable.
 - Record unavailable, skipped, failing, or inconclusive validation explicitly. Do not present missing evidence as a pass.
-- Bug-fix regression tests must demonstrate failure before the change and pass after it.
+- Bug-fix regression evidence must demonstrate failure before the change and pass after it; state any missing reproduction explicitly.
+- A missing or inconclusive required check blocks merge until evidence is supplied or a maintainer explicitly accepts the gap. `NOT RUN` records a result status, not permission to merge. Record the maintainer's decision and its scope as described in [acceptance.md](.agents/acceptance.md#required-evidence-and-merge-decisions).
+
+### Test-case policy
+
+For contributions covered by this harness, describe the necessary test cases and local reproduction in the PR; do not submit added or modified test code with the implementation change. This includes the existing `tests/**` tree and test code under `tools/**`.
+Reuse existing test binaries and selected cases first. If coverage is missing, use a minimal local reproducer or temporarily add a case to an existing test locally, keeping those edits out of the commit and PR diff.
+State the operation or feature, inputs and relevant shape/dtype/layout boundaries, independent reference or expected behavior, command or local test adaptation, and baseline/candidate results. A proposed case is not evidence that it ran.
+Keep local reproducers and test patches in ignored `.agents/workspace/`; identify the test patch separately from the production patch in the validation record. The PR must contain enough case and command detail to reproduce the result without private files, but does not require committed test sources.
+Permanent SpacemiT-specific cases belong in the separate SpacemiT test suite once it is available and its contribution instructions are established. That future suite is not a current dependency.
+Shared-contract test changes may be proposed separately to maintainers; this does not permit adding backend-specific cases to the shared test tree in these PRs.
 
 ## AI assistance and contributor responsibility
 

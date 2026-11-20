@@ -12,7 +12,7 @@ Reading dependencies and running existing build or test facilities elsewhere doe
 Changes elsewhere in the repository are possible but strongly discouraged.
 Before making one, establish with code-path evidence why the task cannot be completed without it, identify alternatives considered and why they fail, and name the exact necessary paths.
 Include the effect of each such path in the planned diff, validation, and PR explanation; do not silently broaden the change.
-This general exception excludes `ggml/src/ggml-cpu/spacemit/**`, which is a retired backend and must not receive new backend development or optimization.
+This general exception excludes `ggml/src/ggml-cpu/spacemit/**`, which is a retired backend and must not receive new backend development or optimization. It also does not permit submitting test-code changes; follow the [local test-case policy](../CONTRIBUTING.md#test-case-policy).
 
 ## Before implementation: choose the approach
 
@@ -61,7 +61,7 @@ Before editing, the agent must understand and be able to explain what will chang
 - Identify the changed responsibility and concrete entry points or symbols, with links to the relevant source-map rows and code.
 - Trace callers, dispatch, data representation, resource ownership, and downstream consumers as relevant. Include affected behavior in files that do not need editing.
 - Name the model or feature paths, inputs, and hardware conditions that can exercise the change. Explain which nearby paths should remain unaffected and why; treat unresolved reachability as a coverage gap.
-- Connect each affected behavior or contract to the selected checks in [acceptance.md](acceptance.md), including required model correctness and performance checks. Explain exclusions and unavailable coverage.
+- Classify the change as execution-path, mechanical, documentation, or build-only based on its effects. Connect each affected behavior or contract to the required checks in [acceptance.md](acceptance.md), including model correctness and performance where applicable. Explain exclusions and unavailable coverage.
 
 For example, a repack change can affect tensor upload, traits, packed kernels, readback, and model output even when only `repack.cpp` is edited. Follow those dependencies before deciding the verification scope.
 Keep this understanding current while developing. If the call path or impact expands, update the note and verification selection before relying on earlier results. At handoff, reconcile the final diff with the map and evidence; explain every changed responsibility and every remaining coverage gap.
@@ -83,7 +83,7 @@ Apply the following principles to the code being changed. Implement concrete saf
 
 - **Make interfaces hard to misuse.** Express preconditions, resource ownership, and lifecycle through existing interfaces, types, support predicates, and boundary checks where practical. Keep shared rules such as workspace sizing and buffer slicing consistent rather than duplicating assumptions at each caller. Introduce a helper or interface change only when it is needed for the task.
 - **Respect module boundaries.** Place behavior in the layer responsible for it and connect layers through their established interfaces. Keep model or media business decisions out of low-level kernels, and do not bypass dispatch, allocation, or synchronization contracts. If a boundary must change, explain its necessity and update the development-map impact and affected validation.
-- **Turn recurring mistakes into checks.** When fixing a reproducible defect or repeated misuse, use a focused regression test, support-condition check, type/interface constraint, or existing static check that can detect it. Prefer existing test and build facilities. A comment or a new prose rule does not replace a required regression test or validation; if a constraint cannot be checked mechanically, explain its reasoning and review evidence in the development record.
+- **Turn recurring mistakes into checks.** When fixing a reproducible defect or repeated misuse, use an existing check, focused local reproducer, support-condition check, or type/interface constraint that can detect it. Describe regression cases and execution evidence in the PR; keep local test adaptations out of the submitted diff under the test-case policy. A comment or a new prose rule does not replace required validation; if a constraint cannot be checked mechanically, explain its reasoning and review evidence in the development record.
 - **Make failures actionable.** At the appropriate validation or error boundary, identify the violated condition and enough actual/expected information to locate the cause, such as dtype, shape, or required/available workspace. Preserve a truthful error or an explicitly supported fallback. Do not suppress a failing check, relax a criterion merely to pass, or fabricate success. Keep diagnostics out of the normal compute hot path and performance timing.
 
 ## Keep the implementation focused
@@ -125,13 +125,15 @@ Use [templates/validation.md](templates/validation.md) to record the baseline, i
 Select checks that can expose the failure or validate the intended behavior rather than merely repeat the implementation.
 Follow the [SpacemiT build guide](../docs/build-riscv64-spacemit.md) and record the actual compiler, CMake options, and prebuilt spine-runtime package used.
 The standalone backend uses `GGML_SPACEMIT=ON` and `SPERT_DIR`; the legacy CPU SpacemiT path is not an interchangeable build target.
-For every source change under `ggml/src/ggml-spacemit/**`, select the relevant model or models before editing and plan both end-to-end correctness and model-level performance checks. Operator and kernel tests supplement these model runs; they do not replace them.
+For execution-path changes, select relevant models or media inputs before editing, plan proof that the intended path runs, and validate affected end-to-end behavior. Plan comparable baseline/candidate performance when execution cost may change or a performance benefit is claimed. Operator and kernel tests supplement the required model runs. For mechanical or build-only changes, justify the narrower checks by showing what remains unchanged; build changes that affect execution still need the corresponding runtime checks.
 Use the scope-matched facilities in [acceptance.md](acceptance.md): backend operators and numerical cases for `ggml-spacemit`, mtmd tests and media smoke for `tools/mtmd`, SMT build and pipeline checks for `tools/smt-mtmd`, and server component/API tests for media-related `tools/server` changes.
 Existing `test-backend-ops`, `llama-cli`, `llama-bench`, `llama-server`, mtmd tests, server pytest cases, and SpacemiT build workflows may be used as evidence.
+When an existing test does not cover the case, document its inputs, reference, expected behavior, and the minimal local adaptation or reproducer needed. Keep such test sources or patches local in `.agents/workspace/`, identify them separately in the record, and exclude them from the commit and PR diff. Use the future separate SpacemiT suite for permanent backend cases once it is available.
 Verify the intended backend, dispatch path, binaries, and loaded libraries before interpreting results.
 Choose architecture coverage from the changed paths, and state explicitly which affected hardware or fallback paths remain untested.
 For performance work, define the workload and comparison conditions in advance and validate correctness before using timing results as acceptance evidence.
 A successful build, an emulator run, and a run on target hardware provide different evidence and must be reported separately.
+If a required check cannot be completed, preserve the gap and follow [the maintainer exception process](acceptance.md#required-evidence-and-merge-decisions); recording `NOT RUN` does not clear the merge blocker.
 
 ## Prepare the result for review
 

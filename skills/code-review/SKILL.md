@@ -50,6 +50,8 @@ These are the patterns that get PRs closed without a full review. Check them fir
 - Is it a duplicate of existing/in-flight work? Suggest `gh search prs` / `gh search issues` for the feature. Many closed PRs were duplicates of something already queued.
 - Is it self-contained and single-purpose? Multiple unrelated changes/optimizations bundled together get sent back to be split. Flag unrelated changes and suggest separate PRs.
 - Does the diff stay within `ggml/src/ggml-spacemit/**` and the relevant maintained `tools/**` paths? Backend development belongs in `ggml-spacemit`; the retired `ggml/src/ggml-cpu/spacemit/**` backend must not receive new features or optimizations. For every other changed path, require the necessity evidence, rejected alternatives, minimum necessary diff, and path-specific validation defined in `CONTRIBUTING.md`. CPU-first implementation and unrelated backend coverage are not requirements for this fork.
+- Does a harness-scoped implementation PR contain added or modified test code? Apply the [test-case policy](../../CONTRIBUTING.md#test-case-policy): keep test adaptations local and require case construction, reproduction commands, and results in the PR. Recommendations in any area checklist below do not authorize submitting test sources with these changes.
+- Are required checks proportional to the actual impact, and are evidence status and merge disposition separate? Apply [the acceptance decision rules](../../.agents/acceptance.md#required-evidence-and-merge-decisions). Missing required board/model/path evidence remains blocking without an explicit maintainer exception; do not treat `NOT RUN` as self-approval or demand model benchmarks for justified mechanical edits.
 - Does it add a new `ggml_type` or persisted quantization format? Require a design and scope justification, a reproducible sample, independent numerical and representation checks, relevant model-quality comparisons, and target-platform performance evidence. Choose additional measures such as perplexity or KL divergence according to the claim and affected models. Distinguish a public format change from backend-private repacking; do not require unrelated CPU implementation or performance results.
 - Is it invasive - new subsystem, core-API reshaping, changes to shared graph/sampler code that other models don't need? Flag it and suggest a discussion with maintainers before investing further.
 - Does it add a model-specific CLI argument to any binary (`common/arg.cpp`, tools, examples) or conversion script (`convert_*.py`)? Not allowed - model-specific behavior must come from GGUF metadata or be detected automatically, not from a per-model flag.
@@ -110,8 +112,8 @@ See the `add-new-model` skill and `docs/development/HOWTO-add-model.md` for the 
 - For CUDA/HIP changes, use `ggml_cuda_get_physical_warp_size()` and the relevant portable helpers rather than assuming a warp size. For SpacemiT changes, validate RVV vector length, IME capability, layout, alignment, and worker/resource assumptions against the selected path; do not apply CUDA-specific helpers to this backend.
 - Strip leftover debug/profiling/logging code before review.
 - If a change alters advertised operation support, check whether the relevant `docs/ops.md` or `docs/ops/*.csv` entries need updating. Explain any necessary documentation paths outside the primary scope; a kernel-internal change does not automatically require those edits.
-- New or changed operators need relevant `test-backend-ops` cases or independent numerical checks, chosen using `.agents/acceptance.md`. Verify that the reference does not dispatch to the implementation under test and that the intended backend path actually executed. Do not substitute a fixed backend count for an independent reference.
-- Every source change under `ggml/src/ggml-spacemit/**` also needs end-to-end correctness and model-level performance validation on the relevant models. Kernel checks alone are insufficient. Record unavailable model or hardware checks as `NOT RUN`, with the reason and limits on the conclusion.
+- New or changed operators need relevant existing `test-backend-ops` cases, local adaptations, or independent numerical checks, chosen using `.agents/acceptance.md`. Describe missing cases and local reproduction in the PR without submitting test code. Verify that the reference does not dispatch to the implementation under test and that the intended backend path actually executed. Do not substitute a fixed backend count for an independent reference.
+- Execution-path changes need proof of actual dispatch and correctness on the affected models; kernel checks alone do not replace that model evidence. Require comparable model-level performance when execution cost may change or a benefit is claimed. Mechanical and build-only changes need impact-matched checks and justified exclusions; build changes that alter execution also need runtime validation. Apply the maintainer exception rules to unavailable required checks.
 - New kernels are expected to come with concrete perf data (throughput across realistic tensor shapes), not just correctness.
 - For graph or fusion changes, inspect the existing graph optimization hooks, opnode ordering, allocation dependencies, and buffer lifetimes. Flag bypasses of those contracts and require evidence that fused and unfused behavior agree; do not reject the backend's established optimization mechanism solely because it changes a graph.
 - Apply the target repository's actual required checks and maintainer approvals; do not invent a fixed approval count from upstream conventions.
@@ -229,12 +231,13 @@ Use the affected mtmd, SMT, and server-media rows in `.agents/acceptance.md`. Th
 
 ## Tests
 
-- Follow the existing testing patterns. Do not add a new testing system. Before adding a new file under `tests/*`, think carefully about whether the tests can go into an existing file first.
-- In most cases, new test cases belong in an existing test file - check for one covering the same component before adding anything new.
-- Only add tests that bring meaningful results. Too-trivial tests just bloat the suite and CI.
+- For harness-scoped contributions, require PR descriptions of the case, inputs/boundaries, independent reference or expected behavior, command or local adaptation, and observed baseline/candidate results. A proposed case must not be presented as an executed check.
+- Reuse existing test binaries/cases first. Missing coverage may use a minimal local reproducer or temporary edits to an existing test, but no added or modified test code belongs in the implementation PR. Verify the staged and final PR diff, and keep local test patches separately identified in ignored `.agents/workspace/`.
+- Permanent SpacemiT-specific cases belong in the separate SpacemiT test suite once available; do not make that future suite a current dependency or add a new testing system. Shared-contract test changes may be proposed separately to maintainers, not used to admit backend-specific cases into shared tests.
+- Select meaningful checks that can expose the changed contract, not trivial checks that repeat the implementation.
 - Keep correctness tests independent of fragile wall-clock thresholds and arbitrary sleeps. This does not remove the required performance measurements: run those separately using the baseline/candidate protocol in `.agents/acceptance.md`.
 - Think twice about tests that significantly increase CI run time (expensive computation, large inputs, or long sleep/wait delays) or download large amounts of data from the internet (big models, datasets). Flag them and ask whether a smaller model/input or an existing fixture would do.
-- Server: small tests of internal components (helpers, `server_tokens`, queues, format converters, ...) belong in `tests/test-server-component.cpp`. The end-to-end pytest suite in `tools/server/tests` is costly in CI time; only add to it when the test requires end-to-end behavior with a real model.
+- Server: reuse relevant cases in `tests/test-server-component.cpp` for helpers, tokens, queues, and format converters, or select `tools/server/tests` cases when real-model API behavior is involved. If a case is missing, explain its local construction in the PR and keep any temporary test edits out of the submitted diff.
 
 ## General (always)
 
@@ -258,8 +261,8 @@ Enforce the `CONTRIBUTING.md` coding and naming guidelines on every changed line
 
 Group findings by severity so the user knows what actually blocks a merge:
 
-1. **Blocking** - quick-reject/scope issues and correctness bugs; these can sink the PR regardless of everything else.
-2. **Will slow the review** - convention/naming/comment violations, missing tests/docs/perf data, missing API justification or example.
+1. **Blocking** - scope violations, demonstrated correctness/safety defects, and unsatisfied required evidence without an explicit maintainer exception. Distinguish a code defect from a validation gap and name the required check.
+2. **Will slow the review** - convention/naming/comment issues, unclear case or evidence descriptions, and additional coverage suggestions outside the justified required scope.
 3. **Nits** - minor style, optional cleanups.
 
 For each finding, point to the file and line and explain what should change and why. Keep review-only tasks read-only unless the user requests fixes. When requested, implement fixes within the agreed scope and help draft template-compliant PR text, commit messages, or private review-response drafts. The contributor must verify and own the code and claims; drafting does not authorize publication or automatic review replies.
