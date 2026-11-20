@@ -29,7 +29,7 @@ The legacy `ggml/src/ggml-cpu/spacemit/**` backend is retired. Do not add backen
 
 ## AI assistance and contributor responsibility
 
-AI may assist with implementation, analysis, testing, evidence preparation, and PR drafting. Contributors must fully understand the submitted code, be able to debug it independently, explain it to reviewers without AI assistance, and take responsibility for its maintenance.
+Load [AGENTS.md](AGENTS.md) into the agent's context before AI-assisted work. AI may assist with implementation, analysis, testing, evidence preparation, and PR drafting. Contributors must fully understand the submitted code, be able to debug it independently, explain it to reviewers without AI assistance, and take responsibility for its maintenance.
 
 AI may draft a PR description when it follows the required [GitHub PR format](.github/pull_request_template.md) and the detailed [SpacemiT PR template](.agents/templates/pull-request.md). The contributor must review the text and verify every factual claim before submission. Disclose meaningful AI assistance in the PR template.
 
@@ -39,6 +39,7 @@ AI must not automatically submit replies to code review comments. Contributors o
 
 - Explain the problem and trigger, the minimum necessary change, the affected paths, the selected validation, and any remaining limitations.
 - Link reviewer-accessible evidence using the validation record and PR templates in `.agents/templates/`.
+- Before pushing, run a local review using [the code-review skill](skills/code-review/SKILL.md) and address its findings.
 - Respond to review feedback, update the implementation or evidence when needed, and remain available to maintain the contribution after merge.
 - Maintainers decide whether a change fits the architecture and has sufficient evidence; required CI checks and review approvals must pass before merge.
 

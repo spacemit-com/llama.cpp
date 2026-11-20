@@ -273,6 +273,68 @@ static gemm_path_f16 resolve_gemm_f16() {
     return o;
 }
 
+#ifdef GGML_SPACEMIT_REPACK_PARALLEL
+// spert backend for the load-time repack: the X100 cores on K3, the AI cores on K1; nullptr elsewhere (serial repack)
+static const char * repack_parallel_backend() {
+    switch ((spine_core_arch_id) (uint16_t) spert::backend_info().core_arch_id) {
+        case spine_core_arch_id::core_arch_a100:
+            return "spacemit-k3-x100";
+        case spine_core_arch_id::core_arch_a60:
+            return "spacemit-k1";
+        default:
+            return nullptr;
+    }
+}
+
+// Repack a 3-D (MoE) weight with one spert tile per expert. With ne[1] % 32 == 0 no 32-row block straddles two experts, so the bytes equal one serial call.
+// dst_slab must be the expert stride of the kernels (forward_mul_mat_id), not allocation / ne[2]: Q4_1/Q4_K allocate more than the layout uses.
+// Returns false and writes nothing if the tensor does not fit or no backend is available; the caller then repacks serially.
+template <typename Fn>
+static bool repack_experts_parallel(ggml_tensor * t, const void * data, size_t data_size, size_t dst_slab, const Fn & fn,
+                                    int & ret) {
+    const int64_t n_expert = t->ne[2] * t->ne[3];
+    if (n_expert < 2 || t->ne[1] % 32 != 0 || t->nb[3] != t->ne[2] * t->nb[2] ||
+        data_size != (size_t) n_expert * t->nb[2] || (size_t) n_expert * dst_slab > ggml_spacemit_nbytes(nullptr, t)) {
+        return false;
+    }
+
+    static const char * const backend_name = repack_parallel_backend();
+    if (backend_name == nullptr) {
+        return false;
+    }
+    spert::Stream stream(spert::backend(backend_name));
+    if (!stream.valid()) {
+        return false;
+    }
+
+    const size_t     src_slab = t->nb[2];
+    std::vector<int> rets((size_t) n_expert, 0);
+    int *            rets_ptr = rets.data();
+    const Fn *       fn_ptr   = &fn;
+
+    spert::Future fut = stream.launch(spert::Grid((uint32_t) n_expert), [=](spert::Context * ctx) {
+        const int64_t e    = ctx->program_id(0);
+        ggml_tensor   view = *t;
+        view.ne[2]         = 1;
+        view.ne[3]         = 1;
+        view.data          = (char *) t->data + e * dst_slab;
+        rets_ptr[e]        = (*fn_ptr)(&view, (const char *) data + e * src_slab, src_slab);
+    });
+    if (!fut.valid() || fut.sync() != spert::Status::Ok) {
+        return false;  // the serial path rewrites the whole tensor from the source
+    }
+
+    ret = 0;
+    for (int r : rets) {
+        if (r != 0) {
+            ret = r;
+            break;
+        }
+    }
+    return true;
+}
+#endif
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS> class tensor_traits : public ggml::spacemit::tensor_traits_base {
     const gemm_path_i8 dense_ops_;
     const gemm_path_i8 moe_ops_;
@@ -1197,6 +1259,20 @@ private:
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: repack tensor %s with %s_%dx%d\n", __func__, t->name, ggml_type_name(t->type),
                        (int) NB_COLS, (int) INTER_SIZE);
+#ifdef GGML_SPACEMIT_REPACK_PARALLEL
+        // the expert stride the kernels use: ne01 * b_k_blks * repacked block size (forward_mul_mat_id)
+        const size_t dst_slab = (size_t) t->ne[1] * (size_t) ((t->ne[0] + INTER_SIZE - 1) / INTER_SIZE) *
+                                get_repacked_block_type_size<BLOC_TYPE, INTER_SIZE, NB_COLS>();
+        int ret = 0;
+        if (repack_experts_parallel(
+                t, data, data_size, dst_slab,
+                [](ggml_tensor * v, const void * d, size_t n) {
+                    return ggml::cpu::riscv64_spacemit::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(v, d, n);
+                },
+                ret)) {
+            return ret;
+        }
+#endif
         return ggml::cpu::riscv64_spacemit::repack<BLOC_TYPE, INTER_SIZE, NB_COLS>(t, data, data_size);
     }
 };
@@ -1624,7 +1700,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
         const int64_t DK = nek0;
         const int64_t DV = nev0;
 
-        const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_DEFAULT);
+        const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_UNDEFINED);
         const bool supported_types = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
         const bool supported_shape = (DK > 0 && DK <= 256 && DV > 0 && DV <= 256);
         const bool supported_vlen  = (__riscv_vlenb() == 128);
@@ -1938,7 +2014,7 @@ private:
             }
         }
 
-        // Split M across workers; accumulate K chunks directly into F32 output.
+        // Split M/N across workers; accumulate K chunks directly into F32 output.
         if (K < Q4_0_F16_SPLIT_K_MIN && M > Q4_0_F16_SPLIT_N_M_MAX && K % KB == 0) {
             const size_t bytes_per_k  = (m_tile + n_tile) * sizeof(_Float16);
             const size_t kb           = std::min(K, (tcm_size / bytes_per_k) & ~size_t{ 31 });
@@ -1946,9 +2022,18 @@ private:
             const size_t a_budget     = tcm_size > b_tile_bytes ? tcm_size - b_tile_bytes : 0;
             const size_t m_fit        = kb >= 32 ? (a_budget / (kb * sizeof(_Float16))) & ~size_t{ 15 } : 0;
             if (m_fit >= m_tile) {
+                // Split N only when each M group fits one block, avoiding extra M passes.
+                const size_t n_parts = nth >= 4 && nth % 2 == 0 && nt_count >= 2 &&
+                                               GGML_PAD((M + nth / 2 - 1) / (nth / 2), m_tile) <= m_fit
+                                           ? 2 : 1;
+                const size_t m_parts = (size_t) nth / n_parts;
+                const size_t m_group = (size_t) ith / n_parts;
+                const size_t n_group = (size_t) ith % n_parts;
+                const size_t nt_begin = nt_count * n_group / n_parts;
+                const size_t nt_end   = nt_count * (n_group + 1) / n_parts;
                 size_t mb_count = (M + m_fit - 1) / m_fit;
-                if (mb_count < (size_t) nth) {
-                    mb_count = (size_t) nth;
+                if (mb_count < m_parts) {
+                    mb_count = m_parts;
                 }
                 size_t m_block = 0;
                 do {
@@ -1963,7 +2048,7 @@ private:
                     auto * a_tile = reinterpret_cast<_Float16 *>(tcm_buffer);
                     auto * b_tile = a_tile + m_block * kb;
                     const size_t b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
-                    for (size_t mb_i = (size_t) ith; mb_i < mb_count; mb_i += (size_t) nth) {
+                    for (size_t mb_i = m_group; mb_i < mb_count; mb_i += m_parts) {
                         const size_t mb      = mb_i * m_block;
                         const size_t m_count = std::min(m_block, M - mb);
                         const size_t m_tiles = (m_count + m_tile - 1) / m_tile;
@@ -1980,7 +2065,7 @@ private:
                                           static_cast<int64_t>(kk),
                                           1, static_cast<int64_t>(kk / 8));
                             }
-                            for (size_t nt = 0; nt < nt_count; ++nt) {
+                            for (size_t nt = nt_begin; nt < nt_end; ++nt) {
                                 const size_t n0 = nt * n_tile;
                                 const size_t nc = std::min(n_tile, N - n0);
                                 q41_func((void *) (b_src + nt * b_row_stride + (k0 / KB) * KB_BYTES),
@@ -2742,7 +2827,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             if (op->src[0] && op->src[1] && op->src[2] && !op->src[5] &&
-                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
+                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_UNDEFINED) &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                 (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
@@ -2948,7 +3033,8 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             break;
         case GGML_OP_GATED_DELTA_NET:
-            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2) {
+            if (ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 ||
+                ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime1) {
                 return common;
             }
             break;
@@ -2976,7 +3062,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             if (op->src[0] && op->src[1] && op->src[2] && !op->src[5] &&
-                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_DEFAULT) &&
+                (op->op_params[3] == GGML_PREC_F32 || op->op_params[3] == GGML_PREC_UNDEFINED) &&
                 (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
                 (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
                 (op->src[2]->type == GGML_TYPE_F32 || op->src[2]->type == GGML_TYPE_F16) &&
