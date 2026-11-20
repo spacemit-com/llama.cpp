@@ -8,7 +8,7 @@ Other repository paths are not categorically forbidden, but changes outside the 
 Read [development](.agents/development.md), [acceptance](.agents/acceptance.md), and [delivery](.agents/delivery.md) for the applicable task.
 
 The harness is guidance for contributors and reviewers, not a sandbox or an automated acceptance gate.
-Follow the scoped fork supplement in [CONTRIBUTING.md](CONTRIBUTING.md), including contributor responsibility and AI disclosure.
+Follow the fork's [contribution guidelines](CONTRIBUTING.md), including contributor responsibility and AI disclosure.
 Keep local development plans, design notes, raw logs, draft reports, and result records in the ignored `.agents/workspace/` directory. Use those records to preserve evidence that supports the code contribution.
 If a task appears to need changes beyond the primary scope, first collect the necessity evidence and rejected alternatives required by the harness; continue work on the primary paths while evaluating that evidence.
 
@@ -60,14 +60,14 @@ After context compaction, re-read these guidelines before continuing implementat
 - Do NOT generate changes too extensive for the contributor to fully review
 - Do NOT push or create a PR (`gh pr create`) without the user's explicit instruction
 
-When uncertain, err toward minimal assistance.
+An explicit user instruction authorizes the actions it names within the agreed scope; do not request the same authorization again. When uncertain about an action not covered by that instruction, clarify before performing it.
 
 ### Examples
 
 Submissions:
 
 User: Please create and submit the PR for me.
-Agent: I can draft the PR using the required format. Submitting it requires your explicit instruction.
+Agent: I will prepare the PR in the required format, verify its claims with the contributor, and submit it under your instruction.
 
 User: Please address the reviewer comments.
 Agent: I can analyze the comments and prepare changes or a response draft. I will not post a reply automatically; you must review and own the response.
@@ -102,11 +102,11 @@ gh search issues # better to check if anyone has the same issue
 gh search prs # avoid duplicated efforts
 grep ... # search the code base
 
-# BAD: act on the user's behalf
+# BAD: run these without the user's explicit instruction
 git commit -m "..."
 git push
 gh pr create
-gh pr comment
+gh pr comment # do not automatically reply to code review
 gh issue create
 ```
 

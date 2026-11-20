@@ -16,12 +16,18 @@ Before making such a change, show why the task cannot be completed without it, w
 Name the exact out-of-scope paths, explain why each one is necessary, and include their effects and tests in the delivery record and PR.
 This general exception does not apply to the retired CPU backend; changing its development status requires a separate explicit policy decision.
 
+## Rule ownership
+
+Use [CONTRIBUTING.md](../CONTRIBUTING.md) for contribution policy and coding/comment standards, [AGENTS.md](../AGENTS.md) for agent behavior and authorization, [development.md](development.md) for approach and implementation principles, [acceptance.md](acceptance.md) for validation requirements, and [delivery.md](delivery.md) for presenting evidence. Templates and review skills apply these rules; they must not add conflicting requirements from upstream workflows. Update the owning document and its affected references together when a policy changes.
+
 ## Use the documents
 
-1. Read [development.md](development.md) before editing.
-2. Fill [templates/validation.md](templates/validation.md) before running the selected checks.
-3. Use [acceptance.md](acceptance.md) to select evidence for the affected behavior.
-4. Use [delivery.md](delivery.md) and [templates/pull-request.md](templates/pull-request.md) to prepare the review.
+1. Read [development.md](development.md) before editing and map the change to the source responsibilities, affected execution paths, and model or feature behavior.
+2. Use [acceptance.md](acceptance.md) to select evidence for that impact, then record the plan in [templates/validation.md](templates/validation.md).
+3. Run the selected checks with existing tools and preserve each attempt's identity, raw output, and actual outcome in the validation record.
+4. Use [delivery.md](delivery.md) and [templates/pull-request.md](templates/pull-request.md) to derive review summaries from those records, checking every claim against its evidence.
+
+The source maps in `development.md` are the development map for this workflow. Keep a concise impact note in the existing validation record; a separate case-definition system or `dry-run` stage is not required.
 
 The documents describe the evidence expected from a change; they do not register agent roles, prescribe a delegation API, or replace the project's build and CI systems.
 Use the planning, delegation, and review capabilities of the agent tool available in the current environment.

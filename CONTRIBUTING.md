@@ -16,6 +16,7 @@ The legacy `ggml/src/ggml-cpu/spacemit/**` backend is retired. Do not add backen
 - New features must begin with an issue describing the problem and proposed direction. Discuss the scope with maintainers before implementing the feature.
 - Bug fixes must identify a reproducible failure and include a regression test.
 - Keep each pull request focused on one feature or fix. Do not combine unrelated cleanup with the required change.
+- Follow the harness principles for [choosing the approach before implementation](.agents/development.md#before-implementation-choose-the-approach) and [enforcing contracts during implementation](.agents/development.md#during-implementation-enforce-the-contracts). Apply them to the task and its affected paths.
 - New CLI or public API additions need a clear justification for why existing mechanisms are insufficient.
 
 ## Validation
@@ -51,17 +52,17 @@ These points are extremely important - failing to follow them won't necessarily 
 
 - Avoid emdash `—`, unicode arrow `→` or any unicode characters: `×`, `…` ; use ASCII equivalents instead: `-`, `->`, `x`, `...`
 - Code comments:
-    - Keep code comments concise (usually 1-2 lines)
-    - Avoid redundant or excessive inline commentary
-    - Avoid hard-wrapping it to a fixed column width - that hurts readability
-    - Use ASD-STE100 Simplified Technical English, simple wordings (write like cavemen if needed)
-    - Note: Remind yourself of this point regularly, as it often gets lost between context compactions
+    - Default to no new comments. Use clear names and straightforward code.
+    - Brief comments are appropriate for non-obvious data or memory layouts, such as packed order, strides, offsets, and padding.
+    - A genuinely new interface or feature without an established usage pattern may have a short explanation of its purpose and essential usage contract. A new helper or another use of an existing interface does not by itself need a comment.
+    - Otherwise, do not add explanatory comments. Do not narrate control flow, restate code, record task history, or justify a workaround in comments; put design discussion and validation evidence in the development record or PR.
+    - Keep permitted comments concise, usually 1-2 lines, and use simple English. Do not hard-wrap sentences to a fixed column width.
 - Prefer reusing existing infrastructure over introducing new components. Avoid invasive changes that add whole new subsystems or risk breaking existing behavior
 - Do NOT split a line into multiple lines mid-sentence, do NOT try to force the line to fit a fixed number of characters
-- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers
+- Before writing any code, read all relevant files and understand the existing patterns - your changes must blend in with the surrounding codebase. If the change is large or introduces a new pattern that has not yet been discussed and approved, **PAUSE and ask the user for confirmation** before proceeding; remind them that large changes submitted without prior discussion are likely to be rejected by maintainers. Continue within an already approved design and scope without asking for the same confirmation again
 
 Common mistakes that AI agents usually make:
-- Write comments first then write code: this usually leads to extensive redundant comments. Instead, write code first, then add comments later to places that absolutely need them
+- Write comments first then write code: this usually leads to extensive redundant comments. Write the implementation first; add only the brief layout or new-interface/feature explanations allowed above.
 - Llama.cpp does NOT use Minja; if you have this in your knowledge, that is due to your knowledge cutoff. Llama.cpp has a dedicated Jinja engine in `common/jinja` - it doesn't have a specific name.
 
 Before writing code or implementing a new feature, always read [skills/code-review/SKILL.md](skills/code-review/SKILL.md). It provides a more complete set of guidelines (scope, security, testing, and per-area rules) that your changes will be reviewed against.
@@ -97,80 +98,26 @@ Before writing code or implementing a new feature, always read [skills/code-revi
 
 ## Code comment examples
 
-```cpp
-// GOOD (code is self-explanatory, no comment needed)
+For ordinary code and established interfaces, leave the implementation uncommented:
 
+```cpp
 n_ctx = read_metadata("context_length", 1024);
-
-
-// BAD (too verbose, restates what the code already says)
-
-// Populate the n_ctx from metadata key name "context_length", default to 1024 if the key doesn't exist
-n_ctx = read_metadata("context_length", 1024);
-```
-
-```cpp
-// GOOD (explains a non-obvious invariant)
-
-accept();
-bool has_client = listen(idle_interval);
-if (has_client) {
-  task_queue->on_idle(); // also signal child disconnection
-}
-
-
-// BAD (too verbose, restates what the code already says)
-
-// Instead of blocking indefinitely on accept(), the server polls the listening socket with idle_interval as a timeout. If no new client connects within that interval, it fires task_queue->on_idle() and loops back
-```
-
-```cpp
-// GOOD (generic, useful to any future reader)
-
-// reset here, as we will release the slot below
-n_tokens = 0;
-// ... (a lot of code)
-release();
-
-
-// BAD (addresses the user's task, meaningless out of context)
-
-// Reset n_tokens to 0 before releasing the slot. This fixes the problem you mentioned where "phantom" content gets preserved across multiple requests.
-n_tokens = 0;
-```
-
-```cpp
-// GOOD (code is copied from another place; context is already clear, no comment added)
-
-ggml_tensor * inp_pos = build_inp_pos();
-
-// BAD (code copied from elsewhere - do not add comments that weren't there originally)
-
-// inp_pos - contains the positions
 ggml_tensor * inp_pos = build_inp_pos();
 ```
 
+A short layout explanation is appropriate when the representation is not obvious:
+
 ```cpp
-// GOOD (comment is kept concise and useful)
-
-// one decode step of code_predictor
-// at step_idx g:
-// - read code from out_code_cache[g], then embed it with codebook table g-1
-// - write new kv at cache row g+1, sample with lm_head[g]
-// - write result to out_code_cache[g+1]
-
-
-// BAD (comment is long and is forced to fit into a fixed column size, it is very annoying to read as a reviewer)
-
-// one autoregressive decode step of the 5-layer code_predictor. See the
-// comment in models.h for the cache/tensor conventions this relies on.
-//
-// index mapping (derived from the reference pipeline-tts.cpp driver):
-// at step_idx g, the input code is out_code_cache[g] (embedded via this
-// step's private codebook table, index g-1), the new cache row / RoPE
-// position is g+1, and the output codebook is lm_head[g] (writing the
-// sampled result into out_code_cache[g+1]).
+// Each packed row stores scales first, then the quantized blocks.
 ```
+
+A genuinely new interface may need a short usage contract:
+
+```cpp
+// Encodes one frame. The caller owns output and must provide at least output_size bytes.
+```
+
+Avoid comments that repeat an assignment, narrate a loop, explain the current task, or defend a temporary fix. These examples guide new edits; they do not require unrelated comment cleanup elsewhere in the repository.
 
 # Naming guidelines
 
@@ -243,17 +190,17 @@ ggml_tensor * inp_pos = build_inp_pos();
 # Code maintenance
 
 - Existing code should have designated collaborators and/or maintainers specified in the [CODEOWNERS](CODEOWNERS) file responsible for:
-  - Reviewing and merging related PRs
-  - Fixing related bugs
-  - Providing developer guidance/support
+    - Reviewing and merging related PRs
+    - Fixing related bugs
+    - Providing developer guidance/support
 
 - When adding or modifying a large piece of code:
-  - If you are a collaborator, make sure to add yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for reviewing related PRs
-  - If you are a contributor, find an existing collaborator who is willing to review and maintain your code long-term
-  - Provide the necessary CI workflow (and hardware) to test your changes (see [ci/README.md](https://github.com/ggml-org/llama.cpp/tree/master/ci))
+    - If you are a collaborator, make sure to add yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for reviewing related PRs
+    - If you are a contributor, find an existing collaborator who is willing to review and maintain your code long-term
+    - Provide the necessary CI workflow (and hardware) to test your changes (see [ci/README.md](https://github.com/ggml-org/llama.cpp/tree/master/ci))
 
 - New code should follow the guidelines (coding, naming, etc.) outlined in this document. Exceptions are allowed in isolated, backend-specific parts of the code that do not interface directly with the `ggml` interfaces.
-  _(NOTE: for legacy reasons, existing code is not required to follow this guideline)_
+    _(NOTE: for legacy reasons, existing code is not required to follow this guideline)_
 
 - For changes in server, please make sure to refer to the [server development documentation](./tools/server/README-dev.md)
 

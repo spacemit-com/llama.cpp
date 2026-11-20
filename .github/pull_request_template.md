@@ -9,6 +9,7 @@
 ## Scope and design
 
 - Changed paths and why each is necessary:
+- Development-map responsibilities, affected callers/models/features, and corresponding checks:
 - Paths outside ggml/src/ggml-spacemit and relevant tools paths, if any:
 - Code-path evidence they are necessary and alternatives considered:
 - No new development or optimization in the retired ggml/src/ggml-cpu/spacemit backend:
@@ -19,8 +20,12 @@
 - Base / candidate revisions and artifact identity:
 - Build and configuration:
 - Correctness evidence and independent reference:
-- Performance evidence, or why performance is not claimed:
-- Detailed validation record and reviewer-accessible logs:
+- End-to-end model correctness and baseline/candidate model performance for ggml-spacemit source changes (NOT RUN with reason if unavailable):
+- Performance evidence for other changes, or N/A with a scope-based reason:
+- Detailed validation record and reviewer-accessible logs, with check/run labels for each claim:
+- Evidence applicability to the final candidate, including reruns, carried-forward evidence, and gaps:
+
+<!-- Apply .agents/acceptance.md status definitions. Keep failures, retries, and inconclusive results visible; a generated summary is not validation evidence by itself. -->
 
 | Check | Status (PASS / FAIL / NOT RUN / N/A) | Result and evidence |
 | --- | --- | --- |

@@ -17,6 +17,17 @@ Complete this record for an executable or backend change. Keep the detailed reco
 - Affected behavior and expected result:
 - Hardware paths in scope: K1 / K3 / RVV / scalar / other:
 
+## Development-map impact
+
+Keep this note concise and update it as the change develops. Use the [development map](../development.md#keep-the-change-located-on-the-development-map); no separate case-definition file or `dry-run` is required.
+
+- Changed responsibilities, entry points/symbols, and source-map/code links:
+- Affected callers, downstream consumers, and contracts, including unedited paths:
+- Models/features, inputs, and hardware conditions that exercise the change:
+- Nearby paths expected to remain unaffected, with code-path reasons:
+- Impact-to-check mapping, exclusions, and unresolved coverage:
+- Final diff reconciliation and earlier evidence to rerun or justify carrying forward:
+
 ## Artifact identity
 
 - Compiler and toolchain:
@@ -37,11 +48,25 @@ Complete this record for an executable or backend change. Keep the detailed reco
 - Selected build, correctness, performance, and platform checks:
 - Excluded checks and reason:
 
+## Execution records
+
+Repeat this block or link an equivalent existing record for each attempt, including retries. Reference shared metadata above only when it matches the actual run. Follow [execution-record requirements](../acceptance.md#preserve-execution-records).
+
+- Run label, selected check, and affected behavior:
+- Start/end times with timezone, working directory, resolved command, and relevant environment:
+- Source revision / local patch, artifact, runtime, model/input, and hardware identities:
+- Exit status or termination reason:
+- Raw stdout/stderr, actual coverage counts, and dispatch evidence:
+- Independent reference, criterion/tolerance, and observed result, where applicable:
+- Raw performance samples, where applicable:
+- Failure, interruption, exclusion, contamination, or retry reason; related run labels:
+- Applicability to the final candidate; carried-forward evidence justification or checks to rerun:
+
 ## Results
 
-Use exactly one status for each selected check: `PASS`, `FAIL`, `NOT RUN`, or `N/A`.
+Use exactly one status for each selected check: `PASS`, `FAIL`, `NOT RUN`, or `N/A`, as defined in [acceptance.md](../acceptance.md#preserve-execution-records). An executed but inconclusive check is `FAIL` with an explicit unverified-evidence reason; this does not by itself diagnose a code defect. Keep required checks without results visible and state why they remain unverified.
 
-| Check or case | Status | Command / input identity | Observed result | Evidence link |
+| Check or case / run label | Status | Command / input identity | Observed result / reason / limits | Evidence link |
 | --- | --- | --- | --- | --- |
 |  |  |  |  |  |
 
@@ -69,6 +94,13 @@ comparison is applicable.
 |  |  |  |  |  |  |
 
 Do not claim a model improvement from an isolated kernel result. Do not report a percentage when the measurements are not comparable.
+
+## Delivery traceability
+
+- Summary claims and corresponding check/run labels and raw evidence locations:
+- Final candidate identity and record used to prepare the summary:
+- Reviewer-accessible evidence copies or summaries; any verification limits:
+- Contributor checks of reported statuses, counts, calculations, and remaining gaps:
 
 ## Limits
 

@@ -56,6 +56,18 @@ identities. Name the actual hardware and backend path exercised. Distinguish
 source inspection and host checks from hardware execution. Follow the validation
 record for commands, inputs, raw outputs, and the limits of each result.
 
+## Derive delivery summaries from evidence
+
+Prepare validation summaries and PR text from the recorded runs, using the existing templates. This applies equally to manual summaries, agent drafting, and any report-generation tool; no new runner or report command is required by this guide.
+
+- Map each correctness, coverage, or performance claim to a recorded check, run label, and raw evidence location. Include the source revision and artifact identity to which the claim applies, and reconcile the final changed responsibilities with the development-map impact note.
+- Preserve result status, execution counts, failures, exclusions, retries, regressions, and limitations. Required checks that lack evidence remain visible. Do not turn a successful report-generation command, a blank field, or an expected result into a validation pass.
+- Compute performance summaries only from identified raw samples under the comparison rules below. Preserve units, sample counts, aggregation and delta definitions, and exclusion reasons. If measurements cannot support a comparison, state that it is inconclusive.
+- Separate observed facts from interpretation. Design rationale, necessity of scope, reference independence, and the meaning of results require contributor review; template completion or an agent assertion does not prove them.
+- Before delivery, check that the evidence still applies to the final candidate. Update summaries after changed results, replace stale claims, and identify carried-forward evidence and its justification. Keep local raw records in `.agents/workspace/`; provide reviewer-accessible copies or summaries with explicit verification limits, as described below.
+
+Generating a report prepares review material. The contributor must check its claims and own the result under the existing AI-assistance and publication rules.
+
 ## Make performance claims comparable
 
 For each comparison, assign a case identity that fixes the hardware, model/input

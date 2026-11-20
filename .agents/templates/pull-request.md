@@ -1,6 +1,7 @@
 <!-- For ggml/src/ggml-spacemit or maintained tools/** contributions to spacemit-com/llama.cpp.
 Follow ../delivery.md and ../acceptance.md; use validation.md for detailed evidence.
 Replace placeholders; use NOT RUN or N/A with a reason instead of empty claims.
+Derive results from execution records; retain missing, inconclusive, failed, and superseded evidence with explanations.
 Use reviewer-accessible links, not private workspace paths. -->
 
 ## Problem and behavior
@@ -11,6 +12,7 @@ Use reviewer-accessible links, not private workspace paths. -->
 ## Change and design
 
 - Scope: <backend/tools paths, entry points, and why each change is needed>
+- Development-map impact: <changed responsibilities, affected callers/models/features including unedited paths, and corresponding checks; exclusions with reasons>
 - Additional paths outside ggml/src/ggml-spacemit and relevant tools paths: <none, or exact paths and code-path evidence that the task cannot be completed without them>
 - Alternatives to those additional changes and evidence they are insufficient: <details or N/A>
 - Approach and key tradeoff: <numerics/layout/lifetime/dispatch/fallback as applicable>
@@ -24,11 +26,12 @@ Use reviewer-accessible links, not private workspace paths. -->
 - Regression check: <case/command link; observed baseline failure and candidate result>
 - End-to-end model correctness: <relevant model/input, expected behavior, candidate result; or NOT RUN with reason>
 - Model-level performance: <baseline/candidate comparison for the relevant model path; or NOT RUN with reason>
-- Detailed validation record and logs: <reviewer-accessible links>
+- Detailed validation record and logs: <reviewer-accessible links with check/run labels for each claim>
+- Evidence applicability to the final candidate: <rerun checks, justified carried-forward evidence, and remaining gaps>
 
 | Acceptance check / selected cases | Status | Observed result and evidence |
 | --- | --- | --- |
-| <build / execution / correctness; separate rows> | <PASS / FAIL / NOT RUN / N/A> | <counts, errors/tolerances/reference, log link; reason if not run or N/A> |
+| <build / execution / correctness; separate rows> | <PASS / FAIL / NOT RUN / N/A> | <run labels, counts, errors/tolerances/reference, raw evidence link; failure/unverified reason, or reason if NOT RUN or N/A> |
 
 ## Performance
 

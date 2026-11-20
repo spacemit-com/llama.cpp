@@ -14,7 +14,7 @@ Apply every relevant row and explain exclusions briefly.
 | Change | Build and correctness evidence | Additional acceptance evidence |
 | --- | --- | --- |
 | Documentation or build configuration | Documentation-only changes need link/command consistency checks; build changes need affected RISC-V configuration, linking and backend loading checks. | Confirm intended IME features and runtime dependency resolution; no model benchmark for prose alone. |
-| Operator bug fix | Build the backend and selected test targets; reproduce the defect on the baseline and pass the same input and criterion on the candidate against an independent reference. | Exercise the failing shape/layout/dtype plus the nearest relevant boundary and an unaffected supported case; run a representative model when graph integration can change. |
+| Operator bug fix | Build the backend and selected test targets; reproduce the defect on the baseline and pass the same input and criterion on the candidate against an independent reference. | Exercise the failing shape/layout/dtype plus the nearest relevant boundary and an unaffected supported case. For SpacemiT backend source changes, include the required model correctness and performance checks from the scope-to-test mapping below. |
 | Numerical or repack change | Independent arithmetic/dequantization reference, exact input identity, declared error criteria and relevant format/layout boundaries. | Separate packed-representation correctness from error against original weights; validate affected quantization/model behavior and any changed memory footprint. |
 | Dispatch or kernel optimization | Correctness on the selected path, eligibility boundaries and fallback; prove that the intended implementation executed. | Paired operator and representative production-model measurements; include relevant prefill/decode and worker configurations, retaining regressions and inconclusive results. |
 | Memory, workspace or concurrency change | Allocation/size/alignment/lifetime checks and affected numerical cases; exercise relevant tails, allocation failure/fallback, reuse and overlapping requests. | Demonstrate synchronization and ownership under the claimed concurrency; check leaks, corruption, hangs and resource release across repeated lifecycle operations, plus relevant latency/throughput. |
@@ -25,7 +25,7 @@ Select the rows for every changed area; do not use a broad build as a substitute
 
 | Changed area | Required targeted evidence | Add when applicable |
 | --- | --- | --- |
-| `ggml/src/ggml-spacemit/**` | Backend build, selected operator or independent numerical cases, evidence that `SPACEMIT0` and the intended dispatch path executed, and end-to-end correctness on the relevant model or models that exercise the changed path. | Run comparable baseline/candidate performance measurements on the relevant model or models, covering the affected prefill/decode or request path and retaining regressions and inconclusive results. |
+| `ggml/src/ggml-spacemit/**` source changes | Backend build, selected operator or independent numerical cases, evidence that `SPACEMIT0` and the intended dispatch path executed, end-to-end correctness, and comparable baseline/candidate model-level performance on the relevant model or models. | Extend coverage to affected prefill/decode, worker, and platform variants; retain regressions and inconclusive results. |
 | `tools/mtmd/**` | Build the affected mtmd targets and run `test-mtmd-c-api` / `test-mtmd-impl` or the closest selected cases. | Run the affected image, audio, video, or model smoke with fixed media and expected semantic behavior. |
 | `tools/smt-mtmd/**` | Build with `LLAMA_SERVER_SMT_MTMD=ON`, verify matching `SPACEMIT_ORT_DIR` and runtime artifacts, and run the affected SMT media pipeline. | Cover vision, audio, multi-ASR, or TTS separately when only one pipeline changes; include K1/K3 where the path differs. |
 | Media-related `tools/server/**` | Build `llama-server` and the server component target; run the relevant `tools/server/tests` pytest selection. | Run at least one real media request for vision/audio/SMT changes and exercise concurrency when request lifetime or scheduling changes. |
@@ -112,6 +112,19 @@ The backend test's current argument parser prints usage and exits nonzero for `-
 
 Confirm nonempty executed coverage and actual backend/dispatch behavior after applying filters.
 Capture benchmark warmup, worker settings and remaining defaults alongside the command rather than assuming that `-t` controls every backend worker.
+
+## Preserve execution records
+
+Use the existing validation template and test tools; these requirements apply whether records are collected by hand, by an agent, or by a script. Record actual execution, not a proposed command or an expectation copied from the plan.
+
+- Give each attempt a distinct local run label and record start/end times with timezone, working directory, resolved command, relevant environment, and exit status or termination reason. Link it to the affected behavior in the development-map note and the selected check. A directory name or record heading is sufficient; no case registry is required.
+- Bind each attempt to its base/candidate source revision and local patch identity, tested binaries and loaded libraries, model/input identity, runtime, and hardware. Shared metadata may be referenced when it is identical across runs; record any differences explicitly.
+- Retain raw stdout/stderr, actual execution counts, dispatch evidence, reference and error criteria, observed outputs, and raw performance samples as applicable. If a tool cannot expose an item, record the gap and its effect on the conclusion; do not fabricate counts or path evidence.
+- Keep failed, interrupted, excluded, contaminated, and retried attempts with their reasons and links to any replacement run. A later success does not erase an earlier failure; explain whether it was resolved, environmental, or still unclassified.
+- After source, build, dependency, input, or configuration changes, check whether earlier evidence still applies. Rerun affected checks or mark their coverage unverified. Evidence carried forward needs a concrete reason that the tested artifact and behavior remain applicable to the final candidate; never relabel an old run as a new one.
+
+Use `PASS` only when the check's declared criterion is established by valid evidence. Use `FAIL` when an executed check does not establish that criterion, with a reason distinguishing an observed defect from interrupted, contaminated, or inconclusive evidence. Use `NOT RUN` when the required check did not execute, including empty selections or all-skipped runs, and retain any attempted command and its output. Use `N/A` only for a requirement that does not apply, with a scope-based reason; missing hardware or inputs are not `N/A`.
+A check's status describes its acceptance evidence, not a diagnosis of the code. If execution occurred but the conclusion is unverified, say so explicitly; do not disguise it as `NOT RUN` or `PASS`.
 
 ## Report the outcome
 

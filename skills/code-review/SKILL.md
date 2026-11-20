@@ -5,12 +5,12 @@ description: Review llama.cpp changes against project conventions and common rev
 
 # Review llama.cpp changes
 
-This skill reviews changes against llama.cpp's conventions and the pitfalls that reviewers flag most often, so the contributor can fix them before a maintainer has to. It has two modes:
+This skill reviews changes in the SpacemiT fork against the contribution rules in [CONTRIBUTING.md](../../CONTRIBUTING.md), the agent instructions in [AGENTS.md](../../AGENTS.md), and the scoped [acceptance requirements](../../.agents/acceptance.md). These documents define policy; this skill provides review checklists and must not impose conflicting upstream contribution or approval requirements. It has two modes:
 
-- **Self-review (default):** review the contributor's own local changes (uncommitted work, or a branch vs `master`) as a pre-PR pass. Ask which if it's ambiguous; default to `git diff master...HEAD` plus any uncommitted changes.
+- **Self-review (default):** review the contributor's local changes against the intended PR base. Resolve that base from the task, PR metadata, or recorded branch origin; do not assume `master` or use a personal tracking branch as the PR base. Use `git diff <base>...HEAD` plus staged and unstaged changes, and report the selected base. If the base cannot be established, review the local diff and identify the missing base before making a branch-wide conclusion.
 - **Read-only review of a PR/file:** if the user points at a PR number or specific files (including code they didn't write), review those and report findings.
 
-In both modes the output is **private review notes for the user to read and act on** - it is never something to post. This is a hard rule from `AGENTS.md`: an agent must NEVER write, or help write, a PR comment, a review comment, or a reply to a reviewer, by any means including `gh`. Do not offer to. If the user asks you to post the notes, refuse and point them at that rule. Present findings in the conversation only.
+In both modes, return **private review notes for the contributor to inspect** by default. AI may draft PR descriptions in the required format, commit messages, and review-response text for the contributor to check and own. Do not automatically submit or post replies to code review comments. Publishing messages, creating a PR, committing, pushing, or merging requires the user's explicit instruction for the relevant action, as defined in `AGENTS.md` and `CONTRIBUTING.md`. An existing instruction covering the same action and scope is sufficient; do not ask for it again.
 
 Before starting, read `AGENTS.md` and `CONTRIBUTING.md` if not already in context - the "Coding guidelines", "Naming guidelines", and AI usage sections are the baseline this review enforces. For a diff that adds a new model architecture, also read `docs/development/HOWTO-add-model.md` and consider the dedicated `add-new-model` skill.
 
@@ -21,7 +21,8 @@ Identify what actually changed and which area checklists below apply. Run `git d
 - `conversion/`, `gguf-py/`, `src/models/`, `src/llama-arch.*` -> **New model / architecture**
 - `ggml/` (any backend, op, or `ggml.h`) -> **ggml / backend**
 - `include/llama.h` and other public headers -> **Public API**
-- `tools/server/` -> **Server**
+- `tools/mtmd/`, `tools/smt-mtmd/` -> **Multimodal** and the applicable scope-to-test rows in `.agents/acceptance.md`
+- `tools/server/` -> **Server**; media changes also use the relevant scope-to-test rows in `.agents/acceptance.md`
 - `tools/ui/` (or the legacy `tools/server/webui/`) -> **WebUI**
 - `tests/`, `tools/server/tests/`, or any other added/changed test -> **Tests**
 - anything else, plus all of the above -> **General** (always runs)
@@ -35,13 +36,13 @@ These are the patterns that get PRs closed without a full review. Check them fir
 - Is there a prior issue/discussion for this? Features are supposed to start as an issue, not a PR (`CONTRIBUTING.md`). If this is a nontrivial feature with no linked issue, flag it and suggest opening one first.
 - Is it a duplicate of existing/in-flight work? Suggest `gh search prs` / `gh search issues` for the feature. Many closed PRs were duplicates of something already queued.
 - Is it self-contained and single-purpose? Multiple unrelated changes/optimizations bundled together get sent back to be split. Flag unrelated changes and suggest separate PRs.
-- Does it touch multiple ggml backends at once? Initial support should be CPU-only, other backends as follow-ups (`CONTRIBUTING.md`). Flag CUDA/Metal/Vulkan/etc. changes bundled into a feature's first PR.
-- Does it add a new `ggml_type` / quantization type? That carries a disproportionate maintenance burden and needs the full justification package (GGUF sample upload, perplexity vs FP16/BF16 and similar sizes, KL-divergence data, CPU perf numbers). Absent that, it will be rejected regardless of code quality.
+- Does the diff stay within `ggml/src/ggml-spacemit/**` and the relevant maintained `tools/**` paths? Backend development belongs in `ggml-spacemit`; the retired `ggml/src/ggml-cpu/spacemit/**` backend must not receive new features or optimizations. For every other changed path, require the necessity evidence, rejected alternatives, minimum necessary diff, and path-specific validation defined in `CONTRIBUTING.md`. CPU-first implementation and unrelated backend coverage are not requirements for this fork.
+- Does it add a new `ggml_type` or persisted quantization format? Require a design and scope justification, a reproducible sample, independent numerical and representation checks, relevant model-quality comparisons, and target-platform performance evidence. Choose additional measures such as perplexity or KL divergence according to the claim and affected models. Distinguish a public format change from backend-private repacking; do not require unrelated CPU implementation or performance results.
 - Is it invasive - new subsystem, core-API reshaping, changes to shared graph/sampler code that other models don't need? Flag it and suggest a discussion with maintainers before investing further.
 - Does it add a model-specific CLI argument to any binary (`common/arg.cpp`, tools, examples) or conversion script (`convert_*.py`)? Not allowed - model-specific behavior must come from GGUF metadata or be detected automatically, not from a per-model flag.
 - Is it niche/vendor-specific in a way that adds a maintenance burden nobody will own long-term? Flag the maintenance-ownership question.
 - Is the change semantically correct, or a plausible-looking "fix" that misunderstands the code? Sanity-check the actual behavior, not just that it compiles.
-- AI-disclosure: if AI meaningfully contributed, is the PR template's disclosure section filled in? Remind the user. Never suggest writing the PR description or commit message for them.
+- AI-disclosure: if AI meaningfully contributed, is the PR template's disclosure section filled in? Check that any AI-drafted description follows the required format and that the contributor has verified its claims.
 
 ## Security review (mandatory)
 
@@ -87,19 +88,20 @@ See the `add-new-model` skill and `docs/development/HOWTO-add-model.md` for the 
 - Don't hack RoPE with a custom sin/cos implementation. If `ggml_rope_ext` genuinely can't express it, that's an issue for discussion, not a PR.
 - In `src/models/`, apply RoPE with `build_rope(cur, pos, il)`, not a direct `ggml_rope_ext`/`ggml_rope_multi` call (see #31683). Per-layer differences go in a `get_rope_params` override: the KV-cache K-shift reads the same params, so a direct call lets the graph and the shift drift apart. The remaining direct calls (deepseek4/41, dflash, sensenova-u1) are not a pattern to copy.
 - Test the quantized-KV path (`-ctk`/`-ctv q8_0`), not just default f16 - new speculative/attention features silently break there.
-- Preserve existing explanatory comments about model-specific quirks when copying code; note the provenance ("copied from X, with Y added").
+- Preserve still-applicable existing comments when adapting reference code. Record the source and adaptations in the development record or PR; apply the shared comment policy to any new comments.
 - Remove dead code/branches left over from adapting a reference implementation.
 
 ## ggml / backend
 
 - `supports_op` (and any dispatch/gating condition) must be scoped exactly to the cases being changed - a condition meant for a few quant types must not silently disable or enable everything else.
-- No hardcoded warp/lane size - use `ggml_cuda_get_physical_warp_size()` (32 on CUDA, 64 on HIP/ROCm) and the portable helpers.
+- For CUDA/HIP changes, use `ggml_cuda_get_physical_warp_size()` and the relevant portable helpers rather than assuming a warp size. For SpacemiT changes, validate RVV vector length, IME capability, layout, alignment, and worker/resource assumptions against the selected path; do not apply CUDA-specific helpers to this backend.
 - Strip leftover debug/profiling/logging code before review.
-- New or changed op? Update `docs/ops.md` and the relevant `docs/ops/*.csv` for the touched backend.
-- New op or operator change needs corresponding `test-backend-ops` cases, and (per `CONTRIBUTING.md`) consistency across at least two backends.
+- If a change alters advertised operation support, check whether the relevant `docs/ops.md` or `docs/ops/*.csv` entries need updating. Explain any necessary documentation paths outside the primary scope; a kernel-internal change does not automatically require those edits.
+- New or changed operators need relevant `test-backend-ops` cases or independent numerical checks, chosen using `.agents/acceptance.md`. Verify that the reference does not dispatch to the implementation under test and that the intended backend path actually executed. Do not substitute a fixed backend count for an independent reference.
+- Every source change under `ggml/src/ggml-spacemit/**` also needs end-to-end correctness and model-level performance validation on the relevant models. Kernel checks alone are insufficient. Record unavailable model or hardware checks as `NOT RUN`, with the reason and limits on the conclusion.
 - New kernels are expected to come with concrete perf data (throughput across realistic tensor shapes), not just correctness.
-- Don't have a backend mutate the cgraph as a shortcut - that's an unresolved architectural question, not something to slip in.
-- Expect this to need two maintainer approvals; that's normal for `ggml/` changes, not a sign something is wrong.
+- For graph or fusion changes, inspect the existing graph optimization hooks, opnode ordering, allocation dependencies, and buffer lifetimes. Flag bypasses of those contracts and require evidence that fused and unfused behavior agree; do not reject the backend's established optimization mechanism solely because it changes a graph.
+- Apply the target repository's actual required checks and maintainer approvals; do not invent a fixed approval count from upstream conventions.
 - For CUDA: Avoid excessively templating kernels, only add this where it shows visible performance gain.
 
 ## Public API (`include/llama.h`)
@@ -134,10 +136,10 @@ Trigger: a literal that is reused, domain-significant, or crosses a boundary (wi
 - **Declarative config array/object** (constants): a set of related items consumed by more than one renderer (e.g. dropdown + sheet) - menu items whose `action`/`id`/`enabledWhen` fields are enum values, not strings (`ATTACHMENT_FILE_ITEMS`). If two surfaces render the same menu, both must render from this one config.
 - **Grouped `as const` object** (constants): related literals that belong to one feature - error-message taxonomy (`ERROR_MESSAGES` with `HTTP`/`NETWORK` groups), UI copy shared across surfaces (`ATTACHMENT_MENU_TEXT`), a feature's prompt + fallback + patterns (`TITLE_GENERATION`). Prefer one grouped object over scattering same-feature constants.
 - **Scalar constants**:
-  - strings: CSS class strings, selectors, `data-*` attribute names, header names, storage keys, API routes/paths, file extensions.
-  - numbers: any threshold, timeout, size, limit, or count - suffixed with unit or context (`_MS`, `_PX`, `_BYTES`, `_CHARS`, `_MAX_LENGTH`).
-  - regexes: any non-trivial literal regex, `_REGEX` suffix, grouped in the feature's constants file.
-  - characters/separators: named by meaning in their domain, not by character - `PATH_SEPARATOR`, `ORG_SEPARATOR`, `SSE_RECORD_SEPARATOR`, `ISO_DATE_TIME_SEPARATOR`, `NEWLINE`. No universal `SLASH` constant.
+    - strings: CSS class strings, selectors, `data-*` attribute names, header names, storage keys, API routes/paths, file extensions.
+    - numbers: any threshold, timeout, size, limit, or count - suffixed with unit or context (`_MS`, `_PX`, `_BYTES`, `_CHARS`, `_MAX_LENGTH`).
+    - regexes: any non-trivial literal regex, `_REGEX` suffix, grouped in the feature's constants file.
+    - characters/separators: named by meaning in their domain, not by character - `PATH_SEPARATOR`, `ORG_SEPARATOR`, `SSE_RECORD_SEPARATOR`, `ISO_DATE_TIME_SEPARATOR`, `NEWLINE`. No universal `SLASH` constant.
 - **Key-name constants**: strings used as keys into another object or persisted config get an object constant mirroring the property names (`SETTINGS_KEYS.CUSTOM_CSS = 'customCss'`), so a rename breaks the build instead of silently missing.
 
 Placement and composition:
@@ -200,7 +202,9 @@ Adjacent data-shape rule: empty string is not a valid "unset" initial state - us
 - Scope discipline: changes that belong to another stacked PR don't ride along in this one - call them out and move them there. Flag unrelated edits to deprecated/legacy files and ask whether they're intentional.
 - New nontrivial utils and parsing logic get Vitest unit tests; reusable UI components get Storybook stories/tests when practical.
 
-## Multimodal (`tools/mtmd/`)
+## Multimodal (`tools/mtmd/`, `tools/smt-mtmd/`)
+
+Use the affected mtmd, SMT, and server-media rows in `.agents/acceptance.md`. The graph-building rules below apply to mtmd model code; do not impose them on SMT provider wrappers that do not construct a ggml graph.
 
 - Tensor names must be prefixed by `v.`, `a.`, `mm.` or `a.mm.` (legacy naming doesn't follow this convention - this is expected, but new code should follow it).
 - Do not use explicit sin/cos for RoPE; use `ggml_rope_ext` instead, see `HOWTO-add-model.md`. If it can't express the needed behavior, that's a design discussion, not a PR.
@@ -215,7 +219,7 @@ Adjacent data-shape rule: empty string is not a valid "unset" initial state - us
 - Follow the existing testing patterns. Do not add a new testing system. Before adding a new file under `tests/*`, think carefully about whether the tests can go into an existing file first.
 - In most cases, new test cases belong in an existing test file - check for one covering the same component before adding anything new.
 - Only add tests that bring meaningful results. Too-trivial tests just bloat the suite and CI.
-- No time-sensitive tests (timing thresholds, sleeps, races against wall-clock); they are flaky on CI.
+- Keep correctness tests independent of fragile wall-clock thresholds and arbitrary sleeps. This does not remove the required performance measurements: run those separately using the baseline/candidate protocol in `.agents/acceptance.md`.
 - Think twice about tests that significantly increase CI run time (expensive computation, large inputs, or long sleep/wait delays) or download large amounts of data from the internet (big models, datasets). Flag them and ask whether a smaller model/input or an existing fixture would do.
 - Server: small tests of internal components (helpers, `server_tokens`, queues, format converters, ...) belong in `tests/test-server-component.cpp`. The end-to-end pytest suite in `tools/server/tests` is costly in CI time; only add to it when the test requires end-to-end behavior with a real model.
 
@@ -224,16 +228,18 @@ Adjacent data-shape rule: empty string is not a valid "unset" initial state - us
 Enforce the `CONTRIBUTING.md` coding and naming guidelines on every changed line - this is a distinct pass from checking that the code works, and matters just as much for review speed:
 
 - ASCII only in code and comments - no emdash, unicode arrows, `x`, `...` used as unicode; use `-`, `->`, `x`, `...` ASCII equivalents.
-- Comments are concise and explain non-obvious *why*, not *what*. Flag verbose comments, comments that restate the code, comments that reference the current task/PR, and comments hard-wrapped to a fixed column width.
+- Apply the [comment policy](../../CONTRIBUTING.md#implementation-and-writing-standards): default to no new comments; allow brief data/memory-layout explanations and essential usage notes for genuinely new interfaces or features. Flag other added explanatory comments, control-flow narration, task history, workaround justifications, and hard-wrapped sentences. Do not require unrelated comment cleanup.
 - Do not force-wrap prose/comments to a fixed character count or split a sentence across lines.
 - `snake_case` names; `kebab-case` (lowercase-with-dashes) file names for C/C++, `.h` headers; Python files lowercase-with-underscores. Naming optimizes for longest common prefix (`number_small`, not `small_number`).
 - 4-space indentation, brackets on the same line, `void * ptr`, `int & a`, no trailing whitespace; match the surrounding style.
 - Before pushing the PR, run the code style check and editorconfig check locally (see `.github/workflows/code-style.yml` and `.github/workflows/editorconfig.yml`). If the change touches Python code, also run the Python type check (`.github/workflows/python-type-check.yml`).
 - Reuse existing infrastructure over introducing new components; no new third-party dependencies, extra headers, or files unless clearly justified.
-- Keep it simple: a simpler change doing 90% is often preferable to a complex one doing 100%. Flag unnecessary templates/fancy STL; basic `for` loops are fine here.
+- Check the [pre-implementation decisions](../../.agents/development.md#before-implementation-choose-the-approach): a solution addressing the cause, appropriate maintained reference code, identified hot-path costs, and restrictions scoped to their actual conditions. Flag unexplained workarounds, copied obsolete patterns, unnecessary repeated costs, and local fixes turned into global bans.
+- Check the [implementation contracts](../../.agents/development.md#during-implementation-enforce-the-contracts): interfaces that express valid use, respected module boundaries, focused executable checks for applicable defects or misuse, and actionable failures. Assess safeguards relevant to the task; do not demand unrelated infrastructure or cleanup.
+- Keep the implementation as simple as possible while satisfying the agreed behavior and acceptance criteria. Flag unnecessary templates or abstractions; do not silently omit required cases to reduce the diff.
 - Every added line should be something the contributor can explain and defend to a reviewer without AI help - flag anything that looks copied-in without understanding.
 - `Co-authored-by:` must be reserved for human co-authors; AI contributions (claude, cursor, codex, etc.) must use `Assisted-by:`; if this point is violated, it's a blocking finding.
-- Any mentions of Minja must be treated as blocking; see the [implementation and writing standards](../../CONTRIBUTING.md#implementation-and-writing-standards) for why.
+- Flag changes that incorrectly treat Minja as the current Jinja engine or introduce dependencies based on that assumption; see the [implementation and writing standards](../../CONTRIBUTING.md#implementation-and-writing-standards). Historical mentions and corrective documentation are not violations.
 
 ## Reporting
 
@@ -243,4 +249,4 @@ Group findings by severity so the user knows what actually blocks a merge:
 2. **Will slow the review** - convention/naming/comment violations, missing tests/docs/perf data, missing API justification or example.
 3. **Nits** - minor style, optional cleanups.
 
-For each finding, point to the file and line and say concretely what to change and why. Do not rewrite the whole diff unprompted; let the contributor make the fixes so they own and understand them. And do not draft any PR text, commit message, or reviewer reply - that is the contributor's to write.
+For each finding, point to the file and line and explain what should change and why. Keep review-only tasks read-only unless the user requests fixes. When requested, implement fixes within the agreed scope and help draft template-compliant PR text, commit messages, or private review-response drafts. The contributor must verify and own the code and claims; drafting does not authorize publication or automatic review replies.
