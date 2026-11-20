@@ -5150,14 +5150,15 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
 // offset(slice,r,c) = slice*512 + ((r/8)*4+c/8)*64 + (r%8)*8+c%8.
 // The caller reserves M16/N32 padding; only valid rows/columns reach final C.
 // Reduce starts at +0 and adds slices in ascending order, matching the old kernel.
-void gemm_kernel_f16f16f16_m16_vfwmadot_tile8(size_t           k,
-                                              const _Float16 * b,
-                                              _Float16 *       a,
-                                              _Float16 *       output,
-                                              size_t           m,
-                                              size_t           n,
-                                              size_t           ldc,
-                                              bool             accumulate) {
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_8_8_16_32,
+                                        size_t           k,
+                                        const _Float16 * b,
+                                        _Float16 *       a,
+                                        _Float16 *       output,
+                                        size_t           m,
+                                        size_t           n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
     GGML_ASSERT(m > 0 && m <= 16 && n > 0 && n <= 32);
     GGML_ASSERT(k > 0 && k % 8 == 0 && !accumulate);
     (void) ldc;
@@ -5198,18 +5199,31 @@ void gemm_kernel_f16f16f16_m16_vfwmadot_tile8(size_t           k,
           "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
 }
 
-void reducesum_f16f32_m16n32_tile8(void *  input,
-                                   int64_t lhs_offset,
-                                   int64_t lhs_stride0,
-                                   int64_t lhs_stride1,
-                                   void *  output,
-                                   int64_t out_offset,
-                                   int64_t out_stride,
-                                   int64_t src_mc,
-                                   int64_t src_nc,
-                                   int64_t slice_count,
-                                   int64_t dst_m,
-                                   int64_t dst_n) {
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_row_major_16_32,
+                                        size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    gemm_kernel_f16f16f16_m16_vfwmadot(gemm_k, b_f16_k8, a_f16_k8, c_ptr, count_m, count_n, ldc, accumulate);
+}
+
+void reducesum_f16f32_m16n32(fp16_8_8_16_32,
+                             void *  input,
+                             int64_t lhs_offset,
+                             int64_t lhs_stride0,
+                             int64_t lhs_stride1,
+                             void *  output,
+                             int64_t out_offset,
+                             int64_t out_stride,
+                             int64_t src_mc,
+                             int64_t src_nc,
+                             int64_t slice_count,
+                             int64_t dst_m,
+                             int64_t dst_n) {
     GGML_ASSERT(src_mc == 1 && src_nc == 1 && slice_count > 0);
     GGML_ASSERT(dst_m > 0 && dst_m <= 16 && dst_n > 0 && dst_n <= 32);
     (void) lhs_stride0;
