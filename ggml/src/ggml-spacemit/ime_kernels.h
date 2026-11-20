@@ -6,6 +6,28 @@
 
 namespace spacemit_kernels {
 
+// FP16 matrix tile folded from 8x8 subtiles into an M16xN32 parent tile.
+// Storage order is [M16/8][N32/8][M8][N8] = [2][4][8][8].
+// Split-K partial buffers prepend the split index: [split_k][2][4][8][8].
+struct fp16_8_8_16_32 {
+    using value_type = _Float16;
+
+    static constexpr size_t inner_m  = 8;
+    static constexpr size_t inner_n  = 8;
+    static constexpr size_t tile_m   = 16;
+    static constexpr size_t tile_n   = 32;
+    static constexpr size_t m_blocks = tile_m / inner_m;
+    static constexpr size_t n_blocks = tile_n / inner_n;
+};
+
+// FP16 matrix tile stored as a conventional row-major M16xN32 matrix.
+struct fp16_row_major_16_32 {
+    using value_type = _Float16;
+
+    static constexpr size_t tile_m = 16;
+    static constexpr size_t tile_n = 32;
+};
+
 #define BLOCK_QNK_LEN 256
 
 template <int N> struct nrow_block_q2_k {
@@ -195,6 +217,43 @@ void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
                                         size_t           count_n,
                                         size_t           ldc,
                                         bool             accumulate);
+
+// Layout-tag overload: output is conventional FP16 row-major M16xN32.
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_row_major_16_32,
+                                        size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate);
+
+// Layout-tag overload: output is fp16_8_8_16_32, not row-major.
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_8_8_16_32,
+                                        size_t           gemm_k,
+                                        const _Float16 * b,
+                                        _Float16 *       a,
+                                        _Float16 *       c,
+                                        size_t           m,
+                                        size_t           n,
+                                        size_t           ldc,
+                                        bool             accumulate);
+
+// Layout-tag overload: reads fp16_8_8_16_32 partials and writes FP32 row-major output.
+void reducesum_f16f32_m16n32(fp16_8_8_16_32,
+                             void *  in,
+                             int64_t lhs_offset,
+                             int64_t lhs_stride0,
+                             int64_t lhs_stride1,
+                             void *  out,
+                             int64_t out_offset,
+                             int64_t out_stride,
+                             int64_t src_mc,
+                             int64_t src_nc,
+                             int64_t nth,
+                             int64_t dst_mc,
+                             int64_t dst_nc);
 
 // Same packed A/B layouts; accumulate seeds the F32 result from C.
 void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
