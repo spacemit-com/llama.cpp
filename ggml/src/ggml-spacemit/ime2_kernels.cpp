@@ -3,6 +3,7 @@
 #include "ime_kernels.h"
 #include "repack.h"
 #include "rvv_kernels.h"
+#include "spe_kernels_core.h"
 #include "string.h"
 
 #include <algorithm>
@@ -5142,6 +5143,210 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
             }
         }
     }
+}
+
+// Private split-K layout: [slice][2][4][8][8]. Final C stays row-major.
+// A/B packing, FP32 dot accumulation and FP16 narrowing are unchanged.
+// offset(slice,r,c) = slice*512 + ((r/8)*4+c/8)*64 + (r%8)*8+c%8.
+// The caller reserves M16/N32 padding; only valid rows/columns reach final C.
+// Reduce starts at +0 and adds slices in ascending order, matching the old kernel.
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_8_8_16_32,
+                                        size_t           k,
+                                        const _Float16 * b,
+                                        _Float16 *       a,
+                                        _Float16 *       output,
+                                        size_t           m,
+                                        size_t           n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    GGML_ASSERT(m > 0 && m <= 16 && n > 0 && n <= 32);
+    GGML_ASSERT(k > 0 && k % 8 == 0 && !accumulate);
+    (void) ldc;
+    const size_t kc = k / 8;
+    auto *       c  = reinterpret_cast<int8_t *>(output);
+    __asm__ volatile(
+        MMT4D_FP16_M16N32K8_INIT
+        MMT4D_FP16_M16N32K8_COMPUTE_LOOP
+        "vsetvli       t0, zero, e16, m1, tu, mu\n\t"
+        "vfncvt.f.f.w  v0, v16\n\t"
+        "vfncvt.f.f.w  v1, v18\n\t"
+        "vfncvt.f.f.w  v2, v20\n\t"
+        "vfncvt.f.f.w  v3, v22\n\t"
+        "vfncvt.f.f.w  v4, v24\n\t"
+        "vfncvt.f.f.w  v5, v26\n\t"
+        "vfncvt.f.f.w  v6, v28\n\t"
+        "vfncvt.f.f.w  v7, v30\n\t"
+        "vse16.v       v0, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v1, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v2, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v3, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v4, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v5, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v6, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        "vse16.v       v7, (%[c])\n\t"
+        "addi          %[c], %[c], 128\n\t"
+        : [c] "+&r"(c)
+        : [a] "r"(a), [b] "r"(b), [kc] "r"(kc)
+        : "memory", "cc", "t0", "t2", "a1", "a2", "s1", "s2", "s3", "s4", "v0", "v1", "v2", "v3", "v4",
+          "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13", "v14", "v15", "v16", "v17", "v18",
+          "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+}
+
+void gemm_kernel_f16f16f16_m16_vfwmadot(fp16_row_major_16_32,
+                                        size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        _Float16 *       c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    gemm_kernel_f16f16f16_m16_vfwmadot(gemm_k, b_f16_k8, a_f16_k8, c_ptr, count_m, count_n, ldc, accumulate);
+}
+
+void reducesum_f16f32_m16n32(fp16_8_8_16_32,
+                             void *  input,
+                             int64_t lhs_offset,
+                             int64_t lhs_stride0,
+                             int64_t lhs_stride1,
+                             void *  output,
+                             int64_t out_offset,
+                             int64_t out_stride,
+                             int64_t src_mc,
+                             int64_t src_nc,
+                             int64_t slice_count,
+                             int64_t dst_m,
+                             int64_t dst_n) {
+    GGML_ASSERT(src_mc == 1 && src_nc == 1 && slice_count > 0);
+    GGML_ASSERT(dst_m > 0 && dst_m <= 16 && dst_n > 0 && dst_n <= 32);
+    (void) lhs_stride0;
+    (void) lhs_stride1;
+    auto *       in  = static_cast<const int8_t *>(input) + lhs_offset;
+    auto *       out = static_cast<int8_t *>(output) + out_offset;
+    size_t       nth = static_cast<size_t>(slice_count);
+    size_t       m   = static_cast<size_t>(dst_m);
+    const size_t n   = static_cast<size_t>(dst_n);
+    const size_t os  = static_cast<size_t>(out_stride);
+    __asm__ volatile(
+        "vsetvli       t0, zero, e32, m8, tu, mu\n\t"
+        "vxor.vv       v16, v16, v16\n\t"
+        "vxor.vv       v24, v24, v24\n\t"
+        "L_TILE8_SLICE%=:\n\t"
+        "vsetvli       t0, zero, e16, m1, tu, mu\n\t"
+        "vle16.v       v1, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v3, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v5, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v7, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v9, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v11, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v13, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vle16.v       v15, (%[in])\n\t"
+        "addi          %[in], %[in], 128\n\t"
+        "vfwcvt.f.f.v  v0, v1\n\t"
+        "vfwcvt.f.f.v  v2, v3\n\t"
+        "vfwcvt.f.f.v  v4, v5\n\t"
+        "vfwcvt.f.f.v  v6, v7\n\t"
+        "vfwcvt.f.f.v  v8, v9\n\t"
+        "vfwcvt.f.f.v  v10, v11\n\t"
+        "vfwcvt.f.f.v  v12, v13\n\t"
+        "vfwcvt.f.f.v  v14, v15\n\t"
+        "vsetvli       t0, zero, e32, m2, tu, mu\n\t"
+        "vfadd.vv      v16, v16, v0\n\t"
+        "vfadd.vv      v18, v18, v2\n\t"
+        "vfadd.vv      v20, v20, v4\n\t"
+        "vfadd.vv      v22, v22, v6\n\t"
+        "vfadd.vv      v24, v24, v8\n\t"
+        "vfadd.vv      v26, v26, v10\n\t"
+        "vfadd.vv      v28, v28, v12\n\t"
+        "vfadd.vv      v30, v30, v14\n\t"
+        "addi          %[nth], %[nth], -1\n\t"
+        "bnez          %[nth], L_TILE8_SLICE%=\n\t"
+        "vsetvli       t0, zero, e32, m1, tu, mu\n\t" MMT4D_FP16_UNPACK_M16N32
+        "vsetvli       zero, %[n], e32, m1, tu, mu\n\t"
+        "vse32.v       v16, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v17, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v18, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v19, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v20, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v21, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v22, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v23, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v24, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v25, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v26, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v27, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v28, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v29, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v30, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "vse32.v       v31, (%[out])\n\t"
+        "addi          %[m], %[m], -1\n\t"
+        "beqz          %[m], L_TILE8_DONE%=\n\t"
+        "add           %[out], %[out], %[os]\n\t"
+        "L_TILE8_DONE%=:\n\t"
+        : [in] "+&r"(in), [out] "+&r"(out), [nth] "+&r"(nth), [m] "+&r"(m)
+        : [n] "r"(n), [os] "r"(os)
+        : "memory", "cc", "t0", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
+          "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
+          "v29", "v30", "v31");
 }
 
 }  // namespace ime2
