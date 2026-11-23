@@ -8,6 +8,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct spacemit_session {
@@ -27,10 +28,11 @@ struct spacemit_session {
     size_t workspace_size = 0;
     std::vector<ggml::spacemit::context> contexts;
 
-    struct {
-        uint64_t uid = 0;
-        std::vector<spacemit_opnode> nodes;
-    } cached_graph;
+    // Opnode lists by graph uid. A graph gets one uid per split on this backend.
+    // All lists are dropped when they would hold more than max_cached_opnodes opnodes.
+    static constexpr size_t max_cached_opnodes = 1 << 16;
+    std::unordered_map<uint64_t, std::vector<spacemit_opnode>> cached_graphs;
+    size_t n_cached_opnodes = 0;
 
     spacemit_session() = default;
     ~spacemit_session();
