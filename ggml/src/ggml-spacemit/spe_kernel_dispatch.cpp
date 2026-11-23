@@ -1,9 +1,11 @@
+#if defined(RISCV64_SPACEMIT_IME2)
 #include "ggml.h"
 #include "ime_kernels.h"
 #include "spe_kernels_core.h"
 
 #include <typeindex>
 #include <vector>
+#endif
 
 #if defined(__OHOS__) && defined(__riscv) && defined(__riscv_zfh)
 // Supply the missing _Float16 RTTI using the Itanium C++ ABI layout.
@@ -19,6 +21,7 @@ void * _ZTIDF16_[] = {
 };
 #endif
 
+#if defined(RISCV64_SPACEMIT_IME2)
 namespace mlir::speir::spekernel {
 
 // FP32 [M,K] -> FP16 [dst_mc,dst_kc,16,8]; offsets and strides are bytes.
@@ -358,3 +361,4 @@ void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
 }
 
 }  // namespace spacemit_kernels::ime2
+#endif // RISCV64_SPACEMIT_IME2
