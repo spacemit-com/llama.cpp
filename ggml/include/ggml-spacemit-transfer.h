@@ -32,7 +32,7 @@ enum ggml_spacemit_transfer_state {
 };
 
 struct ggml_spacemit_transfer_config {
-    size_t n_workers;       // 0: one worker; must not exceed available provider CPUs
+    size_t n_workers;       // 0: one worker; each binds a distinct available provider CPU
     size_t queue_capacity;  // 0: 64 pending requests (in-flight work is additional)
 };
 

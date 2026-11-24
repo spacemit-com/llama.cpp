@@ -143,5 +143,36 @@ int main() {
     spacemit_graph_build_prefetch_plan(&projection_split, {spacemit_opnode(projection)}, plan);
     CHECK(count(plan, GGML_SPACEMIT_MODULE_QKV, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
     std::puts("PASS: QKV projection in split, layer and exact weight role guards");
+    // Predictor is an independent speculative branch expanded before QKV.
+    // Its VIEW top-k must signal READY at the producing argsort, separately
+    // from the real FFN router, including when graph planning is repeated.
+    ggml_set_name(wq, "blk.3.attn_q_a.weight");
+    auto * prediction = ggml_argsort_top_k(ctx, q, 2);
+    name(prediction, "ffn_predictor_topk");
+    name(prediction->src[0], "ffn_predictor_argsort");
+    auto * predicted_graph = ggml_new_graph_custom(ctx, 256, false);
+    ggml_build_forward_expand(predicted_graph, prediction);
+    ggml_build_forward_expand(predicted_graph, projection);
+    auto predicted_nodes = plain_plan(predicted_graph);
+    for (int repeat = 0; repeat < 2; ++repeat) {
+        spacemit_graph_build_prefetch_plan(predicted_graph, predicted_nodes, plan);
+        CHECK(count(plan, GGML_SPACEMIT_MODULE_PREDICTOR, GGML_SPACEMIT_PREFETCH_READY, prediction) == 1);
+        CHECK(count(plan, GGML_SPACEMIT_MODULE_ROUTER, GGML_SPACEMIT_PREFETCH_READY) == 0);
+        CHECK(count(plan, GGML_SPACEMIT_MODULE_ROUTER, GGML_SPACEMIT_PREFETCH_BEGIN) == 0);
+        size_t predictor_at = plan.size(), qkv_at = plan.size();
+        for (size_t j = 0; j < plan.size(); ++j) {
+            for (const auto & event : plan[j].before) {
+                if (event.module == GGML_SPACEMIT_MODULE_QKV) { qkv_at = std::min(qkv_at, j); }
+            }
+            for (const auto & event : plan[j].after) {
+                if (event.module == GGML_SPACEMIT_MODULE_PREDICTOR) {
+                    CHECK(predicted_nodes[j].node == prediction->src[0]);
+                    predictor_at = j;
+                }
+            }
+        }
+        CHECK(predictor_at < qkv_at && qkv_at < plan.size());
+    }
+    std::puts("PASS: independent predictor top-k READY and repeated planning");
     ggml_free(ctx);
 }

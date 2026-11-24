@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 #include "spacemit-transfer.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -13,6 +14,8 @@
 #include <vector>
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <fcntl.h>
+#include <cerrno>
 #include <unistd.h>
 #endif
 
@@ -27,6 +30,7 @@ std::atomic<size_t> warmed_bytes{0};
 std::mutex gate_mutex;
 std::condition_variable gate_cv;
 bool blocked = false, entered = false;
+std::atomic<unsigned> cpu_binding_mask{0};
 const auto main_thread = std::this_thread::get_id();
 }
 
@@ -34,8 +38,10 @@ bool spacemit_transfer_provider_available_cpus(std::vector<int> & cpus) {
     cpus = unavailable ? std::vector<int>{} : std::vector<int>{0, 1, 2, 3};
     return !cpus.empty();
 }
-bool spacemit_transfer_provider_bind(const std::vector<int> &) {
+bool spacemit_transfer_provider_bind(const std::vector<int> & cpus) {
     CHECK(std::this_thread::get_id() != main_thread);
+    CHECK(cpus.size() == 1 && cpus[0] >= 0 && cpus[0] < 4);
+    cpu_binding_mask.fetch_or(1u << cpus[0]);
     ++bindings;
     return !bind_failed;
 }
@@ -99,6 +105,12 @@ static ggml_spacemit_transfer_t create(size_t workers = 1, size_t capacity = 8) 
 }
 
 static void basic() {
+#ifndef SPACEMIT_TRANSFER_TEST_REAL
+    cpu_binding_mask.store(0);
+    auto bound_transfer = create(4, 4);
+    CHECK(cpu_binding_mask.load() == 0xf); // four distinct singleton CPU bindings
+    ggml_spacemit_transfer_free(bound_transfer);
+#endif
     auto transfer = create();
     auto event = ggml_spacemit_transfer_event_create();
     CHECK(event);
@@ -492,7 +504,7 @@ int main(int argc, char ** argv) {
     std::printf("X100 provider sampled available CPUs:");
     for (int cpu : cpus) { std::printf(" %d", cpu); }
     std::puts("");
-    const size_t workers = cpus.size() > 1 ? 2 : 1;
+    const size_t workers = std::min(size_t(4), cpus.size());
 #else
     const size_t workers = 2;
     failures();

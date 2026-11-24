@@ -853,6 +853,32 @@ llama_model_deepseek41::graph::graph(const llm_graph_params & params) :
         cur = pre_prev ? build_hc_pre(inpL, pre_prev, il) : ggml_cont(ctx0, ggml_view_2d(ctx0, inpL, n_embd, n_tokens, inpL->nb[2], 0));
         cb(cur, "hc_attn_pre", il);
 
+        // One token per sequence set is decode, including batched decode.
+        // Approximate the upcoming FFN input from the pre-attention stream.
+        // This reuses router weights; no separately trained predictor exists.
+        if (cparams.prefetch && ubatch.n_seq_tokens == 1) {
+            auto * prediction = build_norm(cur, layer.ffn_norm, nullptr, LLM_NORM_RMS, il);
+            prediction = build_lora_mm(layer.ffn_gate_inp, prediction);
+            ggml_prec_set_acc(prediction, GGML_PREC_F32);
+            cb(prediction, "ffn_predictor_logits", il);
+            switch (hparams.expert_gating_func) {
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX:
+                    prediction = ggml_soft_max(ctx0, prediction); break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID:
+                    prediction = ggml_sigmoid(ctx0, prediction); break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT: break;
+                case LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS:
+                    prediction = ggml_sqrt(ctx0, ggml_softplus(ctx0, prediction)); break;
+                default: GGML_ABORT("unsupported predictor gating function");
+            }
+            auto * bias = ubatch.embd && layer.ffn_exp_probs_b_vl ? layer.ffn_exp_probs_b_vl : layer.ffn_exp_probs_b;
+            if (bias) { prediction = ggml_add(ctx0, prediction, bias); }
+            prediction = build_moe_topk(prediction, n_expert, hparams.n_expert_used(), il, true);
+            // Explicit expansion preserves predictor-before-QKV scheduling even
+            // though the speculative branch is independent of model outputs.
+            ggml_build_forward_expand(gf, prediction);
+        }
+
         cur = build_norm(cur, layer.attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 

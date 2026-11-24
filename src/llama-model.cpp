@@ -1696,6 +1696,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     if (params.prefetch_expert_ratio >= 0.0 && !params.prefetch) {
         throw std::runtime_error("prefetch_expert_ratio requires --prefetch");
     }
+    if (params.prefetch_threads < 1) {
+        throw std::runtime_error("prefetch_threads must be at least 1");
+    }
     ml.prefetch = params.prefetch;
     if (params.prefetch) {
         // Ordinary contexts allocate real backend buffers; only lazy contexts wrap
@@ -2567,6 +2570,10 @@ llama_split_mode llama_model::split_mode() const {
 
 bool llama_model::no_alloc() const {
     return params.no_alloc;
+}
+
+int32_t llama_model::prefetch_threads() const {
+    return params.prefetch_threads;
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() const {
@@ -3573,6 +3580,7 @@ llama_model_params llama_model_default_params() {
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.prefetch_expert_ratio       =*/ -1.0,
+        /*.prefetch_threads            =*/ 4,
         /*.vocab_only                  =*/ false,
         /*.check_tensors               =*/ false,
         /*.use_extra_bufts             =*/ true,

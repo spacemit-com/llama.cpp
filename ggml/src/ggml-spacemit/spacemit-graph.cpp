@@ -491,9 +491,12 @@ void spacemit_graph_build_prefetch_plan(const ggml_cgraph * graph,
         } else if (stem == "kqv_out" || stem == "attn_out") {
             merge_range(GGML_SPACEMIT_MODULE_ATTENTION, name.layer,
                         find_module_range(tensor, name.layer, "attn_norm", local, indices, true));
-        } else if (stem == "ffn_moe_topk" && tensor->type == GGML_TYPE_I32) {
-            merge_range(GGML_SPACEMIT_MODULE_ROUTER, name.layer,
-                        find_module_range(tensor, name.layer, "ffn_norm", local, indices, false));
+        } else if ((stem == "ffn_moe_topk" || stem == "ffn_predictor_topk") && tensor->type == GGML_TYPE_I32) {
+            const bool predictor = stem == "ffn_predictor_topk";
+            if (!predictor) {
+                merge_range(GGML_SPACEMIT_MODULE_ROUTER, name.layer,
+                            find_module_range(tensor, name.layer, "ffn_norm", local, indices, false));
+            }
             // top-k can be a non-compute VIEW. Signal READY at its actual local
             // producer, after the executor's existing all-worker barrier.
             const ggml_tensor * producer = tensor;
@@ -504,7 +507,8 @@ void spacemit_graph_build_prefetch_plan(const ggml_cgraph * graph,
             }
             const auto it = indices.find(producer);
             if (it != indices.end()) {
-                add_prefetch_event(points, it->second, GGML_SPACEMIT_MODULE_ROUTER,
+                add_prefetch_event(points, it->second,
+                                   predictor ? GGML_SPACEMIT_MODULE_PREDICTOR : GGML_SPACEMIT_MODULE_ROUTER,
                                    GGML_SPACEMIT_PREFETCH_READY, name.layer, tensor);
             }
         }

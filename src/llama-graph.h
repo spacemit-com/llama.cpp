@@ -1187,6 +1187,10 @@ struct llm_graph_context {
        llm_ffn_gate_type   type_gate,
                      int   il) const;
 
+    // Shared router grouping/selection; predictor IDs never feed actual MoE.
+    ggml_tensor * build_moe_topk(ggml_tensor * selection_probs, int64_t n_expert,
+            int64_t n_expert_used, int il, bool predictor = false) const;
+
     // build MoE FFN without bias tensors
     ggml_tensor * build_moe_ffn(
              ggml_tensor * cur,

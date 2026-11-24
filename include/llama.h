@@ -351,6 +351,7 @@ extern "C" {
         // -1: retain mmap page warmup; [0,1]: reserve floor(ratio * total routed
         // experts) complete expert slots in one bounded host buffer. Requires prefetch.
         double prefetch_expert_ratio;
+        int32_t prefetch_threads; // X100 transfer workers on distinct available CPUs; default 4
 
         // Keep the booleans together to avoid misalignment during copy-by-value.
         bool vocab_only;      // only load the vocabulary, no weights

@@ -490,3 +490,9 @@ if (TARGET ggml-cpu)
     set_tests_properties(test-prefetch-debug-ideal-delay PROPERTIES
         ENVIRONMENT "GGML_PREFETCH_DEBUG_IDEAL=1;GGML_PREFETCH_DEBUG_IDEAL_US=50000")
 endif()
+
+
+llama_build_and_test(test-spacemit-prefetch-policy.cpp
+    LABEL "backend" LINK llama ggml-cpu ggml-base)
+target_include_directories(test-spacemit-prefetch-policy PRIVATE
+    "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/ggml/src")

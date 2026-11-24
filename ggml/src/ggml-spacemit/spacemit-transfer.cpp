@@ -46,8 +46,9 @@ struct ggml_spacemit_transfer {
         }
     }
 
-    void run() {
-        const bool bound = spacemit_transfer_provider_bind(cpus);
+    void run(size_t worker) {
+        // Give each worker its own available provider CPU.
+        const bool bound = spacemit_transfer_provider_bind({cpus[worker]});
         {
             std::lock_guard<std::mutex> lock(mutex);
             startup_failed |= !bound;
@@ -136,7 +137,7 @@ ggml_spacemit_transfer_t ggml_spacemit_transfer_create(
         transfer->queue.resize(capacity);
         transfer->workers.reserve(n);
         for (size_t i = 0; i < n; ++i) {
-            transfer->workers.emplace_back([p = transfer.get()] { p->run(); });
+            transfer->workers.emplace_back([p = transfer.get(), i] { p->run(i); });
         }
         {
             std::unique_lock<std::mutex> lock(transfer->mutex);

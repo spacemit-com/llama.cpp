@@ -1699,6 +1699,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.prefetch        = params.prefetch;
     mparams.prefetch_expert_ratio = params.prefetch_expert_ratio;
+    mparams.prefetch_threads = params.prefetch_threads;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 

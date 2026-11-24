@@ -587,6 +587,7 @@ struct common_params {
     bool no_kv_offload     = false; // disable KV offloading
     bool warmup            = true;  // warmup run
     double prefetch_expert_ratio = -1.0; // optional bounded host expert slots, [0,1]
+    int32_t prefetch_threads = 4; // background transfer workers
     bool prefetch          = false; // backend prefetch planning
     bool check_tensors     = false; // validate tensor data
     bool no_op_offload     = false; // globally disable offload host tensor operations to device

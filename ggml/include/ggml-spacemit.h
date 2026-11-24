@@ -25,12 +25,13 @@ enum ggml_spacemit_module {
     GGML_SPACEMIT_MODULE_ATTENTION,
     GGML_SPACEMIT_MODULE_ROUTER,
     GGML_SPACEMIT_MODULE_EXPERTS,
+    GGML_SPACEMIT_MODULE_PREDICTOR, // speculative top-k, before QKV
 };
 
 enum ggml_spacemit_prefetch_phase {
     GGML_SPACEMIT_PREFETCH_BEGIN,
     GGML_SPACEMIT_PREFETCH_END,
-    GGML_SPACEMIT_PREFETCH_READY, // ROUTER: selected expert indices are ready
+    GGML_SPACEMIT_PREFETCH_READY, // ROUTER/PREDICTOR: expert indices are ready
 };
 
 struct ggml_spacemit_prefetch_event {
@@ -38,7 +39,7 @@ struct ggml_spacemit_prefetch_event {
     enum ggml_spacemit_prefetch_phase phase;
     int layer;
     size_t opnode_index;
-    // BEGIN/END: boundary tensor; ROUTER READY: the I32 top-k tensor/view.
+    // BEGIN/END: boundary tensor; ROUTER/PREDICTOR READY: the I32 top-k tensor/view.
     const struct ggml_tensor * tensor;
 };
 

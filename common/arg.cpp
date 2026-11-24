@@ -1974,6 +1974,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_PREFETCH_EXPERT_RATIO"));
     add_opt(common_arg(
+        {"--prefetch-threads"}, "N",
+        string_format("number of background X100 transfer workers, each on a distinct available CPU (default: %d)", params.prefetch_threads),
+        [](common_params & params, const std::string & value) {
+            size_t end = 0;
+            const int threads = std::stoi(value, &end);
+            if (end != value.size() || threads < 1) {
+                throw std::invalid_argument("--prefetch-threads must be an integer of at least 1");
+            }
+            params.prefetch_threads = threads;
+        }
+    ).set_env("LLAMA_ARG_PREFETCH_THREADS"));
+    add_opt(common_arg(
         {"--spm-infill"},
         string_format(
             "use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: %s)",

@@ -55,65 +55,41 @@ usual AUTO size threshold, so small individual expert tensors are also lazy.
 The file mapping may cover the GGUF file, but ordinary weights are read into
 their own buffers rather than used through that mapping.
 
-With a supported SpacemiT backend, the context installs an asynchronous expert
-page-warmup manager. A recognized layer QKV BEGIN sets a preallocated atomic
-activation flag. An unpinned background dispatcher submits page touches to an
-available X100 transfer worker; the callback does not allocate, lock, submit
-transfers or wait. Expert tensor addresses stay unchanged; Router and expert
-execution do not wait for the whole warmup request. Expert kernels fault any
-missing pages normally. If the required backend functions or an available
-transfer CPU are missing, inference continues using demand paging.
+With a supported SpacemiT backend, the context installs one expert-prefetch
+manager. Both prefill and decode policies live in
+`src/llama-spacemit-prefetch.cpp` and share the same model-owned slot buffer,
+transfer service and dispatcher. QKV BEGIN opens the current layer's window.
+Callbacks snapshot IDs and update request metadata under a short mutex; they do
+not copy weights, wait for transfer completion, create mappings or drain work.
+An unpinned dispatcher owns job descriptors and submits payload work to an
+available X100 worker. Missing backend functions or unavailable transfer CPUs
+leave inference on the existing mmap fallback.
 
-Four reusable event slots carry chunks of at most 16 MiB, with at most 64 MiB
-in flight. The dispatcher rotates between activated layers and projections and
-continues after QKV without requiring another decode callback. It queries event
-completion and sleeps between rounds with a 1 ms condition-variable timeout.
-BUSY leaves the submission cursor unchanged for retry. Other submission errors
-or failed/cancelled events stop further speculative dispatch.
+Four reusable events carry chunks of at most 16 MiB, with at most 64 MiB in
+flight. BUSY retries keep the cursor unchanged. The dispatcher polls completion
+with a 1 ms condition-variable timeout. Cancelled destinations remain reserved
+until every accepted write reaches a terminal state; late completions cannot
+publish an aborted expert or overwrite a reused slot. Shutdown detaches the
+callback, joins dispatch and drains accepted requests before releasing buffers.
 
-Each eligible expert range can be submitted once per context. Accepted cursors
-persist across graphs and tokens, so later callbacks do not restart the sweep.
-Gate/up/down, fused gate-up and CHEXPS matrix banks are considered only when
-listed in `model.can_prefetch` and backed by CPU host-accessible buffers. The
-64 MiB limit bounds in-flight requests only: it does not limit total warmed
-bytes, RSS, OS readahead or page-cache residency. A layer can eventually warm
-all eligible ranges while the context remains alive. There is no repeat scan
-after eviction, and shutdown may cancel unfinished warmup.
+DeepSeek41 graphs with one token per sequence set add a speculative predictor
+before QKV, including batched decode. It applies the current layer's FFN norm
+and router to the pre-attention stream, then uses the normal group/top-k policy.
+This is an approximation using existing weights, not a trained predictor or a
+promise that predictions match the actual router. The predictor branch is
+explicitly expanded before QKV and does not feed model outputs. Its READY event
+snapshots the union of predicted IDs across the microbatch; QKV BEGIN starts
+those copies. At actual router READY, decode closes its window and requests
+cancellation immediately. Only fully copied actual experts are exposed from
+slots; misses and unfinished experts use their original mmap addresses. No
+router-time demand copy or transfer wait is added. The first local expert node
+also snapshots actual IDs when the router was in another backend split.
 
-Ordinary allocated buffers are locked only when mlock is requested and succeeds.
-Locking them does not lock a prefix of the GGUF mapping containing expert pages.
-Expert mmap pages use NORMAL advice in this mode on POSIX systems; Windows keeps
-its default paging policy. The loader does not eagerly populate or scan those
-expert ranges. When tensor validation is requested, it warns and skips the full
-scan of forced-lazy expert banks; it does not schedule deferred validation.
-Completed warmup does not pin the pages or guarantee that they remain resident.
-This policy is not an expert cache with selection or eviction. File-backed model
-loading and a backend that can wrap host mmap buffers are required; unsupported
-mapping paths fail explicitly instead of silently copying all experts.
-
-The manager claims one callback owner per loaded llama library instance and
-binds one supported backend handle. Other contexts warn and remain inactive;
-they do not take ownership automatically later. Direct users of the backend
-callback setter must coordinate ownership with this manager. Transfer CPU
-selection samples currently available X100 CPUs; it does not reserve those CPUs
-exclusively against other applications.
-
-Context teardown stops new submissions, removes the callback and cancels/drains
-accepted requests before freeing events, backend handles or model mappings.
-Cancellation is cooperative, so a page fault already in progress can delay
-shutdown. There is no second anonymous expert-weight buffer.
-
-API callers must opt in separately at model load and context creation using the
-two `prefetch` fields. The public model/context parameter layout changes require
-rebuilding callers against the updated headers. Other backends retain the
-optional `ggml_backend_set_prefetch(backend, enabled)` planning hook; the X100
-page-warmup manager requires the SpacemiT callback and transfer capabilities.
-
-`ggml_backend_spacemit_set_prefetch` can pause/resume an installed callback while
-idle and invalidates the cached event plan. Installing a callback also enables
-prefetch for compatibility with existing callers; removing it disables prefetch.
-As with the callback API, handles for the same device share this configuration.
-Both parameter structures must match the headers used to build the library.
+Without a ratio, prefill warms all current-layer expert pages through the same
+transfer service; decode warms predicted IDs and cancels at the router. Page
+warmup does not pin OS file-cache pages or allocate an expert slot buffer. Both
+modes retain mappings for normal demand faults. Only banks allowlisted by
+`model.can_prefetch` and backed by contiguous CPU mappings are eligible.
 
 ## Recognized windows
 
@@ -166,6 +142,10 @@ and all added event barriers, unless planning is explicitly enabled again.
 Event windows do not consume or reorder compute nodes.
 
 ## Validation
+
+`test-spacemit-io-uring` checks buffered reads, QD slot reuse, a short final
+read, payload integrity and page-cache residency observed through the same mmap.
+It is Linux-specific and skips on other platforms.
 
 `test-spacemit-prefetch-plan` checks data dependencies, fused-member mapping,
 view top-k producer timing, scheduler copy names, split graphs and layer mismatch.
@@ -378,6 +358,19 @@ zero counters on a kernel without this interface do not mean zero storage I/O.
 
 Measured K3 single-layer results and experiment limits: [2026-11-18 results](SPACEMIT-prefetch-results-20261118.md).
 
+### Concurrent page warmup with expert slots
+
+With `--prefetch --prefetch-expert-ratio 0.65` and at least two prefetch workers,
+prefill now runs page warmup and mmap-to-slot copies within the same QKV-to-router
+window. One request lane touches the current layer's mapped expert pages; the
+remaining lanes copy expert payloads into the existing CPU slot buffer. Both use
+the same X100 worker service, so the worker count does not increase. Router READY
+cancels both kinds of work without waiting; only fully copied experts are
+published to slots. Incomplete copies continue to use mmap. Pagewarm jobs never
+reserve, publish or discard slots. A single worker retains copy-only behavior;
+decode retains the predictor-driven copy policy. Omitting the ratio retains
+pagewarm-only behavior, and ratio zero retains demand mmap.
+
 ### Reusing the loader mmap: asynchronous page warmup experiment
 
 The single-layer experiment accepts `mmap-prefetch`. It reuses the loader's
@@ -436,21 +429,73 @@ One slot contains all routed projection matrices (gate, up, down, or fused
 gate/up) for one expert in one layer. Shared experts and routers do not count.
 The slot count is floor(ratio * sum(expert_count_per_layer)). Layers may have
 different projection sizes: slot stride is the largest complete expert payload
-across layers, with 64-byte alignment between matrices. The single CPU buffer
+across layers, with each matrix aligned to 64 bytes. The single CPU buffer
 is slot_count * slot_stride bytes (backend allocation alignment may add padding).
 Zero reserves no expert buffer; one reserves all experts. Omitting the ratio
 keeps the existing mmap page-warming mode and allocates no separate slot buffer.
 
-Admission is fixed, round-robin across layers, with ascending expert IDs; this
-version does not evict or replace slots based on router top-k. QKV BEGIN activates
-X100 asynchronous copies into admitted slots. A slot is published only after all
-its matrices and chunks complete. CPU MUL_MAT_ID reads a published slot, otherwise
-it reads the original mmap slice, including experts outside the admitted set.
-Stopping cancels/drains accepted work before context teardown. Completed slots
-belong to the model and survive context recreation; incomplete slots are retried.
-The ratio limits the separate buffer, not process RSS or the OS file page cache.
-The model mappings remain intact for fallback. Native accelerator expert buffers
-are not supported by this CPU slot mode.
+A positive ratio must reserve at least one complete layer's experts; otherwise
+loading reports an error. Zero remains mmap-only. For example, two 256-expert
+layers with ratio 0.65 reserve floor(512 * 0.65) = 332 slots, and the fixed
+prefill region occupies slots [0, 256). No separate prefill buffer is allocated.
+
+Prefill writes expert `e` only to slot `e` in that fixed prefix, replacing the
+previous layer's unpinned cached experts. Slots outside the prefix are never
+prefill destinations. Prefill attempts all current-layer experts, with mmap
+fallback if compute reaches an expert before its slot copy completes. On transition
+to decode, the prefix and any retained complete experts become ordinary parts
+of the same full 332-slot LRU cache; no buffer migration is needed.
+
+Decode first protects predicted hits, then admits misses into empty slots or
+the least recently used eligible slots across the entire buffer. Actual router
+hits update LRU and are pinned through their local EXPERTS execution window.
+For CPU-offloaded experts without a SpacemiT EXPERTS END event, the next layer
+or token's QKV BEGIN releases the prior pins; its input depends on completion
+of the prior FFN.
+Writing slots are never evicted, including while cancellation awaits worker
+acknowledgement. One expert is published only after all gate/up/down matrices
+and chunks complete. CPU MUL_MAT_ID uses the resolver for complete pinned hits;
+all other reads retain the original mmap slice. Completed contents belong to
+the model and survive context recreation.
+
+Positive-ratio slots are filled by X100 background workers copying the exact
+expert slices from the model's existing mmap into the slots buffer. The slot
+path does not reopen the model, use `pread` or `O_DIRECT`, or read sector
+padding. Workers can still block on cold source page faults; unlike page
+warming alone, this mode also copies and stores a second copy of the payload.
+
+During prefill with a positive slot ratio and at least two transfer workers,
+one event lane independently warms the current layer's mmap pages while the
+remaining lanes copy experts into slots. With the default four workers this is
+one page-warmup lane and three copy lanes, sharing the same worker service.
+The warmup lane can copy when it has no eligible warmup job. Warmup progress is
+tracked separately and owns no slot reservation; only complete copies publish
+slots. Both job kinds are cancelled at router READY. Decode and single-worker
+prefill keep the copy-only policy.
+
+`--prefetch-threads N` (environment: `LLAMA_ARG_PREFETCH_THREADS`) selects the
+number of background X100 transfer workers, default 4, minimum 1. Each worker
+binds to a distinct online, affinity-eligible CPU sampled as available by the
+provider. Requesting more workers than available CPUs disables warmup with a
+warning; busy CPUs and A100 cores are not used as substitutes. Each copy job
+has at most one in-flight chunk, and each worker handles at most one 16 MiB
+chunk. The independent warmup lane may touch the same expert as a copy lane.
+This option applies to both slot copies and mmap page warmup.
+
+Both prefill and decode close the prefetch window and request cancellation as
+soon as the current layer's router is ready. No more reads are submitted for
+that window. Complete experts remain usable; unfinished experts use mmap.
+Workers check cancellation between 64 KiB copy chunks. A copy already in
+progress, including any page fault it triggers, must return before the worker
+acknowledges cancellation and the slot can be reused. Failed or cancelled
+transfers do not publish an expert. Omitting the ratio still uses mmap page
+warming, unchanged.
+
+The ratio bounds only the separate expert buffer, not RSS or OS file page cache.
+Native accelerator expert buffers are outside this CPU slot mode. Only one
+manager can own the shared SpacemiT callback; use one active inference context
+per model with this mutable cache. A shared model executing concurrent CPU
+expert graphs in other contexts is not supported by the current reader pins.
 
 
 ## Ideal-compute prefetch debugging

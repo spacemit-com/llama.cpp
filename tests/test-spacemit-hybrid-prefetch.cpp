@@ -1,7 +1,7 @@
 // Production hybrid-prefetch hardware benchmark; deliberately not a default CTest.
-// Usage: test-spacemit-hybrid-prefetch MODEL MODE PREFIX 128
+// Usage: test-spacemit-hybrid-prefetch MODEL MODE PREFIX PP [UBATCH] [SEED]
 // Native float32, full-vocabulary last-token logits: .first/.decode/.warm.logits
-// and .warm1/.warm2/.warm3.logits. Run modes in separate, exclusively queued processes.
+// and .warm<N>.logits. Run modes in separate, exclusively queued processes.
 #include "llama.h"
 #include "llama-model.h"
 #include "ggml.h"
@@ -20,12 +20,13 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <map>
+#include <random>
 #include <sys/resource.h>
 
 using clock_type = std::chrono::steady_clock;
-static constexpr int pp_tokens = 128;
 static constexpr int decode_tokens = 16;
-static constexpr int warm_repeats = 3;
+static constexpr int warm_repeats = 1;
 static constexpr const char * expert_override = ".*ffn_(gate|up|down)_exps.*";
 
 static void require(bool ok, const char * message) {
@@ -165,9 +166,64 @@ static void save_text(const llama_vocab * vocab, const std::vector<llama_token> 
     require(size >= 0, "detokenization failed");
     save_bytes(path, text.data(), size_t(size));
 }
+struct expert_coverage {
+    std::map<int, std::vector<unsigned char>> selected;
+    std::map<int, int> experts;
+};
+
+static bool observe_expert_ids(ggml_tensor * tensor, bool ask, void * opaque) {
+    if (!ask || tensor->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+    auto & coverage = *static_cast<expert_coverage *>(opaque);
+    const ggml_tensor * weights = tensor->src[0];
+    const ggml_tensor * ids = tensor->src[2];
+    require(weights && ids && ids->type == GGML_TYPE_I32 && ids->data, "missing executed expert IDs");
+    int layer = -1;
+    require(std::sscanf(weights->name, "blk.%d.", &layer) == 1 && layer >= 0,
+            "cannot identify expert layer");
+    const int n_experts = int(weights->ne[2]);
+    require(n_experts > 0 && ids->ne[2] == 1 && ids->ne[3] == 1, "unexpected expert ID shape");
+    if (coverage.selected.count(layer) == 0) {
+        coverage.selected[layer].assign(size_t(n_experts), 0);
+        coverage.experts[layer] = n_experts;
+    }
+    require(coverage.experts[layer] == n_experts, "expert count changed within a layer");
+    for (int64_t row = 0; row < ids->ne[1]; ++row) {
+        for (int64_t col = 0; col < ids->ne[0]; ++col) {
+            int32_t expert = -1;
+            std::memcpy(&expert, static_cast<const char *>(ids->data) + row * ids->nb[1] + col * ids->nb[0],
+                        sizeof(expert));
+            if (expert >= 0) {
+                require(expert < n_experts, "expert ID is out of range");
+                coverage.selected[layer][size_t(expert)] = 1;
+            }
+        }
+    }
+    return false;
+}
+
+static std::string coverage_json(const expert_coverage & coverage, bool & all_covered) {
+    std::ostringstream out;
+    out << '[';
+    all_covered = !coverage.selected.empty();
+    bool first = true;
+    for (const auto & entry : coverage.selected) {
+        const int selected = static_cast<int>(std::count(entry.second.begin(), entry.second.end(), static_cast<unsigned char>(1)));
+        const int experts = coverage.experts.at(entry.first);
+        all_covered = all_covered && selected == experts;
+        if (!first) { out << ','; }
+        first = false;
+        out << "{\"layer\":" << entry.first << ",\"selected_experts\":" << selected
+            << ",\"total_experts\":" << experts << '}';
+    }
+    out << ']';
+    return out.str();
+}
+
 int main(int argc, char ** argv) {
-    if (argc != 5) {
-        std::fprintf(stderr, "usage: %s MODEL resident|mmap|mmap-eager|hybrid-off|hybrid-on PREFIX PP (PP must be 128)\n", argv[0]);
+    if (argc < 5 || argc > 7) {
+        std::fprintf(stderr, "usage: %s MODEL resident|mmap|mmap-eager|hybrid-off|hybrid-on PREFIX PP [UBATCH] [SEED]\n", argv[0]);
         return 2;
     }
     llama_model * model = nullptr;
@@ -181,7 +237,11 @@ int main(int argc, char ** argv) {
                 mode == "hybrid-off" || mode == "hybrid-on", "unknown mode");
         size_t parsed = 0;
         const int pp = std::stoi(argv[4], &parsed);
-        require(parsed == std::strlen(argv[4]) && pp == pp_tokens, "PP must be exactly 128");
+        require(parsed == std::strlen(argv[4]) && pp > 0, "PP must be positive");
+        const int ubatch = argc >= 6 ? std::stoi(argv[5]) : pp;
+        const uint32_t seed = argc >= 7 ? uint32_t(std::stoul(argv[6])) : UINT32_C(20261120);
+        require(ubatch > 0 && ubatch <= pp, "UBATCH must be in 1..PP");
+        expert_coverage coverage;
         const bool hybrid = mode == "hybrid-off" || mode == "hybrid-on";
         ggml_backend_load_all();
         llama_backend_init();
@@ -193,6 +253,8 @@ int main(int argc, char ** argv) {
         }
         require(has_spacemit, "SpacemiT backend unavailable");
         auto params = llama_model_default_params();
+        // Keep Q4_0 expert weights mmap-able instead of repacking the full model into RAM.
+        params.use_extra_bufts = false;
         params.n_gpu_layers = 99;
         params.load_mode = (mode == "mmap" || mode == "mmap-eager") ? LLAMA_LOAD_MODE_MMAP : LLAMA_LOAD_MODE_NONE;
         params.lazy_mode = mode == "mmap" ? LLAMA_LAZY_MODE_ON : LLAMA_LAZY_MODE_OFF;
@@ -206,7 +268,7 @@ int main(int argc, char ** argv) {
         const auto load_end = clock_type::now();
         require(model != nullptr, "model load failed");
         const snapshot after_load = sample();
-        require(llama_model_n_layer(model) == 1, "benchmark requires a single-layer model");
+        require(llama_model_n_layer(model) > 0, "model has no layers");
         const auto mapping = inspect_mapping(*model);
         require(!hybrid || mapping.mapped_expert_tensors == mapping.expert_tensors,
                 "hybrid loader did not mark all routed expert weights can_prefetch");
@@ -214,30 +276,36 @@ int main(int argc, char ** argv) {
                      model->can_prefetch.size(), mapping.ordinary_bytes, mapping.expert_bytes, mapping.mapped_expert_bytes);
         const auto * vocab = llama_model_get_vocab(model);
         const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-        require(n_vocab > 227, "vocabulary does not contain input IDs 100..227");
+        require(n_vocab > 0, "model has an empty vocabulary");
         auto cparams = llama_context_default_params();
-        cparams.n_ctx = 256;
-        cparams.n_batch = pp_tokens;
-        cparams.n_ubatch = pp_tokens;
+        cparams.n_ctx = pp + decode_tokens + 1;
+        cparams.n_batch = pp;
+        cparams.n_ubatch = ubatch;
         cparams.n_threads = 8;
         cparams.n_threads_batch = 8;
         cparams.prefetch = mode == "hybrid-on";
+        cparams.cb_eval = observe_expert_ids;
+        cparams.cb_eval_user_data = &coverage;
         const snapshot before_context = sample();
         const auto context_begin = clock_type::now();
         ctx = llama_init_from_model(model, cparams);
         const auto context_end = clock_type::now();
         require(ctx != nullptr, "context creation failed");
         const snapshot after_context = sample();
-        std::vector<llama_token> tokens(pp_tokens);
-        for (int i = 0; i < pp_tokens; ++i) { tokens[i] = 100 + i; }
+        std::vector<llama_token> tokens(pp);
+        std::mt19937 rng(seed);
+        std::uniform_int_distribution<llama_token> random_token(0, n_vocab - 1);
+        for (auto & token_id : tokens) { token_id = random_token(rng); }
         const snapshot before_first = sample();
         const auto first_begin = clock_type::now();
-        require(llama_decode(ctx, llama_batch_get_one(tokens.data(), pp_tokens)) == 0, "first prefill failed");
+        require(llama_decode(ctx, llama_batch_get_one(tokens.data(), pp)) == 0, "first prefill failed");
         llama_synchronize(ctx);
         const auto first_end = clock_type::now();
         const snapshot after_first = sample();
         const auto first_logits = capture_logits(ctx, n_vocab, prefix + ".first.logits");
         const uint64_t first_hash = logits_hash(first_logits);
+        bool all_experts_covered = false;
+        const std::string first_pp_coverage = coverage_json(coverage, all_experts_covered);
         std::vector<llama_token> generated;
         generated.reserve(decode_tokens);
         llama_token token = greedy(first_logits.data(), n_vocab);
@@ -262,7 +330,7 @@ int main(int argc, char ** argv) {
             llama_synchronize(ctx);
             before_warm.push_back(sample());
             const auto begin = clock_type::now();
-            require(llama_decode(ctx, llama_batch_get_one(tokens.data(), pp_tokens)) == 0, "warm prefill failed");
+            require(llama_decode(ctx, llama_batch_get_one(tokens.data(), pp)) == 0, "warm prefill failed");
             llama_synchronize(ctx);
             const auto end = clock_type::now();
             after_warm.push_back(sample());
@@ -282,8 +350,12 @@ int main(int argc, char ** argv) {
         require(out.good(), "cannot open result JSON");
         out << std::setprecision(17) << std::boolalpha;
         out << "{\n  \"model\": " << json_string(argv[1]) << ",\n  \"mode\": " << json_string(mode)
-            << ",\n  \"pp_tokens\":128, \"decode_tokens\":16, \"warm_repeats\":3, \"n_ctx\":256,"
-            << " \"n_batch\":128, \"n_ubatch\":128, \"n_threads\":8, \"n_threads_batch\":8, \"n_gpu_layers\":99, \"n_layers\":1"
+            << ",\n  \"pp_tokens\":" << pp << ", \"decode_tokens\":16, \"warm_repeats\":" << warm_repeats << ", \"n_ctx\":" << cparams.n_ctx
+            << ", \"n_batch\":" << cparams.n_batch << ", \"n_ubatch\":" << cparams.n_ubatch
+            << ", \"seed\":" << seed << ", \"n_threads\":8, \"n_threads_batch\":8, \"n_gpu_layers\":99"
+            << ", \"n_layers\":" << llama_model_n_layer(model)
+            << ", \"first_pp_expert_coverage\":" << first_pp_coverage
+            << ", \"all_experts_covered\":" << (all_experts_covered ? "true" : "false")
             << ",\n  \"load_mode\": " << json_string(params.load_mode == LLAMA_LOAD_MODE_MMAP ? "MMAP" : "NONE")
             << ",\n  \"lazy_mode\": " << json_string(params.lazy_mode == LLAMA_LAZY_MODE_ON ? "ON" : "OFF")
             << ",\n  \"model_prefetch\": " << params.prefetch << ", \"context_prefetch\": " << cparams.prefetch
@@ -295,8 +367,13 @@ int main(int argc, char ** argv) {
             << ",\n  \"loader_expert_mapping\": " << mapping.entries
             << ",\n  \"load_ms\": " << ms(load_begin, load_end) << ", \"context_ms\": " << ms(context_begin, context_end)
             << ",\n  \"first_pp_ms\": " << ms(first_begin, first_end)
-            << ",\n  \"warm_pp_ms\": " << (warm_ms[0] + warm_ms[1] + warm_ms[2]) / warm_repeats
-            << ", \"warm_pp_ms_each\": [" << warm_ms[0] << ',' << warm_ms[1] << ',' << warm_ms[2] << ']'
+            << ",\n  \"warm_pp_ms\": " << warm_ms.front();
+        out << ", \"warm_pp_ms_each\": [";
+        for (size_t r = 0; r < warm_ms.size(); ++r) {
+            if (r) { out << ','; }
+            out << warm_ms[r];
+        }
+        out << ']'
             << ",\n  \"decode16_ms\": " << ms(decode_begin, decode_end)
             << ",\n  \"total_measured_ms\": " << ms(process_start, measured_end)
             << ",\n  \"load_plus_first_ms\": " << ms(load_begin, first_end)
@@ -342,7 +419,7 @@ int main(int argc, char ** argv) {
         require(out.good(), "cannot save result JSON");
         require(repeat_equal, "repeat prefill logits changed (see saved logits and JSON)");
         std::fprintf(stderr, "PASS mode=%s first_pp_ms=%.3f warm_pp_ms=%.3f decode16_ms=%.3f JSON=%s.json\n",
-                     mode.c_str(), ms(first_begin, first_end), (warm_ms[0] + warm_ms[1] + warm_ms[2]) / warm_repeats,
+                     mode.c_str(), ms(first_begin, first_end), warm_ms.front(),
                      ms(decode_begin, decode_end), prefix.c_str());
         result = 0;
     } catch (const std::exception & error) {
