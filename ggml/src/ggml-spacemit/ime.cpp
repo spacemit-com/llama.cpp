@@ -2617,10 +2617,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_optimal_repack_type
             {
 #if defined(RISCV64_SPACEMIT_IME2)
                 if ((ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2)) {
-                    // Dense matrices and contiguous expert weights have packed
-                    // kernels. Other shapes must keep their canonical strides.
-                    if (!cur->view_src && ggml_is_contiguous(cur) &&
-                        (ggml_n_dims(cur) == 2 || ggml_n_dims(cur) == 3)) {
+                    const int rank = ggml_n_dims(cur);
+                    // Packed MoE kernels index experts separately; each expert must
+                    // start on a complete N32 tile. Keep partial tiles canonical.
+                    const bool packed_experts = rank == 3 && cur->ne[1] % 32 == 0;
+                    if (!cur->view_src && ggml_is_contiguous(cur) && (rank == 2 || packed_experts)) {
                         return &traits_instance<ggml::cpu::riscv64_spacemit::tensor_traits_q8_0_ime2>();
                     }
                 }
