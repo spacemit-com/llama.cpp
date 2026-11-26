@@ -4739,7 +4739,8 @@ size_t gemm_i8i5_k32_rows(a_pack           ap,
 }
 
 // A/B use [K/8][M16|N32][K8]; the output is row-major FP32.
-void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+template <bool FA_DIRECT_ACCUMULATE>
+static void gemm_kernel_f16f16f32_m16_vfwmadot_impl(size_t           gemm_k,
                                         const _Float16 * b_f16_k8,
                                         _Float16 *       a_f16_k8,
                                         float *          c_ptr,
@@ -4764,10 +4765,18 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
     size_t           kc_left       = gemm_k / 8;
     // Accumulator register pairs are not row-major; add existing C only after unpacking.
     // The local tile also avoids writing beyond a partial-M output.
-    const bool       via_tile      = accumulate || count_m != 16;
+    const bool       via_tile      = !FA_DIRECT_ACCUMULATE && (accumulate || count_m != 16);
     const bool       store_vs8r    = count_m == 16 && count_n == 32 && ldc == 32 && !accumulate;
     float *          out           = via_tile ? tile : c_ptr;
     const size_t     out_row_bytes = (via_tile ? size_t{ 32 } : ldc) * sizeof(float);
+
+#define GGML_IME2_PV_ACCUMULATE_ROW(VREG)                  \
+        "vle32.v   v0, (%[out])\n\t"                     \
+        "vfadd.vv  " #VREG ", v0, " #VREG "\n\t"         \
+        "vse32.v   " #VREG ", (%[out])\n\t"              \
+        "addi      t1, t1, -1\n\t"                       \
+        "beqz      t1, .L_f16_store_done_%=\n\t"          \
+        "add       %[out], %[out], %[out_stride]\n\t"
 
     asm volatile(
         "vsetvli   t0, zero, e32, m4, tu, mu\n\t"
@@ -5089,6 +5098,26 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "vpack.vv  v26, v9, v11, 3\n\t"
         "vpack.vv  v28, v12, v14, 3\n\t"
         "vpack.vv  v30, v13, v15, 3\n\t"
+        ".if       %[fa_direct_accumulate]\n\t"
+        "vsetvli   t0, %[count_n], e32, m1, tu, mu\n\t"
+        "mv        t1, %[count_m]\n\t"
+        GGML_IME2_PV_ACCUMULATE_ROW(v16)
+        GGML_IME2_PV_ACCUMULATE_ROW(v17)
+        GGML_IME2_PV_ACCUMULATE_ROW(v18)
+        GGML_IME2_PV_ACCUMULATE_ROW(v19)
+        GGML_IME2_PV_ACCUMULATE_ROW(v20)
+        GGML_IME2_PV_ACCUMULATE_ROW(v21)
+        GGML_IME2_PV_ACCUMULATE_ROW(v22)
+        GGML_IME2_PV_ACCUMULATE_ROW(v23)
+        GGML_IME2_PV_ACCUMULATE_ROW(v24)
+        GGML_IME2_PV_ACCUMULATE_ROW(v25)
+        GGML_IME2_PV_ACCUMULATE_ROW(v26)
+        GGML_IME2_PV_ACCUMULATE_ROW(v27)
+        GGML_IME2_PV_ACCUMULATE_ROW(v28)
+        GGML_IME2_PV_ACCUMULATE_ROW(v29)
+        GGML_IME2_PV_ACCUMULATE_ROW(v30)
+        GGML_IME2_PV_ACCUMULATE_ROW(v31)
+        ".else\n\t"
         "bnez      %[store_vs8r], .L_f16_store_whole_registers_%=\n\t"
         "vsetvli   t0, %[count_n], e32, m1, tu, mu\n\t"
         "vse32.v   v16, (%[out])\n\t"
@@ -5127,13 +5156,16 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
         "vs8r.v    v16, (%[out])\n\t"
         "addi      %[out], %[out], 1024\n\t"
         "vs8r.v    v24, (%[out])\n\t"
+        ".endif\n\t"
         ".L_f16_store_done_%=:\n\t"
         : [a0] "+&r"(a0), [a1] "+&r"(a1), [b0] "+&r"(b0), [b1] "+&r"(b1),
           [b2] "+&r"(b2), [b3] "+&r"(b3), [kc] "+&r"(kc_left), [out] "+&r"(out)
-        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes), [store_vs8r] "r"(store_vs8r)
+        : [count_n] "r"(count_n), [out_stride] "r"(out_row_bytes), [store_vs8r] "r"(store_vs8r),
+          [count_m] "r"(count_m), [fa_direct_accumulate] "i"(FA_DIRECT_ACCUMULATE)
         : "cc", "memory", "t0", "t1", "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11", "v12", "v13",
           "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23", "v24", "v25", "v26", "v27", "v28",
           "v29", "v30", "v31");
+#undef GGML_IME2_PV_ACCUMULATE_ROW
 
     if (via_tile) {
         for (size_t m = 0; m < count_m; ++m) {
@@ -5142,6 +5174,29 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
             }
         }
     }
+}
+
+void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
+                                        const _Float16 * b_f16_k8,
+                                        _Float16 *       a_f16_k8,
+                                        float *          c_ptr,
+                                        size_t           count_m,
+                                        size_t           count_n,
+                                        size_t           ldc,
+                                        bool             accumulate) {
+    gemm_kernel_f16f16f32_m16_vfwmadot_impl<false>(gemm_k, b_f16_k8, a_f16_k8, c_ptr,
+                                                 count_m, count_n, ldc, accumulate);
+}
+
+void fa_pv_f16f16f32_m16n32_k64_accumulate(const _Float16 * b_f16_k8,
+                                            _Float16 *       a_f16_k8,
+                                            float *          c_ptr,
+                                            size_t           count_m,
+                                            size_t           ldc) {
+    // Add C only after unpacking, with one F32 addition per completed dot product.
+    // The row count prevents loads/stores beyond a partial query panel.
+    gemm_kernel_f16f16f32_m16_vfwmadot_impl<true>(64, b_f16_k8, a_f16_k8, c_ptr,
+                                                count_m, 32, ldc, true);
 }
 
 }  // namespace ime2
