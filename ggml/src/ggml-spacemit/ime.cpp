@@ -1839,6 +1839,119 @@ private:
         return true;
     }
 
+    // Pattern 3: the sibling FFN projections (gate/up) of one split SwiGLU share their activation.
+    // Cast it once into a graph-scoped M16 pack and drive both GEMMs from it, so the F32 -> F16
+    // conversion is paid once instead of twice. Emitted at the second projection's position (see
+    // try_fuse_node); SwiGLU stays a separate node.
+    bool compute_forward_fused(ggml::spacemit::context & ctx, const spacemit_opnode & node) const override {
+        if (node.opcode != SPACEMIT_OP_MUL_MAT_FFN || node.fused.size() != 1) {
+            return false;
+        }
+        ggml_tensor * first  = node.fused[0];
+        ggml_tensor * second = node.node;
+
+        static const bool trace = getenv("GGML_SPACEMIT_FFN_TRACE") != nullptr;
+        const auto run_separately = [&](const char * why) {
+            if (trace && ctx.ith == 0) {
+                GGML_LOG_INFO("ffn_trace: fused op fell back to separate (%s)\n", why);
+            }
+            if (!compute_forward(ctx, first)) {
+                return false;
+            }
+            ctx.sync();
+            return compute_forward(ctx, second);
+        };
+
+        // Recheck the actual buffers and traits on a cached graph before any worker writes.
+        if (!ggml_spacemit_ffn_f16_eligible(first, second)) {
+            return run_separately("ineligible");
+        }
+        const size_t pack_bytes = ggml_spacemit_ffn_f16_workspace(first, second);
+        if (!ctx.shared.data || ctx.workspace_size < pack_bytes) {
+            return run_separately("no tcm or workspace");
+        }
+
+        const ggml_tensor * input = first->src[1];
+        const size_t        M     = static_cast<size_t>(input->ne[1]);
+        const size_t        K     = static_cast<size_t>(input->ne[0]);
+        const size_t        N     = static_cast<size_t>(first->ne[0]);
+
+        const size_t m_pad    = GGML_PAD(M, F16_M_TILE);
+        const size_t mt_count = m_pad / F16_M_TILE;
+        const size_t nt_count = N / F16_N_TILE;
+        const size_t ith      = ctx.ith;
+        const size_t nth      = ctx.nth;
+
+        // A stays resident in TCM for every M16 tile, so kb covers all of them plus one B tile.
+        const size_t tcm_size = static_cast<size_t>(ctx.shared.size);
+        const size_t kb       = std::min(K, (tcm_size / ((m_pad + F16_N_TILE) * sizeof(_Float16))) & ~size_t{ KB - 1 });
+        if (kb < KB) {
+            return run_separately("tcm too small");
+        }
+        if (trace && ctx.ith == 0) {
+            GGML_LOG_INFO("ffn_trace: fused M=%zu K=%zu N=%zu kb=%zu\n", M, K, N, kb);
+        }
+
+        // All workers cast disjoint M16 tiles exactly once for both projections.
+        auto * packed = reinterpret_cast<_Float16 *>((reinterpret_cast<uintptr_t>(ctx.workspace) + 63) & ~uintptr_t{ 63 });
+        for (size_t mt = ith; mt < mt_count; mt += nth) {
+            const size_t m0 = mt * F16_M_TILE;
+            ops_.castpack_a((void *) input->data,
+                            static_cast<int64_t>(m0 * input->nb[1]),
+                            static_cast<int64_t>(input->nb[1]),
+                            (void *) (packed + m0 * K), 0,
+                            static_cast<int64_t>(K * F16_M_TILE * sizeof(_Float16)),
+                            static_cast<int64_t>(std::min(F16_M_TILE, M - m0)),
+                            static_cast<int64_t>(K), 1, static_cast<int64_t>(K / 8));
+        }
+        ctx.sync();  // publish the shared pack before any projection reads it
+
+        auto *        a_tile       = reinterpret_cast<_Float16 *>(ctx.shared.data);
+        auto *        b_tile       = a_tile + m_pad * kb;
+        const size_t  b_row_stride = (K / KB) * KB_BYTES;  // bytes per N32 tile row
+        ggml_tensor * projections[2] = { first, second };
+
+        for (size_t k0 = 0; k0 < K; k0 += kb) {
+            const size_t kk = std::min(kb, K - k0);
+            // The pack is chunk-major ([K/8][M16][8], 128 halfs per chunk), so one K chunk is a
+            // contiguous run of whole 16x8 chunks. Both projections read this staged copy.
+            for (size_t mt = 0; mt < mt_count; ++mt) {
+                const _Float16 * src = packed + mt * F16_M_TILE * K + (k0 / 8) * F16_M_TILE * 8;
+                _Float16 *       tmp = a_tile + mt * F16_M_TILE * kb;
+                memcpy(tmp, src, (kk / 8) * F16_M_TILE * 8 * sizeof(_Float16));
+            }
+            // Each worker owns independent (projection, N32) columns; K chunks keep the existing
+            // F32 accumulation order. Neither vfwmadot kernel is changed.
+            for (size_t task = ith; task < 2 * nt_count; task += nth) {
+                const size_t  nt      = task % nt_count;
+                ggml_tensor * dst     = projections[task / nt_count];
+                auto *        weights = static_cast<uint8_t *>(dst->src[0]->data);
+                ops_.dequantpack_b((void *) (weights + nt * b_row_stride + (k0 / KB) * KB_BYTES),
+                                   0, static_cast<int64_t>(b_row_stride),
+                                   (void *) b_tile, 0,
+                                   static_cast<int64_t>((kk / 8) * 512),
+                                   1, static_cast<int64_t>(kk / KB),
+                                   1, static_cast<int64_t>(kk / 8));
+                for (size_t mt = 0; mt < mt_count; ++mt) {
+                    const size_t m0  = mt * F16_M_TILE;
+                    float *      out = reinterpret_cast<float *>(static_cast<uint8_t *>(dst->data) + m0 * dst->nb[1]) +
+                                       nt * F16_N_TILE;
+                    ops_.dot_f32acc(kk, b_tile, a_tile + mt * F16_M_TILE * kb, out,
+                                    std::min(F16_M_TILE, M - m0), F16_N_TILE, N, k0 != 0);
+                }
+            }
+        }
+        // The enclosing graph executor synchronizes before SwiGLU or a workspace reuse.
+        return true;
+    }
+
+    size_t fused_workspace_bytes(const spacemit_opnode & node) const override {
+        if (node.opcode == SPACEMIT_OP_MUL_MAT_FFN && node.fused.size() == 1) {
+            return ggml_spacemit_ffn_f16_workspace(node.fused[0], node.node);
+        }
+        return 0;
+    }
+
     bool compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) const override {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
@@ -3103,4 +3216,143 @@ bool ggml_spacemit_get_work_size(int n_threads, const ggml_tensor * op, size_t *
 bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const auto * traits = ggml_spacemit_get_tensor_traits(op);
     return traits != nullptr && traits->compute_forward(ctx, op);
+}
+
+// Validate exact Q41/FP16 format identity, 2D layouts, bounded shapes and allocated byte ranges.
+// Called after graph allocation; reject every input/output overlap.
+bool ggml_spacemit_ffn_f16_eligible(const ggml_tensor * first, const ggml_tensor * second) {
+    using namespace ggml::cpu::riscv64_spacemit;
+    static const bool trace = getenv("GGML_SPACEMIT_FFN_TRACE") != nullptr;
+#define FFN_REJECT(why)                                                                                    \
+    do {                                                                                                   \
+        if (trace) {                                                                                       \
+            GGML_LOG_INFO("ffn_trace: reject %s\n", why);                                                  \
+        }                                                                                                  \
+        return false;                                                                                      \
+    } while (0)
+    if (!first || !second) {
+        FFN_REJECT("null");
+    }
+    if (first->op != GGML_OP_MUL_MAT || second->op != GGML_OP_MUL_MAT) {
+        FFN_REJECT("op not mul_mat");
+    }
+    if (!first->src[0] || !second->src[0] || !first->src[1]) {
+        FFN_REJECT("null src");
+    }
+    if (first->src[1] != second->src[1]) {
+        FFN_REJECT("different activation");
+    }
+    if (first->view_src || second->view_src) {
+        FFN_REJECT("output is a view");
+    }
+    if ((first->flags | second->flags) & (GGML_TENSOR_FLAG_OUTPUT | GGML_TENSOR_FLAG_INPUT)) {
+        FFN_REJECT("output flagged input/output");
+    }
+    if (first->type != GGML_TYPE_F32 || second->type != GGML_TYPE_F32) {
+        FFN_REJECT("output not f32");
+    }
+    if (!ggml_are_same_shape(first, second)) {
+        FFN_REJECT("output shape mismatch");
+    }
+    if (!ggml_is_contiguous(first) || !ggml_is_contiguous(second)) {
+        FFN_REJECT("output not contiguous");
+    }
+    const ggml_tensor * x  = first->src[1];
+    const ggml_tensor * w0 = first->src[0];
+    const ggml_tensor * w1 = second->src[0];
+    if (trace) {
+        GGML_LOG_INFO("ffn_trace: K=%lld M=%lld N=%lld w0=%s w1=%s x_type=%s\n",
+                      (long long) x->ne[0], (long long) x->ne[1], (long long) first->ne[0],
+                      ggml_type_name(w0->type), ggml_type_name(w1->type), ggml_type_name(x->type));
+    }
+    if (x->type != GGML_TYPE_F32) {
+        FFN_REJECT("activation not f32");
+    }
+    if (!ggml_is_contiguous(x)) {
+        FFN_REJECT("activation not contiguous");
+    }
+    if (x->ne[2] != 1 || x->ne[3] != 1) {
+        FFN_REJECT("activation not 2d");
+    }
+    if (x->ne[0] < 32 || x->ne[0] > 1024 || x->ne[0] % 32) {
+        FFN_REJECT("K out of range");
+    }
+    if (x->ne[1] < 2 || x->ne[1] > 128) {
+        FFN_REJECT("M out of range");
+    }
+    if (first->ne[2] != 1 || first->ne[3] != 1 || first->ne[0] <= 0 || first->ne[0] % 32) {
+        FFN_REJECT("N out of range");
+    }
+    if (w0->type != GGML_TYPE_Q4_0 || w1->type != GGML_TYPE_Q4_0) {
+        FFN_REJECT("weight not q4_0");
+    }
+    if (w0->view_src || w1->view_src) {
+        FFN_REJECT("weight is a view");
+    }
+    if (w0->op != GGML_OP_NONE || w1->op != GGML_OP_NONE) {
+        FFN_REJECT("weight not a leaf");
+    }
+    if (!ggml_is_contiguous(w0) || !ggml_is_contiguous(w1)) {
+        FFN_REJECT("weight not contiguous");
+    }
+    if (ggml_n_dims(w0) != 2) {
+        FFN_REJECT("weight not 2d");
+    }
+    if (!ggml_are_same_shape(w0, w1)) {
+        FFN_REJECT("weight shape mismatch");
+    }
+    if (w0->ne[0] != x->ne[0] || w0->ne[1] != first->ne[0] || first->ne[1] != x->ne[1]) {
+        FFN_REJECT("shape chain mismatch");
+    }
+    if (!use_f16_link(w0) || !use_f16_link(w1)) {
+        FFN_REJECT("use_f16_link");
+    }
+    const auto * expected = &f16_traits<q41_zero_point_mode::fixed_8>();
+    if (w0->extra != static_cast<const void *>(expected) || w1->extra != static_cast<const void *>(expected)) {
+        FFN_REJECT("weight traits not f16 fixed_8");
+    }
+    if (ggml_spacemit_get_tensor_traits(first) != expected || ggml_spacemit_get_tensor_traits(second) != expected) {
+        FFN_REJECT("mul_mat traits not f16 fixed_8");
+    }
+    const ggml_tensor * tensors[] = { first, second, x, w0, w1 };
+    uintptr_t            begin[5];
+    uintptr_t            end[5];
+    for (size_t i = 0; i < 5; ++i) {
+        if (!tensors[i]->data) {
+            FFN_REJECT("tensor without data");
+        }
+        begin[i]           = reinterpret_cast<uintptr_t>(tensors[i]->data);
+        const size_t bytes = i < 3 ? ggml_nbytes(tensors[i])
+                                   : (size_t(tensors[i]->ne[0]) / 32) * size_t(tensors[i]->ne[1]) *
+                                         sizeof(Q41Block<32, 32, 2>) / 32;
+        if (bytes > UINTPTR_MAX - begin[i]) {
+            FFN_REJECT("address overflow");
+        }
+        end[i] = begin[i] + bytes;
+    }
+    for (size_t output = 0; output < 2; ++output) {
+        for (size_t other = output + 1; other < 5; ++other) {
+            if (begin[output] < end[other] && begin[other] < end[output]) {
+                FFN_REJECT("overlapping storage");
+            }
+        }
+    }
+#undef FFN_REJECT
+    return true;
+}
+
+namespace {
+// The pack needs a 64-byte aligned base; realloc only guarantees max_align_t.
+constexpr size_t PACK_ALIGN = 64;
+// M tile size for F16-link GEMM (must match tensor_traits_f16::F16_M_TILE).
+constexpr size_t FFN_M_TILE = 16;
+}
+
+size_t ggml_spacemit_ffn_f16_workspace(const ggml_tensor * first, const ggml_tensor * second) {
+    if (!ggml_spacemit_ffn_f16_eligible(first, second)) {
+        return 0;
+    }
+    const ggml_tensor * act   = first->src[1];
+    const size_t        m_pad = GGML_PAD((size_t) act->ne[1], FFN_M_TILE);
+    return m_pad * (size_t) act->ne[0] * sizeof(ggml_fp16_t) + PACK_ALIGN - 1;
 }

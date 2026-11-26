@@ -310,6 +310,38 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
     return true;
 }
 
+// Opt-in experiment: the sibling FFN projections (gate/up) of a split SwiGLU share one activation,
+// so cast it once and drive both GEMMs from that pack. Delay the first projection until the second
+// one's position: both outputs are live there, and a future output write is never pulled earlier
+// than the allocator's original node order.
+
+// Pure predicate over an already-built graph: i0/i1 are the two projections, i2 the split SwiGLU.
+static bool ffn_projections_fusable(const ggml_cgraph * graph, int i0, int i1, int i2) {
+    const ggml_tensor * first  = graph->nodes[i0];
+    const ggml_tensor * second = graph->nodes[i1];
+    const ggml_tensor * glu    = graph->nodes[i2];
+    if (!ggml_spacemit_ffn_f16_eligible(first, second) ||
+        glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        ggml_get_op_params_i32(glu, 1) != 0 ||
+        !((glu->src[0] == first && glu->src[1] == second) ||
+          (glu->src[0] == second && glu->src[1] == first))) {
+        return false;
+    }
+    // Reject exposed intermediates, views and every consumer except the split SwiGLU.
+    for (int j = 0; j < graph->n_nodes; ++j) {
+        const ggml_tensor * t = graph->nodes[j];
+        if (t->view_src == first || t->view_src == second) {
+            return false;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            if ((t->src[k] == first || t->src[k] == second) && t != glu) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
                           std::unordered_set<ggml_tensor *> & emitted) {
     ggml_tensor * n = graph->nodes[i];
@@ -368,6 +400,32 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
             return true;
         }
     }
+
+    // Pattern 3: adjacent parallel FFN projections, then split SwiGLU. There is no intervening
+    // compute node, so replacing the pair keeps execution at the second projection's position.
+    // The first output has no reader until SwiGLU, which stays unchanged and separate.
+    if (n->op == GGML_OP_MUL_MAT && next_idx >= 0) {
+        int glu_idx = -1;
+        for (int j = next_idx + 1; j < graph->n_nodes; ++j) {
+            if (op_is_compute(graph->nodes[j])) {
+                glu_idx = j;
+                break;
+            }
+        }
+        if (getenv("GGML_SPACEMIT_FFN_TRACE") != nullptr) {
+            GGML_LOG_INFO("ffn_trace: i=%d op=%s next=%s glu=%s\n", i, ggml_op_name(n->op),
+                          ggml_op_name(next_node->op),
+                          glu_idx >= 0 ? ggml_op_name(graph->nodes[glu_idx]->op) : "none");
+        }
+        if (glu_idx >= 0 && ffn_projections_fusable(graph, i, next_idx, glu_idx)) {
+            spacemit_opnode node(graph->nodes[next_idx], {}, SPACEMIT_OP_MUL_MAT_FFN);
+            node.add_fused(n, true);
+            nodes.push_back(std::move(node));
+            i = next_idx;  // skip past the first projection; SwiGLU is still emitted normally
+            return true;
+        }
+    }
+
 
     return false;
 }
@@ -597,8 +655,7 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 n_fused++;
             }
         }
-        GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
-                       (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+        GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(), (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
     }
     const auto & opnodes = sess->cached_graph.nodes;
 
@@ -608,6 +665,11 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
         size_t node_workspace_size = 0;
         if (ggml_spacemit_get_work_size(n_threads, node.node, &node_workspace_size)) {
             workspace_size = std::max(workspace_size, node_workspace_size);
+        }
+        // Fused ops may need additional scratch; ask the same traits that will compute it.
+        const auto * traits = ggml_spacemit_get_tensor_traits(node.node);
+        if (traits) {
+            workspace_size = std::max(workspace_size, traits->fused_workspace_bytes(node));
         }
     }
 
