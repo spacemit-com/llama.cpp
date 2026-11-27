@@ -3893,7 +3893,8 @@ static __attribute__((noinline)) void gdn_recurrent_rows_lookahead(float *      
     }
 }
 
-void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op,
+                             const float * state_input, float * state_output) {
     const ggml_tensor * src_q     = op->src[0];
     const ggml_tensor * src_k     = op->src[1];
     const ggml_tensor * src_v     = op->src[2];
@@ -3917,19 +3918,21 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const int64_t attn_score_elems    = S_v * H * n_tokens * n_seqs;
     const int64_t state_size_per_snap = S_v * S_v * H * n_seqs;
     float *       attn_out_base       = (float *) op->data;
-    float *       state_out_base      = attn_out_base + attn_score_elems;
-    const float * state_in_base       = (const float *) src_state->data;
+    float *       state_out_base      = state_output ? state_output : attn_out_base + attn_score_elems;
+    const float * state_in_base       = state_input ? state_input : (const float *) src_state->data;
 
     const float scale = 1.0f / sqrtf((float) S_v);
     // Scalar GDN uses g[0]; KDA supplies one gate per state column.
     // When S_v == 1 the two forms coincide; retain the existing KDA dispatch.
     const bool  kda   = src_g->ne[0] == S_v;
 
-    // Amortize the TCM transpose over prefill tokens; short tails use the row kernels.
+    // Snapshot outputs remain row-major even when the working state lives transposed
+    // in TCM. Amortize the TCM transpose over prefill tokens; short tails use the row kernels.
     const uintptr_t shared_begin = reinterpret_cast<uintptr_t>(ctx.shared.data);
     const size_t    tcm_offset   = align_up(shared_begin, GDN_TCM_ALIGNMENT) - shared_begin;
     const size_t    tcm_bytes    = (S_v * S_v + 3 * S_v) * sizeof(float);
-    const bool      transposed   = K == 1 && !kda && n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
+    const bool      transposed   = !kda &&
+                            n_tokens >= GDN_CHUNK_SIZE && S_v % 4 == 0 &&
                             S_v >= (int64_t) __riscv_vsetvlmax_e32m2() && S_v <= (int64_t) __riscv_vsetvlmax_e32m4() &&
                             ctx.shared.data && tcm_offset <= ctx.shared.size &&
                             tcm_bytes <= ctx.shared.size - tcm_offset;
@@ -4091,13 +4094,73 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
                 if (target_slot >= 0 && target_slot < K) {
                     float * state_snapshot =
                         state_out_base + target_slot * state_size_per_snap + (iv3 * H + iv1) * S_v * S_v;
-                    memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                    if (transposed) {
+                        gdn_transpose(S_v, S_v, s_out, S_v, state_snapshot, S_v);
+                    } else {
+                        memcpy(state_snapshot, s_out, (size_t) (S_v * S_v) * sizeof(float));
+                    }
                 }
             }
         }
-        if (transposed) {
+        // K > 1 already emitted slot0 on the final token above.
+        if (transposed && K == 1) {
             gdn_transpose(S_v, S_v, s_out, S_v, state_out_base + (iv3 * H + iv1) * S_v * S_v, S_v);
         }
+    }
+}
+
+static bool gdn_state_ranges_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    if (!na || !nb) {
+        return false;
+    }
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x < na : x - y < nb;
+}
+
+static bool gdn_state_direct_valid(const ggml_tensor * gdn, const ggml_tensor * copy,
+                                   const ggml_tensor * gather) {
+    constexpr size_t state_bytes = 128 * 128 * 16 * sizeof(float);
+    if (!gdn->data || !copy->data || !gdn->src[5]->data ||
+        !ggml_is_contiguous(copy) || ggml_nbytes(copy) != state_bytes ||
+        gdn_state_ranges_overlap(copy->data, state_bytes, gdn->data, ggml_nbytes(gdn))) {
+        return false;
+    }
+    for (int j = 0; j < 5; ++j) {
+        if (!gdn->src[j]->data || gdn_state_ranges_overlap(copy->data, state_bytes,
+                                                         gdn->src[j]->data, ggml_nbytes(gdn->src[j]))) {
+            return false;
+        }
+    }
+    if (gather) {
+        if (!gather->src[0]->data || !gather->src[1]->data ||
+            gather->src[0]->data != copy->data || *(const int32_t *) gather->src[1]->data != 0 ||
+            gdn_state_ranges_overlap(copy->data, state_bytes, gather->src[1]->data, sizeof(int32_t))) {
+            return false;
+        }
+    } else if (gdn_state_ranges_overlap(copy->data, state_bytes, gdn->src[5]->data, state_bytes)) {
+        return false;
+    }
+    return true;
+}
+
+void forward_gdn_state_gather(ggml::spacemit::context & ctx, ggml_tensor * gather,
+                              ggml_tensor * gdn, ggml_tensor * copy) {
+    if (!gdn_state_direct_valid(gdn, copy, gather)) {
+        forward_get_rows<float>(ctx, gather);
+    }
+}
+
+void forward_gdn_state_store(ggml::spacemit::context & ctx, ggml_tensor * gdn,
+                             ggml_tensor * copy, ggml_tensor * gather) {
+    if (gdn_state_direct_valid(gdn, copy, gather)) {
+        // Each head owns disjoint rows; the lookahead kernel loads each row before its store.
+        forward_gated_delta_net(ctx, gdn, gather ? (const float *) gather->src[0]->data : nullptr,
+                                (float *) copy->data);
+    } else {
+        forward_gated_delta_net(ctx, gdn);
+        ctx.sync();
+        forward_cpy_strided_f32(ctx, copy);
     }
 }
 

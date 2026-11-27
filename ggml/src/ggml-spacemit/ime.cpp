@@ -1860,10 +1860,6 @@ private:
         const int ith = ctx.ith;
         const int nth = ctx.nth;
 
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
-
         const size_t out_row_stride = dst->nb[1];  // bytes
 
         constexpr size_t m_tile = F16_M_TILE;
@@ -2747,6 +2743,12 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
     // They run at their original graph positions (see try_fuse_node); the allocator plans buffer
     // reuse on that order, so they must not be merged into one opnode at the concat position.
     switch (node.opcode) {
+        case SPACEMIT_OP_GDN_STATE_GATHER:
+            spacemit_kernels::rvv::forward_gdn_state_gather(ctx, node.node, node.extra_dsts[0], node.extra_dsts[1]);
+            return true;
+        case SPACEMIT_OP_GDN_STATE_STORE:
+            spacemit_kernels::rvv::forward_gdn_state_store(ctx, node.node, node.extra_dsts[0], node.extra_dsts[1]);
+            return true;
         case SPACEMIT_OP_CONCAT_STATE:
             // only the trailing columns read back through views (the conv state update)
             if (!spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, node.node,

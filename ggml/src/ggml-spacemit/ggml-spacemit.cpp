@@ -310,6 +310,158 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
     return true;
 }
 
+static constexpr int GDN_STATE_PARAM_INPUT_KEPT = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
+
+static const ggml_tensor * tensor_storage_root(const ggml_tensor * t) {
+    while (t && t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static size_t tensor_storage_offset(const ggml_tensor * t) {
+    size_t offset = 0;
+    while (t && t->view_src) {
+        offset += t->view_offs;
+        t = t->view_src;
+    }
+    return offset;
+}
+
+static int next_compute_index(const ggml_cgraph * graph, int i) {
+    for (++i; i < graph->n_nodes; ++i) {
+        if (op_is_compute(graph->nodes[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+
+// Only the state tail may disappear; every other consumer must read the attention prefix.
+static ggml_tensor * gdn_state_store_match(const ggml_cgraph * graph, int gi, int * copy_index = nullptr) {
+    ggml_tensor * gdn = graph->nodes[gi];
+    if (gdn->op != GGML_OP_GATED_DELTA_NET || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_get_op_params_i32(gdn, 0) != 1) {
+        return nullptr;
+    }
+    for (int j = 0; j < 6; ++j) {
+        if (!gdn->src[j] || gdn->src[j]->type != GGML_TYPE_F32) {
+            return nullptr;
+        }
+    }
+    const ggml_tensor * v = gdn->src[2];
+    const ggml_tensor * st = gdn->src[5];
+    constexpr size_t attention_bytes = 128 * 16 * sizeof(float);
+    constexpr size_t state_bytes = 128 * 128 * 16 * sizeof(float);
+    if (v->ne[0] != 128 || v->ne[1] != 16 || v->ne[2] != 1 || v->ne[3] != 1 ||
+        gdn->src[3]->ne[0] != 1 || !ggml_is_contiguous(gdn) || !ggml_is_contiguous(st) ||
+        st->ne[0] != 128 || st->ne[1] != 128 || st->ne[2] != 16 || st->ne[3] != 1 ||
+        ggml_nbytes(gdn) != attention_bytes + state_bytes) {
+        return nullptr;
+    }
+    const int ci = next_compute_index(graph, gi);
+    if (ci < 0) {
+        return nullptr;
+    }
+    ggml_tensor * copy = graph->nodes[ci];
+    const ggml_tensor * cache = tensor_storage_root(copy);
+    if (copy->op != GGML_OP_CPY || copy->type != GGML_TYPE_F32 || !copy->src[0] || !copy->src[1] ||
+        !ggml_is_contiguous(copy) || !ggml_is_contiguous(copy->src[0]) ||
+        ggml_nbytes(copy) != state_bytes || ggml_nbytes(copy->src[0]) != state_bytes ||
+        tensor_storage_root(copy->src[0]) != gdn || tensor_storage_offset(copy->src[0]) != attention_bytes ||
+        !cache || cache->op != GGML_OP_NONE || !cache->buffer || !cache->data) {
+        return nullptr;
+    }
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; ++i) {
+        const ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        if (tensor_storage_root(t) == gdn && (t->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            tensor_storage_offset(t) + ggml_nbytes(t) > attention_bytes) {
+            return nullptr;
+        }
+        if (!op_is_compute(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * input = t->src[j];
+            if (input && tensor_storage_root(input) == gdn &&
+                tensor_storage_offset(input) + ggml_nbytes(input) > attention_bytes && !(t == copy && j == 0)) {
+                return nullptr;
+            }
+        }
+    }
+    if (copy_index) {
+        *copy_index = ci;
+    }
+    return copy;
+}
+
+// A single dynamic index into one persistent cache row. Its lifetime is extended by graph_optimize.
+static ggml_tensor * gdn_state_gather_match(const ggml_cgraph * graph, int gi, const ggml_tensor * copy,
+                                           bool need_kept) {
+    ggml_tensor * gdn = graph->nodes[gi];
+    auto * gather = const_cast<ggml_tensor *>(tensor_storage_root(gdn->src[5]));
+    if (!gather || gather->op != GGML_OP_GET_ROWS || gather->type != GGML_TYPE_F32 ||
+        tensor_storage_offset(gdn->src[5]) != 0 || !ggml_is_contiguous(gather) ||
+        ggml_nbytes(gather) != ggml_nbytes(copy) || !gather->src[0] || !gather->src[1] ||
+        (need_kept && ggml_get_op_params_i32(gather, GDN_STATE_PARAM_INPUT_KEPT) != 1)) {
+        return nullptr;
+    }
+    const ggml_tensor * cache = gather->src[0];
+    const ggml_tensor * index = gather->src[1];
+    if (cache->type != GGML_TYPE_F32 || !ggml_is_contiguous(cache) || ggml_nrows(cache) != 1 ||
+        ggml_nbytes(cache) != ggml_nbytes(copy) || index->type != GGML_TYPE_I32 || ggml_nelements(index) != 1 ||
+        tensor_storage_root(cache) != tensor_storage_root(copy) ||
+        tensor_storage_offset(cache) != tensor_storage_offset(copy)) {
+        return nullptr;
+    }
+    int gather_index = -1;
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i] == gather) {
+            gather_index = i;
+        }
+    }
+    if (gather_index < 0 || gather_index >= gi) {
+        return nullptr;
+    }
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; ++i) {
+        const ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        if (tensor_storage_root(t) == gather && (t->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_is_empty(t)) {
+            return nullptr;
+        }
+        if (!op_is_compute(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        if (i > gather_index && i < gi) {
+            if (tensor_storage_root(t) == tensor_storage_root(cache) ||
+                tensor_storage_root(t) == tensor_storage_root(index)) {
+                return nullptr;
+            }
+            // The skipped GET_ROWS captured cache/index at its original position.
+            // Allocation dependencies retain storage, not that snapshot. At dispatch
+            // reject writes through external aliases with distinct view roots too.
+            if (need_kept && t->data) {
+                for (const ggml_tensor * input : {cache, index}) {
+                    if (!input->data) {
+                        continue;
+                    }
+                    const uintptr_t x = reinterpret_cast<uintptr_t>(t->data);
+                    const uintptr_t y = reinterpret_cast<uintptr_t>(input->data);
+                    if (x <= y ? y - x < ggml_nbytes(t) : x - y < ggml_nbytes(input)) {
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (t->src[j] && tensor_storage_root(t->src[j]) == gather && !(t == gdn && j == 5)) {
+                return nullptr;
+            }
+        }
+    }
+    return gather;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
                           std::unordered_set<ggml_tensor *> & emitted) {
     ggml_tensor * n = graph->nodes[i];
@@ -333,6 +485,31 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         }
     }
     ggml_tensor * next_node = (next_idx >= 0) ? graph->nodes[next_idx] : nullptr;
+
+    if (n->op == GGML_OP_GET_ROWS && ggml_get_op_params_i32(n, GDN_STATE_PARAM_INPUT_KEPT) == 1) {
+        for (int gi = i + 1; gi < graph->n_nodes; ++gi) {
+            if (graph->nodes[gi]->op != GGML_OP_GATED_DELTA_NET ||
+                tensor_storage_root(graph->nodes[gi]->src[5]) != n) {
+                continue;
+            }
+            ggml_tensor * copy = gdn_state_store_match(graph, gi);
+            if (copy && gdn_state_gather_match(graph, gi, copy, true) == n) {
+                nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_GDN_STATE_GATHER,
+                                   std::vector<ggml_tensor *>{graph->nodes[gi], copy});
+                return true;
+            }
+        }
+    }
+    if (n->op == GGML_OP_GATED_DELTA_NET) {
+        int copy_index = -1;
+        if (ggml_tensor * copy = gdn_state_store_match(graph, i, &copy_index)) {
+            ggml_tensor * gather = gdn_state_gather_match(graph, i, copy, true);
+            nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_GDN_STATE_STORE,
+                               std::vector<ggml_tensor *>{copy, gather});
+            i = copy_index;
+            return true;
+        }
+    }
 
     // Pattern 1: RMS_NORM + MUL
     if (n->op == GGML_OP_RMS_NORM && next_node && next_node->op == GGML_OP_MUL) {
@@ -694,6 +871,9 @@ static void ggml_backend_spacemit_synchronize(ggml_backend_t backend) {
 static void ggml_backend_spacemit_graph_optimize(ggml_backend_t backend, ggml_cgraph * graph,
                                                  ggml_backend_graph_optimize_params * params) {
     for (int i = 0; i < graph->n_nodes; ++i) {
+        if (graph->nodes[i]->op == GGML_OP_GET_ROWS) {
+            ggml_set_op_params_i32(graph->nodes[i], GDN_STATE_PARAM_INPUT_KEPT, 0);
+        }
         if (graph->nodes[i]->op == GGML_OP_SSM_CONV) {
             ggml_set_op_params_i32(graph->nodes[i], SSM_CONV_PARAM_INPUTS_KEPT, 0);
         }
@@ -703,6 +883,15 @@ static void ggml_backend_spacemit_graph_optimize(ggml_backend_t backend, ggml_cg
     }
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * c = graph->nodes[i];
+        if (c->op == GGML_OP_GATED_DELTA_NET) {
+            ggml_tensor * copy = gdn_state_store_match(graph, i);
+            ggml_tensor * gather = copy ? gdn_state_gather_match(graph, i, copy, false) : nullptr;
+            if (gather) {
+                params->add_alloc_dep(params->user_data, gather->src[0], c);
+                params->add_alloc_dep(params->user_data, gather->src[1], c);
+                ggml_set_op_params_i32(gather, GDN_STATE_PARAM_INPUT_KEPT, 1);
+            }
+        }
         ggml_tensor * ssm     = nullptr;
         int           ssm_idx = -1;
         int64_t       col0    = 0;
