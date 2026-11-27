@@ -1,4 +1,7 @@
 #include "models.h"
+#ifdef GGML_USE_SPACEMIT
+#include "llama-kv-cache.h"
+#endif
 #include "llama-memory-recurrent.h"
 
 void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
@@ -566,7 +569,9 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     res->add_input(std::move(inp));
 
     ggml_tensor * inp_pos     = build_inp_pos();
+#ifndef GGML_USE_SPACEMIT
     ggml_tensor * inp_out_ids = build_inp_out_ids();
+#endif
 
     auto * inp_attn = build_attn_inp_kv();
 
@@ -617,8 +622,32 @@ llama_model_qwen35moe::graph_mtp::graph_mtp(const llm_graph_params & params)
     Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
     cb(Vcur, "mtp_Vcur", il);
 
+#ifdef GGML_USE_SPACEMIT
+    Kcur = build_rope(Kcur, inp_pos, il);
+
+    // Catch-up batches only populate this single MTP layer's KV cache. Neither
+    // attention nor the FFN changes K/V, and no draft output is consumed here.
+    // Keep the full graph when an API caller requests unmasked hidden states.
+    if (n_outputs == 0 && !cparams.training &&
+            (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked) &&
+            !inp_attn->mctx->get_k_scale(il) && !inp_attn->mctx->get_v_scale(il)) {
+        if (inp_attn->self_k_rot[il]) {
+            Kcur = llama_mul_mat_hadamard(ctx0, Kcur, inp_attn->self_k_rot[il]);
+        }
+        if (inp_attn->self_v_rot[il]) {
+            Vcur = llama_mul_mat_hadamard(ctx0, Vcur, inp_attn->self_v_rot[il]);
+        }
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_k(ctx0, Kcur, inp_attn->get_k_idxs(), il));
+        ggml_build_forward_expand(gf, inp_attn->mctx->cpy_v(ctx0, Vcur, inp_attn->get_v_idxs(), il));
+        return;
+    }
+
+    ggml_tensor * inp_out_ids = build_inp_out_ids();
+    Qcur = build_rope(Qcur, inp_pos, il);
+#else
     Qcur = build_rope(Qcur, inp_pos, il);
     Kcur = build_rope(Kcur, inp_pos, il);
+#endif
 
     const float kq_scale = hparams.f_attention_scale == 0.0f
             ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
