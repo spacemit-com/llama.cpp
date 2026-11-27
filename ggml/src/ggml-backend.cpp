@@ -2777,11 +2777,23 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
 
     assert(g1->n_nodes == g2->n_nodes);
 
+    auto compute_checked = [](ggml_backend_t backend, ggml_cgraph * g) {
+        const ggml_status status = ggml_backend_graph_compute(backend, g);
+        if (status != GGML_STATUS_SUCCESS) {
+            GGML_LOG_ERROR("ggml_backend_compare_graph_backend: %s graph compute failed: %s\n",
+                           ggml_backend_name(backend), ggml_status_to_string(status));
+            return false;
+        }
+        return true;
+    };
+
     if (num_test_nodes != 0) {
         GGML_ASSERT(test_nodes);
         // Compute the whole graph and only test the output for specific tensors
-        ggml_backend_graph_compute(backend1, g1);
-        ggml_backend_graph_compute(backend2, g2);
+        if (!compute_checked(backend1, g1) || !compute_checked(backend2, g2)) {
+            ggml_backend_graph_copy_free(copy);
+            return false;
+        }
 
         bool verified = false;
         for (int i = 0; i < g1->n_nodes; i++) {
@@ -2803,8 +2815,10 @@ bool ggml_backend_compare_graph_backend(ggml_backend_t backend1, ggml_backend_t 
             struct ggml_cgraph g1v = ggml_graph_view(g1, i, i + 1);
             struct ggml_cgraph g2v = ggml_graph_view(g2, i, i + 1);
 
-            ggml_backend_graph_compute(backend1, &g1v);
-            ggml_backend_graph_compute(backend2, &g2v);
+            if (!compute_checked(backend1, &g1v) || !compute_checked(backend2, &g2v)) {
+                ggml_backend_graph_copy_free(copy);
+                return false;
+            }
 
             if (ggml_is_view_op(t1->op)) {
                 continue;
