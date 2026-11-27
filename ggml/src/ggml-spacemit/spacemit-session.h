@@ -5,6 +5,7 @@
 #include "spacemit-context.h"
 
 #include <cstdint>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -27,10 +28,12 @@ struct spacemit_session {
     size_t workspace_size = 0;
     std::vector<ggml::spacemit::context> contexts;
 
-    struct {
+    struct graph_cache_entry {
         uint64_t uid = 0;
         std::vector<spacemit_opnode> nodes;
-    } cached_graph;
+    } uncached_graph;
+    std::array<graph_cache_entry, 4> cached_graphs;
+    size_t next_graph_cache = 0;
 
     spacemit_session() = default;
     ~spacemit_session();

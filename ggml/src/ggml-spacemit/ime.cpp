@@ -1420,6 +1420,9 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     default:
                         return false;
                 }
+            case GGML_OP_ARANGE:
+                spacemit_kernels::rvv::forward_arange_f32(ctx, op);
+                return true;
             case GGML_OP_SCALE:
                 if (op->src[0]->type == GGML_TYPE_F32) {
                     spacemit_kernels::rvv::forward_scale_f32(ctx, op);
@@ -1530,6 +1533,10 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     }
                     if (ggml_is_contiguous(op) && ggml_is_contiguous(src0) &&
                         ggml_nelements(src0) == ggml_nelements(op)) {
+                        if (op->type == GGML_TYPE_I32 && src0->type == GGML_TYPE_F32) {
+                            spacemit_kernels::rvv::forward_cpy_f32_to_i32(ctx, op);
+                            return true;
+                        }
                         if (op->type == GGML_TYPE_F16 && src0->type == GGML_TYPE_F32) {
                             spacemit_kernels::rvv::forward_cpy_f32_to_f16(ctx, op);
                             return true;
@@ -1859,10 +1866,6 @@ private:
 
         const int ith = ctx.ith;
         const int nth = ctx.nth;
-
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
 
         const size_t out_row_stride = dst->nb[1];  // bytes
 
@@ -2747,6 +2750,12 @@ bool ggml_spacemit_compute_opnode(ggml::spacemit::context & ctx, const spacemit_
     // They run at their original graph positions (see try_fuse_node); the allocator plans buffer
     // reuse on that order, so they must not be merged into one opnode at the concat position.
     switch (node.opcode) {
+        case SPACEMIT_OP_SSM_CONV_PERSISTENT:
+            spacemit_kernels::rvv::forward_ssm_conv_persistent(ctx, node.node, node.extra_dsts[0], node.extra_dsts[1]);
+            return true;
+        case SPACEMIT_OP_SSM_CONV_STATE_STORE:
+            spacemit_kernels::rvv::forward_ssm_conv_state_store(ctx, node.extra_dsts[0], node.node);
+            return true;
         case SPACEMIT_OP_CONCAT_STATE:
             // only the trailing columns read back through views (the conv state update)
             if (!spacemit_kernels::rvv::forward_concat_dim0_transposed_f32(ctx, node.node,
@@ -2803,6 +2812,11 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
         case GGML_OP_NORM:
         case GGML_OP_RMS_NORM:
             if (op->src[0] && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16)) {
+                return common;
+            }
+            break;
+        case GGML_OP_ARANGE:
+            if (op->type == GGML_TYPE_F32 && ggml_is_vector(op) && ggml_is_contiguous(op)) {
                 return common;
             }
             break;
@@ -2896,7 +2910,7 @@ const ggml::spacemit::tensor_traits_base * ggml_spacemit_get_tensor_traits(const
                 return common;
             }
             if (op->src[0] &&
-                ((op->type == GGML_TYPE_F16 && op->src[0]->type == GGML_TYPE_F32) ||
+                (((op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_I32) && op->src[0]->type == GGML_TYPE_F32) ||
                  (op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F16)) &&
                 ggml_is_contiguous(op) && ggml_is_contiguous(op->src[0]) &&
                 ggml_nelements(op->src[0]) == ggml_nelements(op)) {

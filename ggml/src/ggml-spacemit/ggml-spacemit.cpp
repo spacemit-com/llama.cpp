@@ -236,6 +236,63 @@ static int64_t concat_view_first_col(const ggml_tensor * c, const ggml_tensor * 
 // SSM_CONV op param set by graph_optimize when the concat inputs are kept allocated until the ssm_conv
 static constexpr int SSM_CONV_PARAM_INPUTS_KEPT = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1;
 
+static const ggml_tensor * tensor_storage_root(const ggml_tensor * t);
+
+// build_conv_state_store's rollback window: [3, Kw, channels, sequences],
+// Kw=min(tokens,4). Windows overlap by two columns; their union is exactly
+// [tokens-(Kw-1), tokens+3), in every channel/sequence of the concat. Restrict
+// this extension to the model's four-slot layout rather than accepting
+// arbitrary strided aliases of a partially materialized tensor.
+static int64_t concat_mtp_window_first_col(const ggml_tensor * c, const ggml_tensor * v) {
+    const int64_t tokens = c->src[1]->ne[0];
+    const int64_t kw = std::min<int64_t>(tokens, 4);
+    if (tokens < 1 || v->op != GGML_OP_VIEW || v->view_src != c || v->type != c->type ||
+        v->ne[0] != 3 || v->ne[1] != kw || v->ne[2] != c->ne[1] || v->ne[3] != c->ne[2] ||
+        v->nb[0] != sizeof(float) || v->nb[1] != sizeof(float) ||
+        v->nb[2] != c->nb[1] || v->nb[3] != c->nb[2] ||
+        v->view_offs != (size_t) (tokens - (kw - 1)) * sizeof(float) ||
+        c->ne[0] != tokens + 3 || c->nb[1] < (size_t) c->ne[0] * sizeof(float) ||
+        c->nb[2] < (size_t) c->ne[1] * c->nb[1]) {
+        return -1;
+    }
+    return tokens - (kw - 1);
+}
+
+// SET_ROWS reads src[0] and writes its separate destination src[2]. For the
+// new rollback-window path accept only these read-only consumers; in-place
+// aliases (CPY/SET_ROWS destinations, SCALE_INPLACE, etc.) and further view
+// transformations must retain the full concat. Also reject writes to either
+// concat input between its original copy and the fused convolution: allocation
+// dependencies extend lifetimes, but do not prevent an explicit in-place write.
+static bool concat_mtp_consumers_readonly(const ggml_cgraph * graph, const ggml_tensor * c,
+                                         int ci, int ssm_idx) {
+    const ggml_tensor * input0 = tensor_storage_root(c->src[0]);
+    const ggml_tensor * input1 = tensor_storage_root(c->src[1]);
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if (t->view_src == c && concat_mtp_window_first_col(c, t) < 0) {
+            return false;
+        }
+        if (i > ci && i < ssm_idx && !ggml_op_is_empty(t->op) &&
+            (tensor_storage_root(t) == input0 || tensor_storage_root(t) == input1)) {
+            return false;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            const ggml_tensor * s = t->src[j];
+            if (s && s->view_src == c &&
+                (concat_mtp_window_first_col(c, s) < 0 || t->op != GGML_OP_SET_ROWS || j != 0 ||
+                 t->view_src == c || !t->src[2] || t->src[2]->type != GGML_TYPE_F32 ||
+                 t->src[2]->ne[0] != 3 || t->src[2]->ne[1] != 4 ||
+                 t->src[2]->ne[2] != c->ne[1] || t->src[2]->ne[3] != c->ne[2])) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+
+
 // concat -> ssm_conv fusion analysis: SSM_CONV reads the two concat inputs directly and CONCAT only
 // writes the trailing columns that are read back through views (the conv state update). Returns the
 // single ssm_conv consumer (with its graph index) and the first column any view reads back. Fails if
@@ -252,11 +309,22 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
     int           ssm_idx = -1;
     int64_t       col0    = c->ne[0];  // min column read back through views
 
+    bool mtp_window = false;
+    auto view_first_col = [&](const ggml_tensor * v) {
+        const int64_t plain_col = concat_view_first_col(c, v);
+        if (plain_col >= 0) {
+            return plain_col;
+        }
+        const int64_t col = concat_mtp_window_first_col(c, v);
+        mtp_window |= col >= 0;
+        return col;
+    };
+
     for (int i = 0; i < graph->n_nodes; ++i) {
         ggml_tensor * t = graph->nodes[i];
 
         if (t->view_src == c) {
-            const int64_t col = concat_view_first_col(c, t);
+            const int64_t col = view_first_col(t);
             if (col < 0) {
                 return false;
             }
@@ -280,7 +348,7 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
                     return false;  // some other consumer needs the full concat output
                 }
             } else if (s->view_src == c) {
-                const int64_t col = concat_view_first_col(c, s);
+                const int64_t col = view_first_col(s);
                 if (col < 0) {
                     return false;
                 }
@@ -291,6 +359,33 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
 
     if (ssm == nullptr || ssm_idx <= ci) {
         return false;
+    }
+
+    if (mtp_window && !concat_mtp_consumers_readonly(graph, c, ci, ssm_idx)) {
+        return false;
+    }
+
+    // Both inputs are now read at SSM instead of at CONCAT. Allocation
+    // dependencies preserve their lifetime, but an intervening in-place write
+    // must retain the ordinary CONCAT snapshot, including external aliases.
+    for (int i = ci + 1; i < ssm_idx; ++i) {
+        const ggml_tensor * t = graph->nodes[i];
+        if (!op_is_compute(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        for (const ggml_tensor * input : {c->src[0], c->src[1]}) {
+            if (tensor_storage_root(t) == tensor_storage_root(input)) {
+                return false;
+            }
+            // The post-allocation check covers physically aliased distinct roots.
+            if (need_kept && t->data && input->data) {
+                const uintptr_t x = reinterpret_cast<uintptr_t>(t->data);
+                const uintptr_t y = reinterpret_cast<uintptr_t>(input->data);
+                if (x <= y ? y - x < ggml_nbytes(t) : x - y < ggml_nbytes(input)) {
+                    return false;
+                }
+            }
+        }
     }
 
     // The fused kernels re-check their layouts at compute time and abort on a mismatch (there is no
@@ -310,6 +405,192 @@ static bool ssm_conv_concat_fusable(const ggml_cgraph * graph, int ci, bool need
     return true;
 }
 
+static constexpr int SSM_PERSISTENT_PARAM_INPUTS_KEPT = GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2;
+
+static const ggml_tensor * tensor_storage_root(const ggml_tensor * t) {
+    while (t && t->view_src) {
+        t = t->view_src;
+    }
+    return t;
+}
+
+static size_t tensor_storage_offset(const ggml_tensor * t) {
+    size_t offset = 0;
+    while (t && t->view_src) {
+        offset += t->view_offs;
+        t = t->view_src;
+    }
+    return offset;
+}
+
+static int next_compute_index(const ggml_cgraph * graph, int i) {
+    for (++i; i < graph->n_nodes; ++i) {
+        if (op_is_compute(graph->nodes[i])) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+
+// Materialize the next state directly at the original CPY; SSM still reads the old gather.
+static ggml_tensor * ssm_conv_state_store_match(const ggml_cgraph * graph, int ci, int si,
+                                                ggml_tensor * ssm, int * copy_index) {
+    ggml_tensor * cat = graph->nodes[ci];
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * q = cat->src[1];
+    const ggml_tensor * w = ssm->src[1];
+    const int64_t channels = cat->ne[1];
+    if (channels <= 0 || cat->ne[0] != 4 || cat->ne[2] != 1 || cat->ne[3] != 1 ||
+        !ggml_is_contiguous(cat) || !ggml_is_contiguous(st) || st->ne[0] != 3 ||
+        st->ne[1] != channels || st->ne[2] != 1 || st->ne[3] != 1 ||
+        tensor_storage_root(st)->op != GGML_OP_GET_ROWS || q->ne[0] != 1 ||
+        q->ne[1] != channels || q->ne[2] != 1 || q->ne[3] != 1 ||
+        ssm->ne[0] != channels || ssm->ne[1] != 1 || ssm->ne[2] != 1 || ssm->ne[3] != 1 ||
+        !ggml_is_contiguous(ssm) || w->ne[1] != channels || w->ne[2] != 1 || w->ne[3] != 1) {
+        return nullptr;
+    }
+    const int pi = next_compute_index(graph, ci);
+    if (pi < 0 || pi >= si) {
+        return nullptr;
+    }
+    ggml_tensor * copy = graph->nodes[pi];
+    const ggml_tensor * last = copy->src[0];
+    const ggml_tensor * cache = tensor_storage_root(copy);
+    const size_t state_bytes = 3 * channels * sizeof(float);
+    if (copy->op != GGML_OP_CPY || copy->type != GGML_TYPE_F32 || !last || !copy->src[1] ||
+        !ggml_is_contiguous(copy) || ggml_nbytes(copy) != state_bytes ||
+        last->type != GGML_TYPE_F32 || last->ne[0] != 3 || last->ne[1] != channels ||
+        last->ne[2] != 1 || last->ne[3] != 1 || last->nb[0] != sizeof(float) || last->nb[1] != cat->nb[1] ||
+        tensor_storage_root(last) != cat || tensor_storage_offset(last) != sizeof(float) ||
+        !cache || cache->op != GGML_OP_NONE || !cache->buffer || !cache->data ||
+        tensor_storage_root(st) == cache || tensor_storage_root(q) == cache || tensor_storage_root(w) == cache) {
+        return nullptr;
+    }
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; ++i) {
+        const ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        if (tensor_storage_root(t) == cat && (t->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_is_empty(t)) {
+            return nullptr;
+        }
+        if (!op_is_compute(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        if (t != cat && tensor_storage_root(t) == cat) {
+            return nullptr;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (t->src[j] && tensor_storage_root(t->src[j]) == cat &&
+                !(t == ssm && j == 0) && !(t == copy && j == 0)) {
+                return nullptr;
+            }
+        }
+    }
+    *copy_index = pi;
+    return copy;
+}
+
+// Delay this state update only across computations independent of both cache and index.
+// The original gather can be recreated at SSM if a runtime alias defeats the direct path.
+static ggml_tensor * ssm_conv_persistent_match(const ggml_cgraph * graph, int ci, int si,
+                                              ggml_tensor * ssm, bool need_kept,
+                                              ggml_tensor ** gather_out = nullptr,
+                                              int * copy_index_out = nullptr) {
+    if (need_kept && ggml_get_op_params_i32(ssm, SSM_PERSISTENT_PARAM_INPUTS_KEPT) != 1) {
+        return nullptr;
+    }
+    int pi = -1;
+    ggml_tensor * copy = ssm_conv_state_store_match(graph, ci, si, ssm, &pi);
+    if (!copy) {
+        return nullptr;
+    }
+    const ggml_tensor * cat = graph->nodes[ci];
+    auto * gather = const_cast<ggml_tensor *>(tensor_storage_root(cat->src[0]));
+    const ggml_tensor * cache = gather->src[0];
+    const ggml_tensor * index = gather->src[1];
+    const ggml_tensor * dest = tensor_storage_root(copy);
+    const ggml_tensor * root = tensor_storage_root(cache);
+    const ggml_tensor * index_root = tensor_storage_root(index);
+    if (gather->type != GGML_TYPE_F32 || !ggml_is_contiguous(gather) ||
+        tensor_storage_offset(cat->src[0]) != 0 || ggml_nbytes(gather) != ggml_nbytes(copy) ||
+        !cache || cache->type != GGML_TYPE_F32 || !ggml_is_contiguous(cache) ||
+        cache->ne[0] != ggml_nelements(copy) || cache->ne[2] != 1 || cache->ne[3] != 1 ||
+        !root || root->op != GGML_OP_NONE || !root->buffer || !root->data ||
+        !index || index->type != GGML_TYPE_I32 || ggml_nelements(index) != 1 ||
+        !ggml_is_contiguous(index) || index_root == root || index_root == dest ||
+        cat->src[1]->nb[1] != sizeof(float) || ssm->src[1]->nb[1] != 4 * sizeof(float) ||
+        tensor_storage_root(cat->src[1]) == root || tensor_storage_root(ssm->src[1]) == root ||
+        tensor_storage_root(ssm) == root || tensor_storage_root(ssm) == dest) {
+        return nullptr;
+    }
+    int gi = -1;
+    for (int i = 0; i < ci; ++i) {
+        if (graph->nodes[i] == gather) {
+            gi = i;
+        }
+    }
+    if (gi < 0) {
+        return nullptr;
+    }
+    for (int i = 0; i < graph->n_nodes + graph->n_leafs; ++i) {
+        const ggml_tensor * t = i < graph->n_nodes ? graph->nodes[i] : graph->leafs[i - graph->n_nodes];
+        const ggml_tensor * tr = tensor_storage_root(t);
+        if (tr == gather && (t->flags & GGML_TENSOR_FLAG_OUTPUT) && !ggml_is_empty(t)) {
+            return nullptr;
+        }
+        if (!op_is_compute(const_cast<ggml_tensor *>(t))) {
+            continue;
+        }
+        if (t != gather && tr == gather) {
+            return nullptr;
+        }
+        // After allocation, also reject physical aliases between distinct roots.
+        // This prevents a delayed gather from observing an intervening in-place
+        // write that an externally supplied buffer hid from view-root identity.
+        auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+            if (!a->data || !b->data) {
+                return false;
+            }
+            const uintptr_t x = reinterpret_cast<uintptr_t>(a->data);
+            const uintptr_t y = reinterpret_cast<uintptr_t>(b->data);
+            return x <= y ? y - x < ggml_nbytes(a) : x - y < ggml_nbytes(b);
+        };
+        if (need_kept && i > gi && i < si && t != copy &&
+            (overlaps(t, cache) || overlaps(t, index))) {
+            return nullptr;
+        }
+        if (need_kept && i > pi && i < si && overlaps(t, copy)) {
+            return nullptr;
+        }
+        // No mutation of the source snapshot or dynamic index until the delayed read.
+        // No read/write of the destination after its original CPY until delayed store.
+        if (i > gi && i < si && t != copy && (tr == root || tr == index_root)) {
+            return nullptr;
+        }
+        if (i > pi && i < si && tr == dest) {
+            return nullptr;
+        }
+        for (int j = 0; j < GGML_MAX_SRC; ++j) {
+            if (!t->src[j]) {
+                continue;
+            }
+            const ggml_tensor * sr = tensor_storage_root(t->src[j]);
+            if (sr == gather && !(t == cat && j == 0)) {
+                return nullptr;
+            }
+            if (i > pi && i < si && (sr == dest || (need_kept && overlaps(t->src[j], copy)))) {
+                return nullptr;
+            }
+        }
+    }
+    if (gather_out) {
+        *gather_out = gather;
+    }
+    if (copy_index_out) {
+        *copy_index_out = pi;
+    }
+    return copy;
+}
+
 static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacemit_opnode> & nodes,
                           std::unordered_set<ggml_tensor *> & emitted) {
     ggml_tensor * n = graph->nodes[i];
@@ -318,8 +599,37 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
     // Emitted at its own position — opnode list order is execution order, and the graph
     // allocator planned the ssm_conv output buffer on the original node order (see Pattern 2).
     if (emitted.count(n)) {
+        if (ggml_get_op_params_i32(n, SSM_PERSISTENT_PARAM_INPUTS_KEPT) == 1) {
+            for (int ci = 0; ci < i; ++ci) {
+                if (graph->nodes[ci] != n->src[0]) {
+                    continue;
+                }
+                ggml_tensor * gather = nullptr;
+                if (ggml_tensor * copy = ssm_conv_persistent_match(graph, ci, i, n, true, &gather)) {
+                    nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_PERSISTENT,
+                                       std::vector<ggml_tensor *>{copy, gather});
+                    return true;
+                }
+            }
+        }
         nodes.emplace_back(n, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_CONCAT);
         return true;
+    }
+    if (n->op == GGML_OP_GET_ROWS) {
+        for (int ci = i + 1; ci < graph->n_nodes; ++ci) {
+            if (graph->nodes[ci]->op != GGML_OP_CONCAT ||
+                tensor_storage_root(graph->nodes[ci]->src[0]) != n) {
+                continue;
+            }
+            ggml_tensor * ssm = nullptr;
+            int si = -1;
+            int64_t col0 = 0;
+            ggml_tensor * gather = nullptr;
+            if (ssm_conv_concat_fusable(graph, ci, true, &ssm, &si, &col0) &&
+                ssm_conv_persistent_match(graph, ci, si, ssm, true, &gather) && gather == n) {
+                return true; // no gather opnode: materialize only in the SSM runtime fallback
+            }
+        }
     }
 
     // Find the next compute node, skipping empty (NONE) nodes. test-backend-ops
@@ -359,6 +669,19 @@ static bool try_fuse_node(const ggml_cgraph * graph, int & i, std::vector<spacem
         int           ssm_idx = -1;
         int64_t       col0    = 0;
         if (ssm_conv_concat_fusable(graph, i, true, &ssm, &ssm_idx, &col0)) {
+            int copy_index = -1;
+            if (ssm_conv_persistent_match(graph, i, ssm_idx, ssm, true, nullptr, &copy_index)) {
+                i = copy_index;
+                emitted.insert(ssm);
+                return true;
+            }
+            if (ggml_tensor * copy = ssm_conv_state_store_match(graph, i, ssm_idx, ssm, &copy_index)) {
+                nodes.emplace_back(copy, std::vector<ggml_tensor *>{}, SPACEMIT_OP_SSM_CONV_STATE_STORE,
+                                   std::vector<ggml_tensor *>{ssm});
+                i = copy_index;
+                emitted.insert(ssm);
+                return true;
+            }
             spacemit_opnode cat(n, {}, SPACEMIT_OP_CONCAT_STATE);
             cat.kernel_params[0] = (int32_t) col0;
             nodes.push_back(std::move(cat));
@@ -573,10 +896,26 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
     // stable shape-class, so the list is only rebuilt when the topology changes.
     // try_fuse_node folds matching patterns into fused opnodes and consumes their
     // nodes; non-matching nodes are appended as single ops.
-    if (!(graph->uid != 0 && sess->cached_graph.uid == graph->uid)) {
-        sess->cached_graph.uid = graph->uid;
-        sess->cached_graph.nodes.clear();
-        sess->cached_graph.nodes.reserve(graph->n_nodes);
+    spacemit_session::graph_cache_entry * cached = nullptr;
+    if (graph->uid != 0) {
+        for (auto & entry : sess->cached_graphs) {
+            if (entry.uid == graph->uid) {
+                cached = &entry;
+                break;
+            }
+        }
+    }
+    if (cached == nullptr) {
+        if (graph->uid != 0) {
+            cached = &sess->cached_graphs[sess->next_graph_cache];
+            sess->next_graph_cache = (sess->next_graph_cache + 1) % sess->cached_graphs.size();
+        } else {
+            cached = &sess->uncached_graph;
+        }
+        // Scheduler split UIDs are unique; never inspect tensors in an unmatched entry.
+        cached->uid = 0;
+        cached->nodes.clear();
+        cached->nodes.reserve(graph->n_nodes);
         std::unordered_set<ggml_tensor *> emitted;  // nodes already emitted by try_fuse_node
         for (int i = 0; i < graph->n_nodes; ++i) {
             ggml_tensor * n = graph->nodes[i];
@@ -585,22 +924,23 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
             }
             // On a match, try_fuse_node pushes the fused opnodes and advances i past
             // the nodes it consumed; otherwise the node is appended as a single op.
-            if (try_fuse_node(graph, i, sess->cached_graph.nodes, emitted)) {
+            if (try_fuse_node(graph, i, cached->nodes, emitted)) {
                 continue;
             }
-            sess->cached_graph.nodes.emplace_back(n);
+            cached->nodes.emplace_back(n);
         }
 
         int n_fused = 0;
-        for (const auto & node : sess->cached_graph.nodes) {
+        for (const auto & node : cached->nodes) {
             if (!node.fused.empty() || node.opcode != SPACEMIT_OP_INVALID) {
                 n_fused++;
             }
         }
         GGML_LOG_DEBUG("ggml-spacemit: %s graph %llu: %zu opnodes, %d fused\n", sess->c_name(),
-                       (unsigned long long) graph->uid, sess->cached_graph.nodes.size(), n_fused);
+                       (unsigned long long) graph->uid, cached->nodes.size(), n_fused);
+        cached->uid = graph->uid;
     }
-    const auto & opnodes = sess->cached_graph.nodes;
+    const auto & opnodes = cached->nodes;
 
     int n_threads = sess->num_cores > 0 ? sess->num_cores : 1;
     size_t workspace_size = 0;
@@ -696,6 +1036,7 @@ static void ggml_backend_spacemit_graph_optimize(ggml_backend_t backend, ggml_cg
     for (int i = 0; i < graph->n_nodes; ++i) {
         if (graph->nodes[i]->op == GGML_OP_SSM_CONV) {
             ggml_set_op_params_i32(graph->nodes[i], SSM_CONV_PARAM_INPUTS_KEPT, 0);
+            ggml_set_op_params_i32(graph->nodes[i], SSM_PERSISTENT_PARAM_INPUTS_KEPT, 0);
         }
     }
     if (params == nullptr || params->add_alloc_dep == nullptr) {
@@ -710,6 +1051,12 @@ static void ggml_backend_spacemit_graph_optimize(ggml_backend_t backend, ggml_cg
             params->add_alloc_dep(params->user_data, c->src[0], ssm);
             params->add_alloc_dep(params->user_data, c->src[1], ssm);
             ggml_set_op_params_i32(ssm, SSM_CONV_PARAM_INPUTS_KEPT, 1);
+            ggml_tensor * gather = nullptr;
+            if (ssm_conv_persistent_match(graph, i, ssm_idx, ssm, false, &gather)) {
+                params->add_alloc_dep(params->user_data, gather->src[0], ssm);
+                params->add_alloc_dep(params->user_data, gather->src[1], ssm);
+                ggml_set_op_params_i32(ssm, SSM_PERSISTENT_PARAM_INPUTS_KEPT, 1);
+            }
         }
     }
 
@@ -833,6 +1180,7 @@ static bool ggml_backend_spacemit_device_supports_op(ggml_backend_dev_t dev, con
             supp = true;
             break;
 
+        case GGML_OP_ARANGE:
         case GGML_OP_SCALE:
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
