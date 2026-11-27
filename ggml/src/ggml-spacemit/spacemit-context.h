@@ -56,6 +56,11 @@ class tensor_traits_base {
         GGML_UNUSED(node);
         return false;
     }
+    // Scratch bytes for fused ops, computed from the actual opnode. Default is 0 (no scratch).
+    virtual size_t fused_workspace_bytes(const spacemit_opnode & node) const {
+        GGML_UNUSED(node);
+        return 0;
+    }
     virtual int  repack(ggml_tensor * tensor, const void * data, size_t size) const     = 0;
 
     // Override for repacked tensors; the default copies raw bytes.

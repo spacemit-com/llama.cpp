@@ -10,3 +10,7 @@ bool ggml_spacemit_compute_forward(ggml::spacemit::context & ctx, ggml_tensor * 
 int ggml_riscv64_spacemit_repack_tensor(ggml_tensor * tensor, const void * data, size_t size);
 void ggml_riscv64_spacemit_unpack_tensor(const ggml_tensor * tensor, void * data, size_t size);
 size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor);
+
+// Up-gate (FFN) fusion: eligibility and workspace sizing.
+bool   ggml_spacemit_ffn_f16_eligible(const ggml_tensor * first, const ggml_tensor * second);
+size_t ggml_spacemit_ffn_f16_workspace(const ggml_tensor * first, const ggml_tensor * second);
