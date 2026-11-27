@@ -1858,7 +1858,10 @@ private:
         const size_t N         = static_cast<size_t>(op->src[0]->ne[1]);
         const size_t M         = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
         const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
-        const size_t gemv_size = ((K + KB - 1) / KB) * 38;
+        const bool output_head = op->src[0]->type == GGML_TYPE_Q4_K &&
+                                 strcmp(op->src[0]->name, "output.weight") == 0 &&
+                                 op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 && M <= 4;
+        const size_t gemv_size = ((K + KB - 1) / KB) * 38 * (output_head ? M : 1);
         size = std::max(partial_workspace_size(M, N, n_threads), GGML_PAD(gemv_size, sizeof(int64_t)));
         return true;
     }
@@ -1913,35 +1916,45 @@ private:
         const auto * b_src = reinterpret_cast<const uint8_t *>(src0->data);
         auto *       out   = reinterpret_cast<uint8_t *>(dst->data);
 
-        // Decode quantizes A once; workers compute separate N32 tiles without TCM staging.
-        if (M == 1 && K % KB == 0) {
+        // Keep the Q4_K output head on the decode arithmetic for short verifier batches.
+        // The multi-row FP16 path uses a different activation representation.
+        const bool output_head = src0->type == GGML_TYPE_Q4_K && strcmp(src0->name, "output.weight") == 0 &&
+                                 src1->ne[2] == 1 && src1->ne[3] == 1 && M <= 4;
+        if ((M == 1 || output_head) && K % KB == 0) {
             constexpr size_t a_blk_len      = 32;
             const size_t     a_blk_stride   = spacemit_kernels::q8_blk_size(a_blk_len, true);
             const size_t     a_k_blks       = K / KB;
             const size_t     k_blks         = K / KB;
-            const size_t     gemv_ws_needed = a_k_blks * a_blk_stride;
+            const size_t     gemv_ws_needed = M * a_k_blks * a_blk_stride;
             if (ctx.workspace_size >= gemv_ws_needed) {
                 auto * quant_a = reinterpret_cast<uint8_t *>(ctx.workspace);
-
-                int task_per_thread = spacemit_kernels::div_round_up((int) a_k_blks, nth);
-                int a_blk_start     = ith * task_per_thread;
-                int a_blk_end       = std::min(a_blk_start + task_per_thread, (int) a_k_blks);
-                if (a_blk_start < a_blk_end) {
-                    ops.quantize_a_gemv(
-                        a_blk_len, reinterpret_cast<const float *>(a_src) + a_blk_start * a_blk_len,
-                        (a_blk_end - a_blk_start) * a_blk_len, quant_a + a_blk_start * a_blk_stride);
+                if (M == 1) {
+                    const size_t per_thread = spacemit_kernels::div_round_up(a_k_blks, (size_t) nth);
+                    const size_t start = ith * per_thread;
+                    const size_t end = std::min(start + per_thread, a_k_blks);
+                    if (start < end) {
+                        ops.quantize_a_gemv(a_blk_len, reinterpret_cast<const float *>(a_src) + start * a_blk_len,
+                            (end - start) * a_blk_len, quant_a + start * a_blk_stride);
+                    }
+                } else {
+                    for (size_t m = ith; m < M; m += nth) {
+                        ops.quantize_a_gemv(a_blk_len, reinterpret_cast<const float *>(a_src + m * a_src_stride),
+                            K, quant_a + m * a_k_blks * a_blk_stride);
+                    }
                 }
 
                 ctx.sync();
 
                 const size_t b_row_stride = k_blks * ROW_PITCH;
                 constexpr size_t tile_cols = 32;
-                for (int64_t ni = (int64_t) ith * tile_cols; ni < (int64_t) N;
-                     ni += (int64_t) tile_cols * nth) {
-                    const int64_t nb_real = std::min((int64_t) N - ni, (int64_t) tile_cols);
+                for (size_t ni = ith * tile_cols; ni < N; ni += tile_cols * nth) {
+                    const size_t nb_real = std::min(N - ni, tile_cols);
                     const uint8_t * b_row = b_src + ni * b_row_stride;
-                    auto *          c_row = reinterpret_cast<float *>(out) + ni;
-                    gemv_func(quant_a, b_row, c_row, (size_t) nb_real, k_blks);
+                    for (size_t m = 0; m < M; ++m) {
+                        auto * c_row = reinterpret_cast<float *>(out + m * out_row_stride) + ni;
+                        gemv_func(quant_a + m * a_k_blks * a_blk_stride,
+                            b_row, c_row, nb_real, k_blks);
+                    }
                 }
                 return true;
             }
