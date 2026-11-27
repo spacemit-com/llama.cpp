@@ -1288,6 +1288,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
                     const size_t bytes = row_size * op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3];
                         if (op->src[1]->type != traits->vec_dot_type) {
                             size = bytes;
+#if defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+                            if (op->src[0]->type == GGML_TYPE_BF16 &&
+                                traits->vec_dot_type == GGML_TYPE_BF16 && traits->nrows == 1 && op->src[1]->ne[1] >= 8) {
+                                const size_t panel_bytes = GGML_PAD(op->src[0]->ne[0] * 32 * sizeof(float), 64);
+                                size = GGML_PAD(bytes, 64) + 63 + n_threads * panel_bytes;
+                            }
+#endif
                             return true;
                         }
                     }
@@ -1859,10 +1866,6 @@ private:
 
         const int ith = ctx.ith;
         const int nth = ctx.nth;
-
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
 
         const size_t out_row_stride = dst->nb[1];  // bytes
 
