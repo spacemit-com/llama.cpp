@@ -1151,14 +1151,15 @@ MMT4D_FP16_MUL_SCALAR_M16N32_IMPL(_FSCALAR, _N,  _TMP_VL)
 namespace mlir::speir::spekernel {
 
 using ggml::cpu::riscv64_spacemit::Q41Block;
+using ggml::cpu::riscv64_spacemit::Q40Block;
 using ggml::cpu::riscv64_spacemit::_spe_fp16_;
 using ggml::cpu::riscv64_spacemit::uint4x2_t;
 }  // namespace mlir::speir::spekernel
 
 namespace mlir::speir::spekernel::ime2 {
 
+template <typename block_type = Q41Block<32, 32, 2>>
 SPINE_FORCE_INLINE void _spe_pack_cast_q41_fixed8_f16_m32k32(const void * in, void * out, int32_t zero_point, int64_t blocks) {
-    using block_type = Q41Block<32, 32, 2>;
     static_assert(sizeof(uint4x2_t) == 1 && sizeof(_spe_fp16_) == 2);
     if (blocks == 0) {
         return;

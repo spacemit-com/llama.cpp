@@ -31,6 +31,18 @@ template <> struct Q41Block<32, 32, 2> {
 
 static_assert(sizeof(Q41Block<32, 32, 2>) == 608, "Q41Block layout changed");
 
+// Q4_0 has implicit zp=8; its data and scales retain the Q41 row/K order.
+template <size_t, size_t, size_t> struct Q40Block;
+
+template <> struct Q40Block<32, 32, 2> {
+    uint4x2_t data[4 * 8 * 16];
+    _spe_fp16_ scale[32];
+};
+using q40_block_32x32 = Q40Block<32, 32, 2>;
+static_assert(sizeof(q40_block_32x32) == 576 && offsetof(q40_block_32x32, scale) == 512);
+int repack_q4_0_to_q40(ggml_tensor * t, const void * data, size_t data_size);
+int unpack_q40_to_q4_0(const ggml_tensor * t, void * data, size_t data_size);
+
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS>
 int repack(ggml_tensor * t, const void * data, size_t data_size);
 

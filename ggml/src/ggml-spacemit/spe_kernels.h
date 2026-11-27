@@ -76,7 +76,7 @@ void spe_reducesum_mxn(void * in, int64_t lhs_offset, int64_t lhs_stride0, int64
 }  // namespace mlir::speir::spekernel
 
 namespace mlir::speir::spekernel::ime2 {
-// fixed_8 requires every Q41Block zero-point slot to equal 8.
+// fixed_8 uses an implicit zero point of 8.
 enum class q41_zero_point_mode { per_row, fixed_8 };
 
 spe_pack_cast_function_def get_spe_pack_cast_function(const uint64_t         march,
