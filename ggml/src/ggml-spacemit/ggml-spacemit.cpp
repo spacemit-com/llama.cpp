@@ -671,6 +671,8 @@ static ggml_status ggml_backend_spacemit_graph_compute(ggml_backend_t backend, g
                 ctx.sync();
             }
 
+            // Flush each worker before returning to the runtime pool.
+            ggml_profile_flush_tls();
             ctx.clear();
         }
     );
