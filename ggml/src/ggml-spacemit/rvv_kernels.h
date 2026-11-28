@@ -100,7 +100,12 @@ void forward_cpy_with_permute(ggml::spacemit::context & ctx, ggml_tensor * op);
 template <typename T> void forward_get_rows(ggml::spacemit::context & ctx, ggml_tensor * op);
 
 template <typename T> void forward_concat(ggml::spacemit::context & ctx, ggml_tensor * op);
-void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op);
+void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op,
+                             const float * state_input = nullptr, float * state_output = nullptr);
+void forward_gdn_state_gather(ggml::spacemit::context & ctx, ggml_tensor * gather,
+                              ggml_tensor * gdn, ggml_tensor * copy);
+void forward_gdn_state_store(ggml::spacemit::context & ctx, ggml_tensor * gdn,
+                             ggml_tensor * copy, ggml_tensor * gather);
 // dim-0 concat of a contiguous src0 and a transposed src1 (channels contiguous), vectorized over rows;
 // writes columns >= col0 only
 bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tensor * op, int64_t col0);
