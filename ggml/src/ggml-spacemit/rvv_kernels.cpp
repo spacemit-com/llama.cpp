@@ -1,4 +1,5 @@
 #include "rvv_kernels.h"
+#include "ime_kernels.h"
 
 #include "common.h"
 #include "spacemit-env.h"
@@ -39,7 +40,7 @@ auto align_up(size_t value, size_t alignment) {
 }
 
 // head dims above vlmax(e16m2) = 128 are processed in 128-wide segments
-static constexpr int64_t FA_VLEN1024_MAX_D = 256;
+static constexpr int64_t FA_VLEN1024_MAX_D = 512;
 // split-KV decode handles up to this many query tokens (speculative-decoding verification)
 static constexpr int64_t FA_SPLIT_KV_MAX_Q = 4;
 
@@ -49,6 +50,16 @@ static inline bool flash_attn_ext_supported_d_vlen1024_vf16(int64_t d) {
 
 static inline bool flash_attn_ext_supported_shape_vlen1024_vf16(int64_t DK, int64_t DV) {
     return flash_attn_ext_supported_d_vlen1024_vf16(DK) && flash_attn_ext_supported_d_vlen1024_vf16(DV);
+}
+
+
+static size_t fa_tiled_thread_bytes(const ggml_tensor * dst) {
+    constexpr size_t qt = ggml_fa_tile_config::Q;
+    constexpr size_t kt = ggml_fa_tile_config::KV;
+    const size_t dk = dst->src[1]->ne[0], dv = dst->src[2]->ne[0];
+    const size_t scalar = dst->src[1]->type == GGML_TYPE_F16 ? sizeof(_Float16) : sizeof(float);
+    return (qt * dk + kt * (dk + dv)) * scalar +
+           (2 * qt * kt + qt * dv + ggml::spacemit::cache_line_size_f32) * sizeof(float);
 }
 
 static inline float reduce_sum_f32m4_vlen1024(vfloat32m4_t v, size_t vl) {
@@ -787,7 +798,8 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
     // its own mask row at mp + m * mask_row_stride bytes; a KV position is packed if any token can see it.
     // With partial != nullptr row i writes {M, S, unnormalized VKQ[DV]} to partial[i] (for a later split-KV
     // reduction) instead of the normalized output to dst[i].
-    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 16, "unsupported QLEN");
+    static_assert(QLEN == 2 || QLEN == 4 || QLEN == 8 || QLEN == 16 || QLEN == 24 || QLEN == 32,
+                  "unsupported QLEN");
     GGML_ASSERT(n_mask_rows >= 1 && QLEN % n_mask_rows == 0 && n_mask_rows <= 16);
     const int64_t rows_per_mask = QLEN / n_mask_rows;
     auto          mask_at       = [&](int64_t m, int64_t ic) -> float {
@@ -843,9 +855,32 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
 
         int64_t ic_step = 0;
         for (int64_t ic = 0; ic < nek1; ++ic) {
+            const char * direct_v = nullptr;
+            bool packed_tile = false;
+            if constexpr (QLEN == 4) {
+                if (partial && n_mask_rows == 1 && DK == 256 && DV == 256 && ic_step == 0 &&
+                    ic + ic_tile_step <= nek1) {
+                    bool all_visible = true;
+                    for (int64_t tk = 0; tk < ic_tile_step; ++tk) {
+                        mv_tile_pack[tk] = mask_at(0, ic + tk);
+                        all_visible &= mv_tile_pack[tk] != -INFINITY;
+                    }
+                    if (all_visible) {
+                        // Eight-row segmented stores avoid channel-strided scatters into TCM.
+                        rvv_transposed_s16_mn_to_nm((int8_t *) k_tile_pack, k_tile_byte_stride,
+                                                   (int8_t *) k_data_row + ic * nbk1, nbk1, ic_tile_step, DK);
+                        // This single PV group consumes each visible V row once.
+                        direct_v = v_data_row + ic * nbv1;
+                        ic += ic_tile_step - 1;
+                        ic_step = ic_tile_step;
+                        packed_tile = true;
+                    }
+                }
+            }
+
             float mvs[16];
             bool  visible = false;
-            for (int64_t m = 0; m < n_mask_rows; ++m) {
+            for (int64_t m = 0; !packed_tile && m < n_mask_rows; ++m) {
                 mvs[m] = mask_at(m, ic);
                 visible |= mvs[m] != -INFINITY;
             }
@@ -926,6 +961,10 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                     const float tile_max = rvv_softcap_add_max_inplace_f32(
                         row_ptr, mv_tile_pack + (i / rows_per_mask) * ic_tile_step, ic_step, logit_softcap);
 
+                    if (tile_max == -INFINITY) {
+                        rvv_zero_f32(row_ptr, ic_step);
+                        continue;
+                    }
                     const float Mold = M[i];
 
                     if (tile_max > Mold) {
@@ -938,7 +977,38 @@ static void flash_attn_ext_f16_one_chunk_inner_vlen1024_vf16_mrow(float **      
                     S[i] += rvv_softmax_exp_inplace_f32(row_ptr, ic_step, M[i]);
                 }
 
-                for (int64_t d0 = 0; d0 < DV; d0 += seg) {
+                bool pv_m4 = false;
+                if constexpr (QLEN == 4) {
+                    if (partial && n_mask_rows == 1 && DK == 256 && DV == 256) {
+                        const size_t vl = __riscv_vsetvl_e16m4(DV);
+                        vfloat16m4_t pv_acc0 = __riscv_vle16_v_f16m4(kq16_buffer + 0 * DV, vl);
+                        vfloat16m4_t pv_acc1 = __riscv_vle16_v_f16m4(kq16_buffer + 1 * DV, vl);
+                        vfloat16m4_t pv_acc2 = __riscv_vle16_v_f16m4(kq16_buffer + 2 * DV, vl);
+                        vfloat16m4_t pv_acc3 = __riscv_vle16_v_f16m4(kq16_buffer + 3 * DV, vl);
+                        const float * p0 = kq_tile_buffer + 0 * ic_tile_step;
+                        const float * p1 = kq_tile_buffer + 1 * ic_tile_step;
+                        const float * p2 = kq_tile_buffer + 2 * ic_tile_step;
+                        const float * p3 = kq_tile_buffer + 3 * ic_tile_step;
+
+                        for (int64_t tk = 0; tk < ic_step; ++tk) {
+                            const _Float16 * vrow = direct_v ? (const _Float16 *) (direct_v + tk * nbv1) :
+                                                               v_tile_pack + tk * DV;
+                            const vfloat16m4_t v16 = __riscv_vle16_v_f16m4(vrow, vl);
+                            pv_acc0 = __riscv_vfmacc_vf_f16m4(pv_acc0, (_Float16) p0[tk], v16, vl);
+                            pv_acc1 = __riscv_vfmacc_vf_f16m4(pv_acc1, (_Float16) p1[tk], v16, vl);
+                            pv_acc2 = __riscv_vfmacc_vf_f16m4(pv_acc2, (_Float16) p2[tk], v16, vl);
+                            pv_acc3 = __riscv_vfmacc_vf_f16m4(pv_acc3, (_Float16) p3[tk], v16, vl);
+                        }
+
+                        __riscv_vse16_v_f16m4(kq16_buffer + 0 * DV, pv_acc0, vl);
+                        __riscv_vse16_v_f16m4(kq16_buffer + 1 * DV, pv_acc1, vl);
+                        __riscv_vse16_v_f16m4(kq16_buffer + 2 * DV, pv_acc2, vl);
+                        __riscv_vse16_v_f16m4(kq16_buffer + 3 * DV, pv_acc3, vl);
+                        pv_m4 = true;
+                    }
+                }
+
+                for (int64_t d0 = 0; !pv_m4 && d0 < DV; d0 += seg) {
                     const size_t vl = __riscv_vsetvl_e16m2(DV - d0);
                     for (size_t g = 0; g < QLEN; g += 4) {
                         if constexpr (QLEN >= 4) {
@@ -1302,7 +1372,7 @@ void forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(ggml::spacemit::context 
                                     (iq3 % mask->ne[3]) * mask->nb[3]) :
                    NULL;
 
-        const bool mp_equal_2 = iq1_1 == iq1 && (iq2 % mask->ne[2]) == (iq2_1 % mask->ne[2]) &&
+        const bool mp_equal_2 = mask && iq1_1 == iq1 && (iq2 % mask->ne[2]) == (iq2_1 % mask->ne[2]) &&
                                 (iq3 % mask->ne[3]) == (iq3_1 % mask->ne[3]);
 
         const bool mp_equal_4 = mp_equal_2 && iq1_2 == iq1 && (iq2 % mask->ne[2]) == (iq2_2 % mask->ne[2]) &&
@@ -1461,15 +1531,19 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
 
     const int64_t chunk  = (n_kv + n_chunks - 1) / n_chunks;
 
-    std::array<float *, 16> pq;
-    std::array<float *, 16> pr;
-    std::array<float *, 16> unused = {};
+    std::array<float *, 32> pq;
+    std::array<float *, 32> pr;
+    std::array<float *, 32> unused = {};
 
-    // all query tokens of a unit in one pass (one K/V pack) when rk2 * nq is a supported row count
+    // All query tokens share one K/V pack when their combined row count is supported.
     const int64_t rows   = rk2 * nq;
-    const bool    fused  = rows == 2 || rows == 4 || rows == 8 || rows == 16;
-    const int64_t n_pass = fused ? 1 : nq;
-    const int64_t prows  = fused ? rows : rk2;
+    const size_t wide_qkv_bytes = rows * (DK + DV) * sizeof(_Float16);
+    const size_t wide_tile_bytes = 8 * (rows * sizeof(float) + (DK + DV) * sizeof(_Float16) + nq * sizeof(float));
+    const bool wide_fits = tcm_buffer_size >= wide_qkv_bytes + wide_tile_bytes + 64;
+    const bool    fused  = rows == 2 || rows == 4 || rows == 8 || rows == 16 ||
+                          (wide_fits && (DK > 256 || DV > 256) && (rows == 24 || rows == 32));
+    const int64_t queries_per_pass = fused ? nq :
+        (rk2 == 8 && (nq == 3 || nq == 4) ? 2 : 1);
 
     for (int64_t u = ctx.ith; u < n_kvh * n_chunks; u += ctx.nth) {
         const int64_t kvh = u / n_chunks;
@@ -1480,17 +1554,17 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
         const char *  kd  = (const char *) k->data + kvh * k->nb[2] + c0 * k->nb[1];
         const char *  vd  = (const char *) v->data + kvh * v->nb[2] + c0 * v->nb[1];
 
-        for (int64_t p = 0; p < n_pass; ++p) {
+        for (int64_t t0 = 0; t0 < nq; t0 += queries_per_pass) {
+            const int64_t n_mask_rows = std::min(queries_per_pass, nq - t0);
+            const int64_t prows = rk2 * n_mask_rows;
             for (int64_t r = 0; r < prows; ++r) {
-                const int64_t t = fused ? r / rk2 : p;
-                const int64_t i = fused ? r % rk2 : r;
+                const int64_t t = t0 + r / rk2;
+                const int64_t i = r % rk2;
                 pq[r] = (float *) ((char *) q->data + t * q->nb[1] + (h0 + i) * q->nb[2]);
                 pr[r] = partials + ((t * nh + h0 + i) * n_chunks + c) * (2 + DV);
             }
-            const int64_t       t0 = fused ? 0 : p;
             const ggml_fp16_t * mp =
                 mask ? (const ggml_fp16_t *) ((const char *) mask->data + t0 * mask->nb[1]) + c0 : nullptr;
-            const int64_t n_mask_rows = fused ? nq : 1;
             const size_t  mstride     = mask ? mask->nb[1] : 0;
 
 #define FA_SPLIT_MROW(QL)                                                                                          \
@@ -1502,6 +1576,8 @@ void forward_flash_attn_ext_f16_split_kv_partial_vlen1024_vf16(ggml::spacemit::c
                 case 2: FA_SPLIT_MROW(2); break;
                 case 4: FA_SPLIT_MROW(4); break;
                 case 8: FA_SPLIT_MROW(8); break;
+                case 24: FA_SPLIT_MROW(24); break;
+                case 32: FA_SPLIT_MROW(32); break;
                 default: FA_SPLIT_MROW(16); break;
             }
 #undef FA_SPLIT_MROW
@@ -1575,10 +1651,168 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ggml::spacemit::co
     }
 }
 
+// Pack row-major F16 rows into IME2 [K/8][panel rows][8] panels.
+// Callers zero the destination for padding rows before packing.
+static void fa_pack_f16_k8(_Float16 * dst, const char * src, size_t row_bytes,
+                           int rows, int depth, int panel_rows) {
+    if (depth >= 128) {
+        // Treat K8 as two 64-bit words. Strided segmented loads gather one
+        // complete panel at a time; the store is contiguous in the native layout.
+        for (int r = 0; r < rows; r += panel_rows) {
+            const int count = std::min(panel_rows, rows - r);
+            for (int k = 0; k < depth; k += 8) {
+                const auto x = __riscv_vlsseg2e64_v_u64m2x2(
+                    reinterpret_cast<const uint64_t *>(src + r * row_bytes + k * sizeof(_Float16)), row_bytes, count);
+                __riscv_vsseg2e64_v_u64m2x2(
+                    reinterpret_cast<uint64_t *>(dst + r * depth + (k / 8) * panel_rows * 8), x, count);
+            }
+        }
+        return;
+    }
+    // For short rows, load contiguous words and scatter K8 pairs. This
+    // avoids many VL=8 F16 loads/stores without gathering a narrow panel.
+    const auto even = __riscv_vsll_vx_u64m1(__riscv_vid_v_u64m1(8), 1, 8);
+    const auto odd = __riscv_vadd_vx_u64m1(even, 1, 8);
+    for (int r = 0; r < rows; ++r) {
+        const auto * row = reinterpret_cast<const uint64_t *>(src + r * row_bytes);
+        auto * out = dst + (r / panel_rows) * panel_rows * depth + (r % panel_rows) * 8;
+        for (int k = 0; k < depth; k += 64) {
+            const int count = std::min(64, depth - k) / 8;
+            const auto words = __riscv_vle64_v_u64m1(row + k / 4, count * 2);
+            vuint64m1x2_t packed;
+            packed = __riscv_vset_v_u64m1_u64m1x2(packed, 0, __riscv_vrgather_vv_u64m1(words, even, count));
+            packed = __riscv_vset_v_u64m1_u64m1x2(packed, 1, __riscv_vrgather_vv_u64m1(words, odd, count));
+            __riscv_vssseg2e64_v_u64m1x2(reinterpret_cast<uint64_t *>(out + k * panel_rows),
+                                         panel_rows * 8 * sizeof(_Float16), packed, count);
+        }
+    }
+}
+
+static void fa_pack_v_f16(_Float16 * dst, const char * src_data, size_t stride, int rows, int dv) {
+    // PV always consumes all 64 positions; explicitly zero padding, including masked non-finite tails.
+    if (rows < ggml_fa_tile_config::KV) {
+        rvv_fill_f16(dst, 0.0f, ggml_fa_tile_config::KV * dv);
+    }
+    // Eight contiguous V rows become one contiguous K8 B panel.
+    int tk = 0;
+    for (; tk + 7 < rows; tk += 8) {
+        const char * src = src_data + tk * stride;
+        for (int d = 0; d < dv; d += 32) {
+            vfloat16m1x8_t x;
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 0, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 0 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 1, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 1 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 2, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 2 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 3, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 3 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 4, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 4 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 5, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 5 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 6, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 6 * stride) + d, 32));
+            x = __riscv_vset_v_f16m1_f16m1x8(x, 7, __riscv_vle16_v_f16m1(
+                reinterpret_cast<const _Float16 *>(src + 7 * stride) + d, 32));
+            __riscv_vsseg8e16_v_f16m1x8(dst + (d / 32) * 32 * ggml_fa_tile_config::KV + tk * 32, x, 32);
+        }
+    }
+    for (; tk < rows; ++tk) {
+        const auto * src = reinterpret_cast<const _Float16 *>(
+            src_data + tk * stride);
+        for (int d = 0; d < dv; d += 32) {
+            const auto x = __riscv_vle16_v_f16m1(src + d, 32);
+            __riscv_vsse16_v_f16m1(dst + (d / 32) * 32 * ggml_fa_tile_config::KV + (tk / 8) * 32 * 8 + tk % 8,
+                                  8 * sizeof(_Float16), x, 32);
+        }
+    }
+}
+
+int flash_attn_ext_f16_ime2_mode() {
+#if defined(RISCV64_SPACEMIT_IME2)
+    return ggml::cpu::riscv64_spacemit::global_spine_env_info.use_ime2 ? 3 : 0;
+#else
+    return 0;
+#endif
+}
+
+
+bool flash_attn_ext_f16_prepack_supported(const ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    // Start with one batch and matching KV heads. Outer strides may be arbitrary.
+    // Workspace sizing runs on the X100 host thread; VLEN is checked by
+    // the A100 worker dispatcher before this path executes.
+    return flash_attn_ext_f16_ime2_mode() >= 3 &&
+           q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16 &&
+           q->ne[0] == 256 && k->ne[0] == 256 && v->ne[0] == 256 &&
+           q->ne[1] >= ggml_fa_tile_config::Q && k->ne[1] > 0 && k->ne[1] == v->ne[1] &&
+           k->ne[2] > 0 && k->ne[2] == v->ne[2] && q->ne[2] % k->ne[2] == 0 &&
+           q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1 &&
+           q->nb[0] == sizeof(float) && k->nb[0] == sizeof(_Float16) && v->nb[0] == sizeof(_Float16);
+}
+
+size_t flash_attn_ext_f16_tiled_workspace_size(const ggml_tensor * dst, int nth) {
+    size_t size = fa_tiled_thread_bytes(dst) * nth;
+    if (flash_attn_ext_f16_prepack_supported(dst)) {
+        const ggml_tensor * k = dst->src[1];
+        const ggml_tensor * v = dst->src[2];
+        constexpr size_t kt = ggml_fa_tile_config::KV;
+        const size_t tiles = (k->ne[1] + kt - 1) / kt;
+        size += sizeof(_Float16) * tiles * kt * k->ne[2] * (k->ne[0] + v->ne[0]);
+    }
+    return size;
+}
+
+void forward_flash_attn_ext_f16_prepack(ggml::spacemit::context & ctx, const ggml_tensor * dst) {
+    GGML_ASSERT(flash_attn_ext_f16_prepack_supported(dst));
+    GGML_ASSERT(ctx.workspace_size >= flash_attn_ext_f16_tiled_workspace_size(dst, ctx.nth));
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    constexpr int kt = ggml_fa_tile_config::KV;
+    const int64_t tiles = (k->ne[1] + kt - 1) / kt;
+    const int64_t tasks = tiles * k->ne[2];
+    auto * packed_k = (_Float16 *) ((char *) ctx.workspace + fa_tiled_thread_bytes(dst) * ctx.nth);
+    auto * packed_v = packed_k + tasks * kt * k->ne[0];
+    // Workers own disjoint tiles. The caller synchronizes every worker before use.
+    for (int64_t task = ctx.ith; task < tasks; task += ctx.nth) {
+        const int64_t h = task / tiles;
+        const int64_t row = (task % tiles) * kt;
+        const int rows = std::min<int64_t>(kt, k->ne[1] - row);
+        const auto * ks = (const _Float16 *) ((const char *) k->data + h * k->nb[2] + row * k->nb[1]);
+        const char * vs = (const char *) v->data + h * v->nb[2] + row * v->nb[1];
+        if (rows < kt) {
+            rvv_fill_f16(packed_k + task * kt * k->ne[0], 0.0f, kt * k->ne[0]);
+        }
+        fa_pack_f16_k8(packed_k + task * kt * k->ne[0], (const char *) ks, k->nb[1], rows, k->ne[0], 32);
+        fa_pack_v_f16(packed_v + task * kt * v->ne[0], vs, v->nb[1], rows, v->ne[0]);
+    }
+}
+
+
+static void fa_gemm_f16_ime2(int depth, const _Float16 * b, _Float16 * a, float * c,
+                              int rows, int cols, int stride, bool accumulate, bool pv_direct = false) {
+#if defined(RISCV64_SPACEMIT_IME2)
+    if (pv_direct) {
+        GGML_ASSERT(depth == 64 && cols == 32 && accumulate);
+        spacemit_kernels::ime2::fa_pv_f16f16f32_m16n32_k64_accumulate(b, a, c, rows, stride);
+    } else {
+        spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot(depth, b, a, c, rows, cols, stride, accumulate);
+    }
+#else
+    GGML_UNUSED(depth); GGML_UNUSED(b); GGML_UNUSED(a); GGML_UNUSED(c);
+    GGML_UNUSED(rows); GGML_UNUSED(cols); GGML_UNUSED(stride); GGML_UNUSED(accumulate); GGML_UNUSED(pv_direct);
+    GGML_ABORT("IME2 flash attention is unavailable in this build");
+#endif
+}
+
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
-                                                    int                       ir1) {
+                                                    int                       ir1,
+                                                    int                       ime2_mode) {
     const ggml_tensor * q     = dst->src[0];
     const ggml_tensor * k     = dst->src[1];
     const ggml_tensor * v     = dst->src[2];
@@ -1622,6 +1856,8 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
     GGML_ASSERT(k->type == v->type);
     const ggml_type kv_type = k->type;
+    GGML_ASSERT(ime2_mode >= 0 && ime2_mode <= 2);
+    GGML_ASSERT(!ime2_mode || (kv_type == GGML_TYPE_F16 && DK % 8 == 0 && DV % 32 == 0));
 
     // broadcast factors
     const int64_t rk2 = neq2 / nek2;
@@ -1649,24 +1885,23 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
 
     static constexpr int Q_TILE_SZ  = ggml_fa_tile_config::Q;
     static constexpr int KV_TILE_SZ = ggml_fa_tile_config::KV;
+    static_assert(Q_TILE_SZ == KV_TILE_SZ && KV_TILE_SZ == 64, "IME2 Q staging and K8 tiles require Q=KV=64");
 
-    // Per-thread scratch layout:
-    // Q_f32:   Q_TILE_SZ * DK
-    // KQ:      Q_TILE_SZ * KV_TILE_SZ
-    // mask32:  Q_TILE_SZ * KV_TILE_SZ
-    // VKQ32:   Q_TILE_SZ * DV
-    // V32:     KV_TILE_SZ * DV
-    // K_f32:   DK * KV_TILE_SZ (transposed K tile)
-    float * base = (float *) ctx.workspace +
-                   ith * (Q_TILE_SZ * DK + 2 * Q_TILE_SZ * KV_TILE_SZ + Q_TILE_SZ * DV + KV_TILE_SZ * DV +
-                          KV_TILE_SZ * DK + ggml::spacemit::cache_line_size_f32);
-    const size_t base_size =
-        (Q_TILE_SZ * DK + 2 * Q_TILE_SZ * KV_TILE_SZ + Q_TILE_SZ * DV + KV_TILE_SZ * DV + KV_TILE_SZ * DK) *
-            sizeof(float) +
-        ggml::spacemit::cache_line_size_f32 * sizeof(float);
+    const bool compact_f16 = kv_type == GGML_TYPE_F16;
+
+    // Q/K/V may use F16 storage; KQ, mask and the output accumulator remain F32.
+    const size_t packed_type_size = compact_f16 ? sizeof(_Float16) : sizeof(float);
+    const size_t q_bytes = Q_TILE_SZ * DK * packed_type_size;
+    const size_t v_bytes = KV_TILE_SZ * DV * packed_type_size;
+    const size_t base_size = fa_tiled_thread_bytes(dst);
+    const bool use_shared_kv = ime2_mode == 2 && flash_attn_ext_f16_prepack_supported(dst);
+    const int64_t kv_tiles = (nek1 + KV_TILE_SZ - 1) / KV_TILE_SZ;
+    const auto * packed_k = (const _Float16 *) ((const char *) ctx.workspace + base_size * ctx.nth);
+    const auto * packed_v = packed_k + kv_tiles * nek2 * KV_TILE_SZ * DK;
+    char * base = (char *) ctx.workspace + ith * base_size;
 
     if (base_size <= ctx.shared.size && ctx.shared.data != nullptr) {
-        base = (float *) ctx.shared.data;
+        base = (char *) ctx.shared.data;
     }
 
     float   S_M_Buf[Q_TILE_SZ * 2];  // buffer to hold S, M, bias for one tile to reduce register pressure in main loop
@@ -1696,12 +1931,12 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             M[i] = -INFINITY;
         }
 
-        float *    Q_f32  = base;
-        float *    KQ     = (float *) ((char *) base + Q_TILE_SZ * DK * sizeof(float));
+        float *    Q_f32  = (float *) base;
+        float *    KQ     = (float *) (base + q_bytes);
         float *    mask32 = KQ + Q_TILE_SZ * KV_TILE_SZ;
         float *    VKQ32  = mask32 + Q_TILE_SZ * KV_TILE_SZ;
         float *    V32    = VKQ32 + Q_TILE_SZ * DV;
-        float *    K_f32  = V32 + KV_TILE_SZ * DV;
+        float *    K_f32  = (float *) ((char *) V32 + v_bytes);
         _Float16 * Q_f16  = (_Float16 *) Q_f32;
         _Float16 * V_f16  = (_Float16 *) V32;
         _Float16 * K_f16  = (_Float16 *) K_f32;
@@ -1717,7 +1952,13 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
         const int iv2 = iq2 / rv2;
 
         const float * pq = (const float *) ((char *) q->data + (iq1 * nbq1 + iq2 * nbq2 + iq3 * nbq3));
-        if (kv_type == GGML_TYPE_F16) {
+        if (ime2_mode) {
+            // K scratch is dead until the KV loop; stage Q there to keep one compact Q allocation.
+            rvv_pack_f32_as_scaled_f16((uint8_t *) K_f16, DK * sizeof(_Float16), (uint8_t *) pq, nbq1, tile_rows, DK,
+                                       scale);
+            rvv_fill_f16(Q_f16, 0.0f, Q_TILE_SZ * DK);
+            fa_pack_f16_k8(Q_f16, (const char *) K_f16, DK * sizeof(_Float16), tile_rows, DK, 16);
+        } else if (kv_type == GGML_TYPE_F16) {
             rvv_pack_f32_as_scaled_f16((uint8_t *) Q_f16, DK * sizeof(_Float16), (uint8_t *) pq, nbq1, tile_rows, DK,
                                        scale);
         } else {
@@ -1729,8 +1970,10 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
             int       active_kv[Q_TILE_SZ];
             int       max_active_kv = kv_tile;
 
-            rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
-            rvv_zero_f32(V32, KV_TILE_SZ * DV);
+            if (!ime2_mode && kv_type != GGML_TYPE_F16) {
+                rvv_zero_f32(K_f32, DK * KV_TILE_SZ);
+                rvv_zero_f32(V32, KV_TILE_SZ * DV);
+            }
 
             // skip the tile entirely if all the masks are -inf
             if (mask) {
@@ -1743,8 +1986,18 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 max_active_kv = 0;
                 for (int tq = 0; tq < tile_rows; tq++) {
                     int tk = kv_tile;
-                    while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
-                        --tk;
+                    if (ime2_mode >= 2 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
+                        const size_t vl = __riscv_vsetvl_e32m2(tk);
+                        const auto values = __riscv_vle32_v_f32m2(mask32 + tq * KV_TILE_SZ, vl);
+                        const auto valid = __riscv_vmfne_vf_f32m2_b16(values, -INFINITY, vl);
+                        const auto indices = __riscv_vadd_vx_u32m2(__riscv_vid_v_u32m2(vl), 1, vl);
+                        const auto selected = __riscv_vmerge_vvm_u32m2(__riscv_vmv_v_x_u32m2(0, vl), indices, valid, vl);
+                        const auto last = __riscv_vredmaxu_vs_u32m2_u32m1(selected, __riscv_vmv_v_x_u32m1(0, 1), vl);
+                        tk = __riscv_vmv_x_s_u32m1_u32(last);
+                    } else {
+                        while (tk > 0 && mask32[tq * KV_TILE_SZ + tk - 1] == -INFINITY) {
+                            --tk;
+                        }
                     }
                     active_kv[tq] = tk;
                     max_active_kv = std::max(max_active_kv, tk);
@@ -1757,7 +2010,32 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 std::fill_n(active_kv, tile_rows, kv_tile);
             }
 
-            if (kv_type == GGML_TYPE_F16) {
+            if (ime2_mode) {
+                // GEMM reads padded K8 panels, unlike the RVV active-range path.
+                if (!use_shared_kv && max_active_kv < KV_TILE_SZ) {
+                    rvv_fill_f16(K_f16, 0.0f, DK * KV_TILE_SZ);
+                }
+                if (use_shared_kv) {
+                    const int64_t tile = ik2 * kv_tiles + ic / KV_TILE_SZ;
+                    memcpy1d(K_f16, packed_k + tile * KV_TILE_SZ * DK, KV_TILE_SZ * DK * sizeof(_Float16));
+                    // Preserve padding semantics when a causal tile ends in masked NaN/Inf rows.
+                    for (int r = max_active_kv; r < KV_TILE_SZ; ++r) {
+                        for (int d = 0; d < DK; d += 8) {
+                            rvv_fill_f16(K_f16 + (r / 32) * 32 * DK + d * 32 + (r % 32) * 8, 0.0f, 8);
+                        }
+                    }
+                } else {
+                    fa_pack_f16_k8(K_f16, (const char *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3,
+                                   nbk1, max_active_kv, DK, 32);
+                }
+                for (int tq = 0; tq < tile_rows; tq += 16) {
+                    for (int tk = 0; tk < max_active_kv; tk += 32) {
+                        fa_gemm_f16_ime2(DK, K_f16 + tk * DK, Q_f16 + tq * DK,
+                                        KQ + tq * KV_TILE_SZ + tk, std::min(16, tile_rows - tq),
+                                        std::min(32, max_active_kv - tk), KV_TILE_SZ, false);
+                    }
+                }
+            } else if (kv_type == GGML_TYPE_F16) {
                 rvv_transposed_s16_mn_to_nm((int8_t *) K_f16, KV_TILE_SZ * sizeof(_Float16),
                                             (int8_t *) k->data + ic * nbk1 + ik2 * nbk2 + ik3 * nbk3, nbk1,
                                             max_active_kv,
@@ -1835,8 +2113,53 @@ void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ct
                 S[tq] += rvv_softmax_exp_inplace_f32(kq_row, row_active, Mnew);
             }
 
-            // Pack V as contiguous [KV_TILE_SZ][DV].
-            if (kv_type == GGML_TYPE_F16) {
+            // Softmax remains F32. Only the IME2 PV operands are rounded to F16.
+            // mask32 is dead here and can hold the packed probability tile.
+            if (ime2_mode == 2) {
+                auto * P_ime2 = reinterpret_cast<_Float16 *>(mask32);
+                memset(P_ime2, 0, Q_TILE_SZ * KV_TILE_SZ * sizeof(_Float16));
+                // Gather K8 word pairs and store eight groups with a segmented stride.
+                const auto even = __riscv_vsll_vx_u64m1(__riscv_vid_v_u64m1(8), 1, 8);
+                const auto odd = __riscv_vadd_vx_u64m1(even, 1, 8);
+                for (int tq = 0; tq < tile_rows; ++tq) {
+                    if (skip[tq]) continue;
+                    auto * row = P_ime2 + (tq / 16) * 16 * KV_TILE_SZ + (tq % 16) * 8;
+                    {
+                        // Tail-undisturbed load zero-pads past row_active without reading stale logits.
+                        const auto zero = __riscv_vfmv_v_f_f32m2(0.0f, KV_TILE_SZ);
+                        const auto p32 = __riscv_vle32_v_f32m2_tu(zero, KQ + tq * KV_TILE_SZ, active_kv[tq]);
+                        const auto p16 = __riscv_vfncvt_f_f_w_f16m1(p32, KV_TILE_SZ);
+                        const auto words = __riscv_vreinterpret_v_u16m1_u64m1(__riscv_vreinterpret_v_f16m1_u16m1(p16));
+                        vuint64m1x2_t packed;
+                        packed = __riscv_vset_v_u64m1_u64m1x2(packed, 0, __riscv_vrgather_vv_u64m1(words, even, 8));
+                        packed = __riscv_vset_v_u64m1_u64m1x2(packed, 1, __riscv_vrgather_vv_u64m1(words, odd, 8));
+                        __riscv_vssseg2e64_v_u64m1x2(reinterpret_cast<uint64_t *>(row), 16 * 8 * sizeof(_Float16), packed, 8);
+                    }
+                }
+                if (use_shared_kv) {
+                    const int64_t tile = iv2 * kv_tiles + ic / KV_TILE_SZ;
+                    memcpy1d(V_f16, packed_v + tile * KV_TILE_SZ * DV, KV_TILE_SZ * DV * sizeof(_Float16));
+                    if (max_active_kv < KV_TILE_SZ) {
+                        const auto zero = __riscv_vfmv_v_f_f16m1((_Float16) 0, 32);
+                        for (int d = 0; d < DV; d += 32) {
+                            for (int tk = max_active_kv; tk < KV_TILE_SZ; ++tk) {
+                                __riscv_vsse16_v_f16m1(V_f16 + d * KV_TILE_SZ + (tk / 8) * 256 + tk % 8,
+                                                      8 * sizeof(_Float16), zero, 32);
+                            }
+                        }
+                    }
+                } else {
+                    fa_pack_v_f16(V_f16, (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3,
+                                  nbv1, max_active_kv, DV);
+                }
+                for (int tq = 0; tq < tile_rows; tq += 16) {
+                    for (int d = 0; d < DV; d += 32) {
+                        fa_gemm_f16_ime2(
+                            KV_TILE_SZ, V_f16 + d * KV_TILE_SZ, P_ime2 + tq * KV_TILE_SZ,
+                            VKQ32 + tq * DV + d, std::min(16, tile_rows - tq), 32, DV, true, true);
+                    }
+                }
+            } else if (kv_type == GGML_TYPE_F16) {
                 const char * v_data = (const char *) v->data + ic * nbv1 + iv2 * nbv2 + iv3 * nbv3;
                 memcpy2d(V_f16, DV * sizeof(_Float16), v_data, nbv1, max_active_kv, DV * sizeof(_Float16));
 

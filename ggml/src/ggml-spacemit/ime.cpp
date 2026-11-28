@@ -1302,11 +1302,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
                     // Tiled flash attention scratch (tile sizes defined in common.h)
                     // Per-thread: Q_q + KQ + mask + VKQ32 + V32 + K_f32 + padding
-                    size_t prefill = sizeof(float) *
-                                     (GGML_FA_TILE_Q * DK + 2 * GGML_FA_TILE_Q * GGML_FA_TILE_KV + GGML_FA_TILE_Q * DV +
-                                      GGML_FA_TILE_KV * DV + GGML_FA_TILE_KV * DK +
-                                      ggml::spacemit::cache_line_size_f32) *
-                                     n_tasks;
+                    size_t prefill = spacemit_kernels::rvv::flash_attn_ext_f16_tiled_workspace_size(op, n_tasks);
 
                     // Decode path: n_kv_chunks = n_tasks (one chunk per thread)
                     // Per-thread: VKQ accmulator (DV), partial M, partial S + intra-thread scratch for V, Q and VKQ
@@ -1702,12 +1698,15 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
         const bool supported_prec  = (dst->op_params[3] == GGML_PREC_F32 || dst->op_params[3] == GGML_PREC_UNDEFINED);
         const bool supported_types = (q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F16 && v->type == GGML_TYPE_F16);
-        const bool supported_shape = (DK > 0 && DK <= 256 && DV > 0 && DV <= 256);
+        const bool supported_shape = (DK > 0 && DK <= 512 && DV > 0 && DV <= 512);
         const bool supported_vlen  = (__riscv_vlenb() == 128);
 
         if (!(supported_prec && supported_types && supported_shape && supported_vlen)) {
             return false;
         }
+
+        const int fa_ime2_mode = spacemit_kernels::rvv::flash_attn_ext_f16_ime2_mode();
+        const int tiled_ime2_mode = DK % 8 == 0 && DV % 32 == 0 ? std::min(fa_ime2_mode, 2) : 0;
 
         // total rows in q
         const int64_t nr = neq1 * neq2 * neq3;
@@ -1742,6 +1741,13 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
             return true;
         }
 
+        // All workers participate, including those with an empty query range.
+        if (use_tiled && tiled_ime2_mode == 2 &&
+            spacemit_kernels::rvv::flash_attn_ext_f16_prepack_supported(dst)) {
+            spacemit_kernels::rvv::forward_flash_attn_ext_f16_prepack(ctx, dst);
+            ctx.sync();
+        }
+
         int64_t nchunk = nth;
 
         // The number of elements in each chunk
@@ -1756,7 +1762,7 @@ class tensor_traits_common : public ggml::spacemit::tensor_traits_base {
 
             if (use_tiled) {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_tiled_vlen1024_vf16(
-                    ctx, dst, ir0, ir1);
+                    ctx, dst, ir0, ir1, tiled_ime2_mode);
             } else {
                 spacemit_kernels::rvv::forward_flash_attn_ext_f16_one_chunk_vlen1024_vf16(
                     ctx, dst, ir0, ir1);
@@ -1859,10 +1865,6 @@ private:
 
         const int ith = ctx.ith;
         const int nth = ctx.nth;
-
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
 
         const size_t out_row_stride = dst->nb[1];  // bytes
 

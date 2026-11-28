@@ -205,5 +205,12 @@ void gemm_kernel_f16f16f32_m16_vfwmadot(size_t           gemm_k,
                                         size_t           count_n,
                                         size_t           ldc,
                                         bool             accumulate = false);
+
+// Flash-attention PV: K64/N32 packed operands, direct F32 accumulation into valid M rows.
+void fa_pv_f16f16f32_m16n32_k64_accumulate(const _Float16 * b_f16_k8,
+                                            _Float16 *       a_f16_k8,
+                                            float *          c_ptr,
+                                            size_t           count_m,
+                                            size_t           ldc);
 }  // namespace ime2
 }  // namespace spacemit_kernels

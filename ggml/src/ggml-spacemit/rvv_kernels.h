@@ -84,10 +84,17 @@ void forward_flash_attn_ext_f16_split_kv_reduce_vlen1024_vf16(ggml::spacemit::co
                                                               int                         n_chunks,
                                                               const float *               partials);
 
+// 0=RVV, 1=IME2 QK, 2=QK+PV, 3=QK+PV and shared KV prepack.
+int flash_attn_ext_f16_ime2_mode();
+bool flash_attn_ext_f16_prepack_supported(const ggml_tensor * dst);
+size_t flash_attn_ext_f16_tiled_workspace_size(const ggml_tensor * dst, int nth);
+void forward_flash_attn_ext_f16_prepack(ggml::spacemit::context & ctx, const ggml_tensor * dst);
+
 void forward_flash_attn_ext_f16_tiled_vlen1024_vf16(ggml::spacemit::context & ctx,
                                                     ggml_tensor *             dst,
                                                     int                       ir0,
-                                                    int                       ir1);
+                                                    int                       ir1,
+                                                    int                       ime2_mode);
 
 void forward_rms_norm_f32(ggml::spacemit::context & ctx, ggml_tensor * op);
 
