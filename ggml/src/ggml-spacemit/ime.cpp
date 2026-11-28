@@ -246,7 +246,7 @@ using q41_zero_point_mode = mlir::speir::spekernel::ime2::q41_zero_point_mode;
 
 template <typename BLOC_TYPE, size_t NB, size_t KB, q41_zero_point_mode Mode>
 static gemm_path_f16 resolve_gemm_f16() {
-    static_assert(std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>>, "the f16 link has a single B layout");
+    static_assert((std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>> || std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>), "unsupported f16 weight layout");
     // A100 dispatch requires IME2, 128-byte vectors and RVV.
     SpineArchInfoDef march{};
     march.fields.core_arch_id = SpineCoreArchID::CoreArchA100;
@@ -263,7 +263,12 @@ static gemm_path_f16 resolve_gemm_f16() {
     o.reducesum = mlir::speir::spekernel::rvv::get_spe_reducesum_mxn_function(
         march.value, typeid(_spe_fp16_), typeid(float), 16, 32, 1, 1);
     o.quantize_a_gemv = &spacemit_kernels::rvv::quantize_a_i8_r1;
-    o.dot_gemv        = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41;
+    if constexpr (std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>) {
+        static_assert(Mode == q41_zero_point_mode::fixed_8);
+        o.dot_gemv = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q40;
+    } else {
+        o.dot_gemv = &spacemit_kernels::ime2::gemm_kernel_i8i4_m1_q41;
+    }
     o.dot_f16acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f16_m16_vfwmadot;
     o.dot_f32acc      = &spacemit_kernels::ime2::gemm_kernel_f16f16f32_m16_vfwmadot;
     if (!o.castpack_a || !o.dequantpack_b || !o.reducesum) {
@@ -1798,7 +1803,7 @@ static bool q4_0_f16_split_n(const size_t K, const size_t M) {
 // Q4_1/Q4_K retain nibbles but round offsets to uint8 zero points; the 608B mapping is lossy.
 template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, q41_zero_point_mode Mode>
 class tensor_traits_f16 : public ggml::spacemit::tensor_traits_base {
-    static_assert(std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>>, "f16 traits expect a Q41Block weight layout");
+    static_assert((std::is_same_v<BLOC_TYPE, Q41Block<32, 32, 2>> || std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>), "unsupported f16 weight layout");
     const gemm_path_f16 ops_;
 
 public:
@@ -1827,6 +1832,16 @@ private:
         return slices * m_pad * n_pad * sizeof(_Float16) + metadata_size;
     }
 
+    // MTP verification uses a fused four-row Q4_0 kernel without M16 padding or
+    // split-K F16 partials. Quantizing activations changes the M2-4 arithmetic,
+    // so restrict this path to the validated fixed-zero Q4_0 mode.
+    static bool small_m_fused_supported(const size_t M, const size_t K) {
+        if constexpr (Mode != q41_zero_point_mode::fixed_8) {
+            return false;
+        }
+        return M >= 2 && M <= 4 && K % KB == 0;
+    }
+
     bool work_size(int n_threads, const ggml_tensor * op, size_t & size) const override {
         if (op->op != GGML_OP_MUL_MAT) {
             return false;
@@ -1834,7 +1849,13 @@ private:
         const size_t N         = static_cast<size_t>(op->src[0]->ne[1]);
         const size_t M         = static_cast<size_t>(op->src[1]->ne[1] * op->src[1]->ne[2] * op->src[1]->ne[3]);
         const size_t K         = static_cast<size_t>(op->src[1]->ne[0]);
-        const size_t gemv_size = ((K + KB - 1) / KB) * 38;
+        const size_t gemv_rows = small_m_fused_supported(M, K) && op->src[1]->ne[2] == 1 && op->src[1]->ne[3] == 1 ? M : 1;
+        size_t gemv_size = gemv_rows * ((K + KB - 1) / KB) * 38;
+        if (gemv_rows > 1) {
+            // Keep the interleaved four-row tile separate from the original
+            // quantized rows and align its FP32 scale fields.
+            gemv_size = GGML_PAD(gemv_size, 64) + 4 * (K / KB) * 38;
+        }
         size = std::max(partial_workspace_size(M, N, n_threads), GGML_PAD(gemv_size, sizeof(int64_t)));
         return true;
     }
@@ -1860,10 +1881,6 @@ private:
         const int ith = ctx.ith;
         const int nth = ctx.nth;
 
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
-
         const size_t out_row_stride = dst->nb[1];  // bytes
 
         constexpr size_t m_tile = F16_M_TILE;
@@ -1888,6 +1905,57 @@ private:
         const auto * a_src = reinterpret_cast<const uint8_t *>(src1->data);
         const auto * b_src = reinterpret_cast<const uint8_t *>(src0->data);
         auto *       out   = reinterpret_cast<uint8_t *>(dst->data);
+
+        if (small_m_fused_supported(M, K) && src1->ne[2] == 1 && src1->ne[3] == 1) {
+            constexpr size_t a_blk_len = 32;
+            const size_t a_blk_stride = spacemit_kernels::q8_blk_size(a_blk_len, true);
+            const size_t k_blks = K / KB;
+            const size_t quant_row_stride = k_blks * a_blk_stride;
+            GGML_ASSERT(ctx.workspace_size >= M * quant_row_stride);
+            auto * quant_a = reinterpret_cast<uint8_t *>(ctx.workspace);
+
+            // Distribute all (row, K-block) pairs, but end each quantizer call at
+            // its source row boundary so non-contiguous row strides are honored.
+            const size_t tasks = M * k_blks;
+            const size_t tasks_per_thread = (tasks + static_cast<size_t>(nth) - 1) / nth;
+            const size_t task_end = std::min((static_cast<size_t>(ith) + 1) * tasks_per_thread, tasks);
+            for (size_t task = static_cast<size_t>(ith) * tasks_per_thread; task < task_end;) {
+                const size_t row = task / k_blks;
+                const size_t kb0 = task % k_blks;
+                const size_t count = std::min(task_end - task, k_blks - kb0);
+                ops.quantize_a_gemv(
+                    a_blk_len, reinterpret_cast<const float *>(a_src + row * a_src_stride) + kb0 * a_blk_len,
+                    count * a_blk_len, quant_a + row * quant_row_stride + kb0 * a_blk_stride);
+                task += count;
+            }
+            ctx.sync();
+
+            const size_t packed_offset = GGML_PAD(M * quant_row_stride, 64);
+            GGML_ASSERT(ctx.workspace_size >= packed_offset + 4 * quant_row_stride);
+            uint8_t * quant_a_m4 = quant_a + packed_offset;
+            const size_t kb0 = k_blks * static_cast<size_t>(ith) / nth;
+            const size_t kb1 = k_blks * static_cast<size_t>(ith + 1) / nth;
+            if (kb1 > kb0) {
+                spacemit_kernels::ime2::pack_q8_rows_m4_q41(quant_a + kb0 * a_blk_stride, quant_row_stride, M,
+                                   kb1 - kb0, quant_a_m4 + kb0 * 4 * a_blk_stride);
+            }
+            ctx.sync();
+
+            const size_t b_row_stride = k_blks * ROW_PITCH;
+            constexpr size_t tile_cols = 32;
+            for (int64_t ni = static_cast<int64_t>(ith) * tile_cols; ni < static_cast<int64_t>(N);
+                 ni += static_cast<int64_t>(tile_cols) * nth) {
+                const size_t nb_real = std::min(N - static_cast<size_t>(ni), tile_cols);
+                const uint8_t * b_row = b_src + ni * b_row_stride;
+                GGML_ASSERT(out_row_stride % sizeof(float) == 0);
+                const auto gemm_m4 = std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>
+                    ? spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q40
+                    : spacemit_kernels::ime2::gemm_kernel_i8i4_m4_q41;
+                gemm_m4(quant_a_m4, b_row, reinterpret_cast<float *>(out) + ni,
+                        M, nb_real, k_blks, out_row_stride / sizeof(float));
+            }
+            return true;
+        }
 
         // Decode quantizes A once; workers compute separate N32 tiles without TCM staging.
         if (M == 1 && K % KB == 0) {
@@ -2417,9 +2485,13 @@ private:
     }
 
     int repack(ggml_tensor * t, const void * data, size_t data_size) const override {
-        GGML_LOG_DEBUG("%s: repack tensor %s (type %s) with q4_0_q41block_f16\n", __func__, t->name, ggml_type_name(t->type));
+        GGML_LOG_DEBUG("%s: repack tensor %s (type %s) with q4_%sblock_f16\n", __func__, t->name, ggml_type_name(t->type),
+                       std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>> ? "0_compact_576" : "1_affine_608");
         switch (t->type) {
             case GGML_TYPE_Q4_0:
+                if constexpr (std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>) {
+                    return ggml::cpu::riscv64_spacemit::repack_q4_0_to_q40(t, data, data_size);
+                }
                 return ggml::cpu::riscv64_spacemit::repack_q4_0_to_q41(t, data, data_size);
             case GGML_TYPE_Q4_1:
                 return ggml::cpu::riscv64_spacemit::repack_q4_1_to_q41(t, data, data_size);
@@ -2432,7 +2504,12 @@ private:
 
     void unpack(const ggml_tensor * t, void * data, size_t data_size) const override {
         GGML_LOG_DEBUG("%s: unpack tensor %s from q4_0_q41block_f16\n", __func__, t->name);
-        auto ok = ggml::cpu::riscv64_spacemit::unpack_q41_to_q4_0_common(t, data, data_size);
+        int ok;
+        if constexpr (std::is_same_v<BLOC_TYPE, Q40Block<32, 32, 2>>) {
+            ok = ggml::cpu::riscv64_spacemit::unpack_q40_to_q4_0(t, data, data_size);
+        } else {
+            ok = ggml::cpu::riscv64_spacemit::unpack_q41_to_q4_0_common(t, data, data_size);
+        }
         GGML_ASSERT(ok == 0);
     }
 };
@@ -2467,7 +2544,9 @@ static const auto & i8_traits() {
 
 template <q41_zero_point_mode Mode>
 static const auto & f16_traits() {
-    return traits_instance<tensor_traits_f16<Q41Block<32, 32, 2>, 32, 32, Mode>>();
+    using block_type = std::conditional_t<Mode == q41_zero_point_mode::fixed_8,
+                                          Q40Block<32, 32, 2>, Q41Block<32, 32, 2>>;
+    return traits_instance<tensor_traits_f16<block_type, 32, 32, Mode>>();
 }
 
 // Impl By RVV
@@ -2724,9 +2803,9 @@ size_t ggml_spacemit_nbytes(ggml_backend_buffer_type_t buft, const ggml_tensor *
             }
             break;
         case GGML_TYPE_Q4_0:
-            // Q41Block needs 19 B per row/K32, padded to 32 rows.
+            // Implicit zp=8 uses 18 B per row/K32, padded to 32 rows.
             nbytes = ggml::cpu::riscv64_spacemit::use_f16_link(tensor)
-                         ? remap_block_nbytes(sizeof(block_q4_0), sizeof(ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>) / 32, 32)
+                         ? remap_block_nbytes(sizeof(block_q4_0), sizeof(ggml::cpu::riscv64_spacemit::Q40Block<32, 32, 2>) / 32, 32)
                          : add_strided_nbytes(row_nbytes, 1, 1);
             break;
         case GGML_TYPE_Q4_1:

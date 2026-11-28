@@ -1899,6 +1899,81 @@ template <> int repack<block_q5_K, 32, 32>(ggml_tensor * t, const void * data, s
     return repack_q5_k_to_q5_1_32_bl(t, 32, data, data_size);
 }
 
+int repack_q4_0_to_q40(ggml_tensor * t, const void * data, size_t data_size) {
+    GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
+
+    const int64_t ne00 = t->ne[0];  // K
+    const int64_t ne01 = t->ne[1];  // N
+    if (ne00 % 32 != 0 || ne01 % 32 != 0) {
+        return -1;
+    }
+
+    const int64_t kblocks = ne00 / 32;
+    const int64_t nrows = ggml_nrows(t);
+
+    if (data_size != static_cast<size_t>(nrows) * kblocks * sizeof(block_q4_0)) {
+        return -1;
+    }
+
+    auto                dst = reinterpret_cast<Q40Block<32, 32, 2> *>(t->data);
+    const block_q4_0 * src = reinterpret_cast<const block_q4_0 *>(data);
+
+    // Preserve all source scale bits; adjacent nibble order is unchanged.
+    for (int64_t n0 = 0; n0 < nrows; n0 += 32) {
+        for (int64_t j = 0; j < kblocks; j++) {
+            Q40Block<32, 32, 2> & blk = dst[(n0 / 32) * kblocks + j];
+            for (int i = 0; i < 32; i++) {
+                const block_q4_0 & b = src[(n0 + i) * kblocks + j];
+                memcpy(&blk.scale[i], &b.d, sizeof(ggml_half));
+                // Convert split-half nibbles (p, p+16) to adjacent pairs (2p, 2p+1).
+                uint8_t e[32];
+                for (int p = 0; p < 16; p++) {
+                    e[p]      = static_cast<uint8_t>(b.qs[p] & 0x0F);
+                    e[p + 16] = static_cast<uint8_t>((b.qs[p] >> 4) & 0x0F);
+                }
+                uint8_t * q41row = reinterpret_cast<uint8_t *>(blk.data) + i * 16;
+                for (int p = 0; p < 16; p++) {
+                    q41row[p] = static_cast<uint8_t>((e[2 * p] & 0x0F) | ((e[2 * p + 1] & 0x0F) << 4));
+                }
+            }
+        }
+    }
+
+    return 0;
+}
+
+int unpack_q40_to_q4_0(const ggml_tensor * t, void * data, size_t data_size) {
+    if (t->type != GGML_TYPE_Q4_0 || t->ne[0] % 32 != 0 || t->ne[1] % 32 != 0) {
+        return -1;
+    }
+    const int64_t kb = t->ne[0] / 32;
+    const int64_t nr = ggml_nrows(t);
+    if (data_size != static_cast<size_t>(nr) * kb * sizeof(block_q4_0)) {
+        return -1;
+    }
+    const auto * src = reinterpret_cast<const Q40Block<32, 32, 2> *>(t->data);
+    auto * dst = reinterpret_cast<block_q4_0 *>(data);
+    for (int64_t n0 = 0; n0 < nr; n0 += 32) {
+        for (int64_t k = 0; k < kb; ++k) {
+            const auto & block = src[(n0 / 32) * kb + k];
+            for (int n = 0; n < 32; ++n) {
+                auto & out = dst[(n0 + n) * kb + k];
+                memcpy(&out.d, &block.scale[n], sizeof(out.d));
+                const auto * row = reinterpret_cast<const uint8_t *>(block.data) + 16 * n;
+                uint8_t q[32];
+                for (int i = 0; i < 16; ++i) {
+                    q[2 * i] = row[i] & 15;
+                    q[2 * i + 1] = row[i] >> 4;
+                }
+                for (int i = 0; i < 16; ++i) {
+                    out.qs[i] = q[i] | (q[i + 16] << 4);
+                }
+            }
+        }
+    }
+    return 0;
+}
+
 int repack_q4_0_to_q41(ggml_tensor * t, const void * data, size_t data_size) {
     GGML_ASSERT(t->type == GGML_TYPE_Q4_0);
 

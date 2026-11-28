@@ -1948,21 +1948,16 @@ void gemm_kernel_i8i4_m1(const uint8_t * quant_a_ptr,
 
 // A stores (dA, -sum(qA), qA); B has a uint8 zero point per row and K32 block.
 // Compute dot(qA,qB) - zpB*sum(qA) in INT32 before applying FP32 scales.
-void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
+template <typename block_type>
+static void gemm_kernel_i8i4_m1_q4(const uint8_t * quant_a_ptr,
                            const uint8_t * quant_b_data,
                            float *         c_ptr,
                            size_t          count_n,
                            size_t          k_blks) {
-    using block_type = ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>;
-    constexpr size_t b_data_bytes  = 32 * 32 / 2 * sizeof(uint8_t);
-    constexpr size_t b_zp_bytes    = 32 * sizeof(uint8_t);
-    constexpr size_t b_scale_bytes = 32 * sizeof(_Float16);
+    constexpr bool compact = std::is_same_v<block_type, ggml::cpu::riscv64_spacemit::Q40Block<32, 32, 2>>;
     constexpr size_t a_sum_off     = sizeof(float);
     constexpr size_t a_data_off    = a_sum_off + sizeof(int16_t);
     constexpr size_t a_block_bytes = a_data_off + 32 * sizeof(int8_t);
-    static_assert(sizeof(block_type) == b_data_bytes + b_zp_bytes + b_scale_bytes &&
-                  offsetof(block_type, zp) == b_data_bytes &&
-                  offsetof(block_type, scale) == b_data_bytes + b_zp_bytes);
     for (size_t n = 0; n < count_n; n += 32) {
         const size_t nblks = std::min<size_t>(count_n - n, 32);
         const uint8_t * b = quant_b_data + (n / 32) * k_blks * sizeof(block_type);
@@ -2013,9 +2008,13 @@ void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
             "vpack.vv v26, v20, v22, 2\n\t"
             "vpack.vv v16, v24, v26, 3\n\t"
             "vsetvli t0, x0, e16, mf2\n\t"
-            "addi s4, s5, %[b_zp_off]\n\t"
+            ".if %[compact]\n\t"
+            "vmv.v.i v26, 8\n\t"
+            ".else\n\t"
+            "addi s4, s5, 512\n\t"
             "vle8.v v28, (s4)\n\t"
             "vzext.vf2 v26, v28\n\t"
+            ".endif\n\t"
             "vwmacc.vx v16, t2, v26\n\t"
             "addi s4, s5, %[b_scale_off]\n\t"
             "vle16.v v30, (s4)\n\t"
@@ -2031,12 +2030,183 @@ void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
             "vse32.v v2, (s6)\n\t"
             :
             : [BCK] "r"(k_blks), [NBLKS] "r"(nblks), [pA] "r"(quant_a_ptr), [pB] "r"(b), [pC] "r"(c),
-              [block_bytes] "i"(sizeof(block_type)), [b_zp_off] "i"(offsetof(block_type, zp)),
+              [block_bytes] "i"(sizeof(block_type)), [compact] "i"(compact),
               [b_scale_off] "i"(offsetof(block_type, scale)), [a_sum_off] "i"(a_sum_off),
               [a_data_off] "i"(a_data_off), [a_block_bytes] "i"(a_block_bytes)
             : "cc", "memory", "t0", "t2", "t3", "t4", "f0", "s2", "s3", "s4", "s5", "s6");
         // clang-format on
     }
+}
+
+void gemm_kernel_i8i4_m1_q41(const uint8_t * a, const uint8_t * b, float * c, size_t n, size_t k) {
+    gemm_kernel_i8i4_m1_q4<ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>>(a, b, c, n, k);
+}
+
+void gemm_kernel_i8i4_m1_q40(const uint8_t * a, const uint8_t * b, float * c, size_t n, size_t k) {
+    gemm_kernel_i8i4_m1_q4<ggml::cpu::riscv64_spacemit::Q40Block<32, 32, 2>>(a, b, c, n, k);
+}
+
+// Interleave existing GEMV blocks rather than quantizing a second time. Each
+// K32 block is [4 x f32 scale][4 x i16 negative sum][4 x 32 i8].
+void pack_q8_rows_m4_q41(const uint8_t * quant_a_rows,
+                         size_t          quant_row_stride,
+                         size_t          count_m,
+                         size_t          k_blks,
+                         uint8_t *       quant_a_m4) {
+    GGML_ASSERT(count_m >= 1 && count_m <= 4);
+    constexpr size_t row_block_bytes = sizeof(float) + sizeof(int16_t) + 32;
+    constexpr size_t tile_block_bytes = 4 * row_block_bytes;
+    for (size_t kb = 0; kb < k_blks; ++kb) {
+        auto * dst = quant_a_m4 + kb * tile_block_bytes;
+        // Zero scales, sums and values in all padded rows.
+        memset(dst, 0, tile_block_bytes);
+        for (size_t row = 0; row < count_m; ++row) {
+            const auto * src = quant_a_rows + row * quant_row_stride + kb * row_block_bytes;
+            memcpy(dst + row * sizeof(float), src, sizeof(float));
+            memcpy(dst + 4 * sizeof(float) + row * sizeof(int16_t), src + sizeof(float), sizeof(int16_t));
+            memcpy(dst + 4 * (sizeof(float) + sizeof(int16_t)) + row * 32,
+                   src + sizeof(float) + sizeof(int16_t), 32);
+        }
+    }
+}
+
+// Four unique A rows share each B load and each IME2 dot. This uses ordinary
+// INT32 vmadot, keeping affine correction exact before FP32 scale application.
+template <typename block_type>
+static void gemm_kernel_i8i4_m4_q4(const uint8_t * quant_a_ptr,
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_m,
+                           size_t          count_n,
+                           size_t          k_blks,
+                           size_t          ldc) {
+    constexpr bool compact = std::is_same_v<block_type, ggml::cpu::riscv64_spacemit::Q40Block<32, 32, 2>>;
+    GGML_ASSERT(count_m >= 1 && count_m <= 4);
+    GGML_ASSERT(k_blks > 0);
+    for (size_t ni = 0; ni < count_n; ni += 32) {
+        const auto * b = quant_b_data + (ni / 32) * k_blks * sizeof(block_type);
+        auto * c = c_ptr + ni;
+        const size_t nb_real = std::min<size_t>(32, count_n - ni);
+        // The payload nibble order is identical to the legacy integer M4 B
+        // layout: adjacent K values, with each group of eight N rows contiguous.
+        // clang-format off
+        __asm__ volatile(
+            "mv s1, %[BK]\n\t"
+            "mv s2, %[A]\n\t"
+            "mv s5, %[B]\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "vxor.vv v28, v28, v28\n\t"
+            "vxor.vv v29, v29, v29\n\t"
+            "vxor.vv v30, v30, v30\n\t"
+            "vxor.vv v31, v31, v31\n\t"
+            ".align 4\n\t"
+            "Q41_M4_K%=:\n\t"
+            "flw fa0, 0(s2)\n\t"
+            "flw fa1, 4(s2)\n\t"
+            "flw fa2, 8(s2)\n\t"
+            "flw fa3, 12(s2)\n\t"
+            "lh t1, 16(s2)\n\t"
+            "lh t2, 18(s2)\n\t"
+            "lh t3, 20(s2)\n\t"
+            "lh t4, 22(s2)\n\t"
+            "addi s3, s2, 24\n\t"
+            "addi s2, s2, 152\n\t"
+            "vsetvli t0, x0, e8, m1\n\t"
+            "vl1r.v v0, (s3)\n\t"
+            "vl4r.v v4, (s5)\n\t"
+            "vsrl.vi v1, v0, 4\n\t"
+            "vnpack4.vv v12, v0, v1, 3\n\t"
+            "vupack.vv v2, v12, v12, 2\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "vxor.vv v16, v16, v16\n\t"
+            "vxor.vv v18, v18, v18\n\t"
+            "vxor.vv v20, v20, v20\n\t"
+            "vxor.vv v22, v22, v22\n\t"
+            "vmadotsu v16, v3, v4, i4\n\t"
+            "vmadotsu v18, v3, v5, i4\n\t"
+            "vmadotsu v20, v3, v6, i4\n\t"
+            "vmadotsu v22, v3, v7, i4\n\t"
+            "vsll.vi v16, v16, 4\n\t"
+            "vsll.vi v18, v18, 4\n\t"
+            "vsll.vi v20, v20, 4\n\t"
+            "vsll.vi v22, v22, 4\n\t"
+            "vmadotu v16, v2, v4, i4\n\t"
+            "vmadotu v18, v2, v5, i4\n\t"
+            "vmadotu v20, v2, v6, i4\n\t"
+            "vmadotu v22, v2, v7, i4\n\t"
+            "vpack.vv v0, v16, v18, 2\n\t"
+            "vpack.vv v2, v20, v22, 2\n\t"
+            "vpack.vv v16, v0, v2, 3\n\t"
+            "vpack.vv v18, v1, v3, 3\n\t"
+            "vsetvli t0, x0, e16, mf2\n\t"
+            ".if %[compact]\n\t"
+            "vmv.v.i v26, 8\n\t"
+            ".else\n\t"
+            "addi s4, s5, 512\n\t"
+            "vle8.v v24, (s4)\n\t"
+            "vzext.vf2 v26, v24\n\t"
+            ".endif\n\t"
+            "vwmacc.vx v16, t1, v26\n\t"
+            "vwmacc.vx v17, t2, v26\n\t"
+            "vwmacc.vx v18, t3, v26\n\t"
+            "vwmacc.vx v19, t4, v26\n\t"
+            "addi s4, s5, %[scale_off]\n\t"
+            "vle16.v v12, (s4)\n\t"
+            "vfwcvt.f.f.v v14, v12\n\t"
+            "vsetvli t0, x0, e32, m1\n\t"
+            "vfcvt.f.x.v v16, v16\n\t"
+            "vfcvt.f.x.v v17, v17\n\t"
+            "vfcvt.f.x.v v18, v18\n\t"
+            "vfcvt.f.x.v v19, v19\n\t"
+            "vfmul.vv v16, v16, v14\n\t"
+            "vfmul.vv v17, v17, v14\n\t"
+            "vfmul.vv v18, v18, v14\n\t"
+            "vfmul.vv v19, v19, v14\n\t"
+            "vfmacc.vf v28, fa0, v16\n\t"
+            "vfmacc.vf v29, fa1, v17\n\t"
+            "vfmacc.vf v30, fa2, v18\n\t"
+            "vfmacc.vf v31, fa3, v19\n\t"
+            "addi s5, s5, %[block_bytes]\n\t"
+            "addi s1, s1, -1\n\t"
+            "bgtz s1, Q41_M4_K%=\n\t"
+            "mv s6, %[C]\n\t"
+            "mv t5, %[M]\n\t"
+            "vsetvli t0, %[N], e32, m1\n\t"
+            "vse32.v v28, (s6)\n\t"
+            "addi t5, t5, -1\n\t"
+            "beqz t5, Q41_M4_END%=\n\t"
+            "add s6, s6, %[LDC]\n\t"
+            "vse32.v v29, (s6)\n\t"
+            "addi t5, t5, -1\n\t"
+            "beqz t5, Q41_M4_END%=\n\t"
+            "add s6, s6, %[LDC]\n\t"
+            "vse32.v v30, (s6)\n\t"
+            "addi t5, t5, -1\n\t"
+            "beqz t5, Q41_M4_END%=\n\t"
+            "add s6, s6, %[LDC]\n\t"
+            "vse32.v v31, (s6)\n\t"
+            "Q41_M4_END%=:\n\t"
+            :
+            : [A] "r"(quant_a_ptr), [B] "r"(b), [C] "r"(c), [BK] "r"(k_blks),
+              [M] "r"(count_m), [N] "r"(nb_real), [LDC] "r"(ldc * sizeof(float)),
+              [compact] "i"(compact), [scale_off] "i"(offsetof(block_type, scale)), [block_bytes] "i"(sizeof(block_type))
+            : "cc", "memory", "t0", "t1", "t2", "t3", "t4", "t5", "s1", "s2", "s3", "s4", "s5", "s6",
+              "fa0", "fa1", "fa2", "fa3",
+              "v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7", "v8", "v9", "v10", "v11",
+              "v12", "v13", "v14", "v15", "v16", "v17", "v18", "v19", "v20", "v21", "v22", "v23",
+              "v24", "v25", "v26", "v27", "v28", "v29", "v30", "v31");
+        // clang-format on
+    }
+}
+
+void gemm_kernel_i8i4_m4_q41(const uint8_t * a, const uint8_t * b, float * c,
+                           size_t m, size_t n, size_t k, size_t ldc) {
+    gemm_kernel_i8i4_m4_q4<ggml::cpu::riscv64_spacemit::Q41Block<32, 32, 2>>(a, b, c, m, n, k, ldc);
+}
+
+void gemm_kernel_i8i4_m4_q40(const uint8_t * a, const uint8_t * b, float * c,
+                           size_t m, size_t n, size_t k, size_t ldc) {
+    gemm_kernel_i8i4_m4_q4<ggml::cpu::riscv64_spacemit::Q40Block<32, 32, 2>>(a, b, c, m, n, k, ldc);
 }
 
 void gemm_kernel_i8i4_m4(const uint8_t * quant_a_ptr,

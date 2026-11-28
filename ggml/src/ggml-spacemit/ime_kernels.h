@@ -186,6 +186,42 @@ void gemm_kernel_i8i4_m1_q41(const uint8_t * quant_a_ptr,
                            size_t          count_n,
                            size_t          k_blks);
 
+// Interleave GEMV A rows: input K32 block = [f32 scale][i16 -sum][32 i8].
+// Output = k_blks * 152 bytes, each [4 f32 scales][4 i16 -sum][4x32 i8].
+// count_m is 1..4; missing rows are zero padded. Source/destination cannot overlap.
+// quant_row_stride is in bytes. The function may be called on a K-block subrange.
+void pack_q8_rows_m4_q41(const uint8_t * quant_a_rows,
+                         size_t          quant_row_stride,
+                         size_t          count_m,
+                         size_t          k_blks,
+                         uint8_t *       quant_a_m4);
+
+// Q41 INT32 GEMM for 1..4 A rows packed by pack_q8_rows_m4_q41.
+// B = [N32 tiles][K32 blocks] of Q41Block<32,32,2>; K must be nonzero.
+// All four padded A rows are read, only count_m rows are stored. ldc is in F32
+// elements; count_n may have an N32 tail, with B physically padded to N32.
+void gemm_kernel_i8i4_m4_q41(const uint8_t * quant_a_ptr,
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_m,
+                           size_t          count_n,
+                           size_t          k_blks,
+                           size_t          ldc);
+
+void gemm_kernel_i8i4_m4_q40(const uint8_t * quant_a_ptr,
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_m,
+                           size_t          count_n,
+                           size_t          k_blks,
+                           size_t          ldc);
+
+void gemm_kernel_i8i4_m1_q40(const uint8_t * quant_a_ptr,
+                           const uint8_t * quant_b_data,
+                           float *         c_ptr,
+                           size_t          count_n,
+                           size_t          k_blks);
+
 // A/B layouts: [K/8][M16|N32][K8]; gemm_k is the K extent.
 void gemm_kernel_f16f16f16_m16_vfwmadot(size_t           gemm_k,
                                         const _Float16 * b_f16_k8,
