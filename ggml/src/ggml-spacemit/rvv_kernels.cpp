@@ -4101,6 +4101,34 @@ void forward_gated_delta_net(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+static bool gdn_state_ranges_overlap(const void * a, size_t na, const void * b, size_t nb) {
+    if (!na || !nb) {
+        return false;
+    }
+    const uintptr_t x = reinterpret_cast<uintptr_t>(a);
+    const uintptr_t y = reinterpret_cast<uintptr_t>(b);
+    return x <= y ? y - x < na : x - y < nb;
+}
+
+void forward_arange_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const float start = ggml_get_op_params_f32(op, 0);
+    const float step  = ggml_get_op_params_f32(op, 2);
+    float * dst = static_cast<float *>(op->data);
+
+    const int64_t n = ggml_nelements(op);
+    const int64_t chunk = (n + ctx.nth - 1) / ctx.nth;
+    const int64_t begin = chunk * ctx.ith;
+    const int64_t end = std::min(begin + chunk, n);
+    for (int64_t i = begin; i < end; ) {
+        const size_t vl = __riscv_vsetvl_e64m4(end - i);
+        vuint64m4_t index = __riscv_vadd_vx_u64m4(__riscv_vid_v_u64m4(vl), i, vl);
+        vfloat32m2_t values = __riscv_vfncvt_f_xu_w_f32m2(index, vl);
+        values = __riscv_vfmacc_vf_f32m2(__riscv_vfmv_v_f_f32m2(start, vl), step, values, vl);
+        __riscv_vse32_v_f32m2(dst + i, values, vl);
+        i += vl;
+    }
+}
+
 void forward_scale_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     const ggml_tensor * src0 = op->src[0];
     ggml_tensor *       dst  = op;
@@ -4259,6 +4287,21 @@ void forward_cpy_f32_row_strided(ggml::spacemit::context & ctx, ggml_tensor * op
         const char * sp = (const char *) src0->data + i1 * src0->nb[1] + i2 * src0->nb[2] + i3 * src0->nb[3];
         char *       dp = (char *)       dst->data + i1 * dst->nb[1]  + i2 * dst->nb[2]  + i3 * dst->nb[3];
         memcpy1d(dp, sp, row_bytes);
+    }
+}
+
+void forward_cpy_f32_to_i32(ggml::spacemit::context & ctx, ggml_tensor * op) {
+    const float * src = static_cast<const float *>(op->src[0]->data);
+    int32_t * dst = static_cast<int32_t *>(op->data);
+    const int64_t n = ggml_nelements(op);
+    const int64_t chunk = (n + ctx.nth - 1) / ctx.nth;
+    const int64_t begin = chunk * ctx.ith;
+    const int64_t end = std::min(begin + chunk, n);
+    for (int64_t i = begin; i < end; ) {
+        const size_t vl = __riscv_vsetvl_e32m4(end - i);
+        vfloat32m4_t values = __riscv_vle32_v_f32m4(src + i, vl);
+        __riscv_vse32_v_i32m4(dst + i, __riscv_vfcvt_rtz_x_f_v_i32m4(values, vl), vl);
+        i += vl;
     }
 }
 
@@ -5043,6 +5086,57 @@ void forward_set_rows(ggml::spacemit::context & ctx, ggml_tensor * op) {
 
     const int64_t nc  = src0->ne[0];
     const int64_t nr  = src0->ne[1];
+
+    const auto disjoint_from_dst = [dst](const ggml_tensor * src) {
+        const uintptr_t sb = reinterpret_cast<uintptr_t>(src->data);
+        const uintptr_t db = reinterpret_cast<uintptr_t>(dst->data);
+        return sb < db ? db - sb >= ggml_nbytes(src) : sb - db >= ggml_nbytes(dst);
+    };
+
+    // Convolution rollback windows contain three adjacent F32 fields per
+    // channel, with the snapshot slots outside the channel/sequence planes.
+    // These conservative stride guards make every channel/sequence group
+    // disjoint even when different source rows select the same slot. Inputs
+    // and indices must not alias destination writes.
+    const size_t channel_plane = static_cast<size_t>(src0->ne[2]) * 3 * sizeof(float);
+    if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        nc == 3 && nr > 0 && src0->ne[2] > 0 && src0->ne[3] > 0 &&
+        src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float) &&
+        src1->ne[1] == 1 && src1->ne[2] == 1 &&
+        dst->nb[2] == 3 * sizeof(float) && dst->nb[3] >= channel_plane &&
+        dst->nb[1] / static_cast<size_t>(src0->ne[3]) >= dst->nb[3] &&
+        disjoint_from_dst(src0) && disjoint_from_dst(src1)) {
+        const int64_t channels = src0->ne[2];
+        const int64_t groups = channels * src0->ne[3];
+        const int64_t dg = (groups + ctx.nth - 1) / ctx.nth;
+        const int64_t end = MIN(dg * (ctx.ith + 1), groups);
+        for (int64_t group = dg * ctx.ith; group < end;) {
+            const int64_t seq = group / channels;
+            const int64_t ch0 = group % channels;
+            const int64_t ch1 = MIN(channels, ch0 + end - group);
+            // Retain source-row order for every owned channel: repeated slot
+            // indices therefore keep the final source row, as in the fallback.
+            for (int64_t row = 0; row < nr; ++row) {
+                const char * index_ptr = (const char *) src1->data + row * src1->nb[0];
+                const int64_t idx = src1->type == GGML_TYPE_I64
+                        ? *(const int64_t *) index_ptr : *(const int32_t *) index_ptr;
+                GGML_ASSERT(idx >= 0 && idx < dst->ne[1]);
+                for (int64_t ch = ch0; ch < ch1;) {
+                    const size_t vl = __riscv_vsetvl_e32m1(ch1 - ch);
+                    const float * src = (const float *) ((const char *) src0->data +
+                            row * src0->nb[1] + ch * src0->nb[2] + seq * src0->nb[3]);
+                    float * out = (float *) ((char *) dst->data +
+                            idx * dst->nb[1] + ch * dst->nb[2] + seq * dst->nb[3]);
+                    const vfloat32m1x3_t values = __riscv_vlsseg3e32_v_f32m1x3(src, src0->nb[2], vl);
+                    __riscv_vsseg3e32_v_f32m1x3(out, values, vl);
+                    ch += vl;
+                }
+            }
+            group += ch1 - ch0;
+        }
+        return;
+    }
+
     const int64_t dc  = (nc + ctx.nth - 1) / ctx.nth;
     const int64_t c0  = dc * ctx.ith;
     const int64_t c1  = MIN(c0 + dc, nc);
@@ -5248,6 +5342,104 @@ void forward_rms_norm_mul_f32(ggml::spacemit::context & ctx, const ggml_tensor *
 // ssm_conv fused with its concat(conv_states, transpose(qkv)) input: reads the conv state (d_conv - 1
 // columns per channel) and the untransposed qkv rows directly, so every token is one contiguous load across
 // channels instead of a strided gather. Same arithmetic order as forward_ssm_conv_f32 (bitwise identical).
+void forward_ssm_conv_persistent(ggml::spacemit::context & ctx, ggml_tensor * ssm,
+                                  ggml_tensor * copy, ggml_tensor * gather) {
+    ggml_tensor * cat = ssm->src[0];
+    const ggml_tensor * q = cat->src[1];
+    const ggml_tensor * w = ssm->src[1];
+    const ggml_tensor * cache = gather->src[0];
+    const ggml_tensor * index = gather->src[1];
+    const int64_t nr = ssm->ne[0];
+    const size_t bytes = 3 * nr * sizeof(float);
+    const int32_t row = index->data ? *(const int32_t *) index->data : -1;
+    const float * old = row >= 0 && row < cache->ne[1] && cache->data ?
+        (const float *) ((const char *) cache->data + row * cache->nb[1]) : nullptr;
+    bool direct = old && copy->data && q->data && w->data && ssm->data &&
+        ggml_is_contiguous(copy) && ggml_nbytes(copy) == bytes && q->nb[1] == sizeof(float) &&
+        w->nb[1] == 4 * sizeof(float) &&
+        (old == copy->data || !gdn_state_ranges_overlap(old, bytes, copy->data, bytes));
+    for (const ggml_tensor * t : {q, w, index, static_cast<const ggml_tensor *>(ssm)}) {
+        direct = direct && t->data &&
+            !gdn_state_ranges_overlap(copy->data, bytes, t->data, ggml_nbytes(t)) &&
+            !gdn_state_ranges_overlap(old, bytes, t->data, ggml_nbytes(t));
+    }
+    if (!direct) {
+        // Reconstruct the full original CONCAT before CPY. The gather output and both
+        // CONCAT inputs remain allocated through SSM for this conservative path.
+        forward_get_rows<float>(ctx, gather);
+        ctx.sync();
+        if (!forward_concat_dim0_transposed_f32(ctx, cat, 0)) {
+            GGML_ABORT("ssm persistent fallback: unsupported concat");
+        }
+        ctx.sync();
+        forward_cpy_strided_f32(ctx, copy);
+        ctx.sync();
+        if (!forward_ssm_conv_f32(ctx, ssm)) {
+            GGML_ABORT("ssm persistent fallback: unsupported convolution");
+        }
+        return;
+    }
+    const int64_t dr = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+    const int64_t c0 = dr * (int64_t) ctx.ith;
+    const int64_t c1 = std::min(c0 + dr, nr);
+    for (int64_t c = c0; c < c1;) {
+        const size_t vl = __riscv_vsetvl_e32m2(c1 - c);
+        vfloat32m2x3_t state = __riscv_vlseg3e32_v_f32m2x3(old + 3 * c, vl);
+        const vfloat32m2_t x0 = __riscv_vget_v_f32m2x3_f32m2(state, 0);
+        const vfloat32m2_t x1 = __riscv_vget_v_f32m2x3_f32m2(state, 1);
+        const vfloat32m2_t x2 = __riscv_vget_v_f32m2x3_f32m2(state, 2);
+        const vfloat32m2_t x3 = __riscv_vle32_v_f32m2((const float *) q->data + c, vl);
+        const vfloat32m2x4_t weights = __riscv_vlseg4e32_v_f32m2x4((const float *) w->data + 4 * c, vl);
+        vfloat32m2_t acc = __riscv_vfmul_vv_f32m2(x0, __riscv_vget_v_f32m2x4_f32m2(weights, 0), vl);
+        acc = __riscv_vfmacc_vv_f32m2(acc, x1, __riscv_vget_v_f32m2x4_f32m2(weights, 1), vl);
+        acc = __riscv_vfmacc_vv_f32m2(acc, x2, __riscv_vget_v_f32m2x4_f32m2(weights, 2), vl);
+        acc = __riscv_vfmacc_vv_f32m2(acc, x3, __riscv_vget_v_f32m2x4_f32m2(weights, 3), vl);
+        __riscv_vse32_v_f32m2((float *) ssm->data + c, acc, vl);
+        // All three old values have reached registers before updating this channel.
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 0, x1);
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 1, x2);
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 2, x3);
+        __riscv_vsseg3e32_v_f32m2x3((float *) copy->data + 3 * c, state, vl);
+        c += vl;
+    }
+}
+
+// The old gathered state remains live until SSM; only its persistent destination changes here.
+void forward_ssm_conv_state_store(ggml::spacemit::context & ctx, ggml_tensor * ssm, ggml_tensor * copy) {
+    ggml_tensor * cat = ssm->src[0];
+    const ggml_tensor * st = cat->src[0];
+    const ggml_tensor * q = cat->src[1];
+    const int64_t nr = cat->ne[1];
+    const size_t state_bytes = 3 * nr * sizeof(float);
+    const bool direct = st->nb[1] == 3 * sizeof(float) && q->nb[1] == sizeof(float) &&
+        ggml_is_contiguous(copy) && ggml_nbytes(copy) == state_bytes && copy->data && st->data && q->data &&
+        !gdn_state_ranges_overlap(copy->data, state_bytes, st->data, ggml_nbytes(st)) &&
+        !gdn_state_ranges_overlap(copy->data, state_bytes, q->data, ggml_nbytes(q));
+    if (!direct) {
+        if (!forward_concat_dim0_transposed_f32(ctx, cat, 1)) {
+            GGML_ABORT("fused ssm state store: unsupported concat");
+        }
+        ctx.sync();
+        forward_cpy_strided_f32(ctx, copy);
+        return;
+    }
+    const int64_t dr = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
+    const int64_t c0 = dr * (int64_t) ctx.ith;
+    const int64_t c1 = std::min(c0 + dr, nr);
+    for (int64_t c = c0; c < c1;) {
+        const size_t vl = __riscv_vsetvl_e32m2(c1 - c);
+        vfloat32m2x3_t state = __riscv_vlseg3e32_v_f32m2x3((const float *) st->data + 3 * c, vl);
+        const vfloat32m2_t s1 = __riscv_vget_v_f32m2x3_f32m2(state, 1);
+        const vfloat32m2_t s2 = __riscv_vget_v_f32m2x3_f32m2(state, 2);
+        const vfloat32m2_t x = __riscv_vle32_v_f32m2((const float *) q->data + c, vl);
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 0, s1);
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 1, s2);
+        state = __riscv_vset_v_f32m2_f32m2x3(state, 2, x);
+        __riscv_vsseg3e32_v_f32m2x3((float *) copy->data + 3 * c, state, vl);
+        c += vl;
+    }
+}
+
 bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * dst) {
     const ggml_tensor * cat = dst->src[0];  // concat {d_conv - 1 + n_t, d_inner, n_s}
     const ggml_tensor * st  = cat->src[0];  // conv states {d_conv - 1, d_inner, n_s}
@@ -5274,6 +5466,31 @@ bool forward_ssm_conv_concat_f32(ggml::spacemit::context & ctx, ggml_tensor * ds
     const int64_t dr  = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
     const int64_t ir0 = dr * (int64_t) ctx.ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    if (n_t == 1 && ss == 3 * sizeof(float) && ws == 4 * sizeof(float)) {
+        for (int64_t i3 = 0; i3 < n_s; ++i3) {
+            for (int64_t c = ir0; c < ir1;) {
+                const size_t vl = __riscv_vsetvl_e32m2(ir1 - c);
+                const float * wp = (const float *) ((const char *) src1->data + c * ws);
+                const vfloat32m2x4_t w = __riscv_vlseg4e32_v_f32m2x4(wp, vl);
+                const float * sp = (const float *) ((const char *) st->data + c * ss + i3 * st->nb[2]);
+                const vfloat32m2x3_t sx = __riscv_vlseg3e32_v_f32m2x3(sp, vl);
+                const vfloat32m2_t x0 = __riscv_vget_v_f32m2x3_f32m2(sx, 0);
+                const vfloat32m2_t x1 = __riscv_vget_v_f32m2x3_f32m2(sx, 1);
+                const vfloat32m2_t x2 = __riscv_vget_v_f32m2x3_f32m2(sx, 2);
+                const float * qp = (const float *) ((const char *) qk->data + c * sizeof(float) + i3 * qk->nb[2]);
+                const vfloat32m2_t x3 = __riscv_vle32_v_f32m2(qp, vl);
+                vfloat32m2_t acc = __riscv_vfmul_vv_f32m2(x0, __riscv_vget_v_f32m2x4_f32m2(w, 0), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x1, __riscv_vget_v_f32m2x4_f32m2(w, 1), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x2, __riscv_vget_v_f32m2x4_f32m2(w, 2), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x3, __riscv_vget_v_f32m2x4_f32m2(w, 3), vl);
+                float * yp = (float *) ((char *) dst->data + c * sizeof(float) + i3 * dst->nb[2]);
+                __riscv_vse32_v_f32m2(yp, acc, vl);
+                c += vl;
+            }
+        }
+        return true;
+    }
 
     for (int64_t i3 = 0; i3 < n_s; ++i3) {
         for (int64_t c = ir0; c < ir1;) {
@@ -5336,6 +5553,52 @@ bool forward_concat_dim0_transposed_f32(ggml::spacemit::context & ctx, ggml_tens
     const int64_t c0 = dc * (int64_t) ctx.ith;
     const int64_t c1 = std::min(c0 + dc, ne1);
 
+    // The existing channel-vectorized copy scatters each token over many dst
+    // cache lines. Instead transpose small channel/token tiles: a vector loads
+    // tokens with src1's token stride and writes them contiguously into one dst
+    // channel. Adjacent channels reuse the same source cache lines before the
+    // next token tile. A 32x32 tile copies 4 KiB of values from each side.
+    // This also honors the partial materialization used by concat/SSM fusion.
+    if (ne10 >= 64 && ne1 >= 32 && nb10 >= (size_t) ne1 * sizeof(float) &&
+        nb10 % sizeof(float) == 0 && nb01 >= (size_t) ne00 * sizeof(float) &&
+        nb1 >= (size_t) ne0 * sizeof(float)) {
+        constexpr int64_t channel_tile = 32;
+        constexpr int64_t token_tile = 32;
+        const int64_t first_state = std::max<int64_t>(0, col0);
+        const int64_t first_token = std::max<int64_t>(0, col0 - ne00);
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                const char * s0 = (const char *) src0->data + i2 * nb02 + i3 * nb03;
+                const char * s1 = (const char *) src1->data + i2 * nb12 + i3 * nb13;
+                char * d = (char *) op->data + i2 * nb2 + i3 * nb3;
+                if (first_state < ne00) {
+                    for (int64_t c = c0; c < c1; ++c) {
+                        memcpy1d(d + c * nb1 + first_state * sizeof(float),
+                                 s0 + c * nb01 + first_state * sizeof(float),
+                                 (ne00 - first_state) * sizeof(float));
+                    }
+                }
+                for (int64_t cb = c0; cb < c1; cb += channel_tile) {
+                    const int64_t ce = std::min(cb + channel_tile, c1);
+                    for (int64_t tb = first_token; tb < ne10; tb += token_tile) {
+                        const int64_t te = std::min(tb + token_tile, ne10);
+                        for (int64_t c = cb; c < ce; ++c) {
+                            for (int64_t t = tb; t < te;) {
+                                const size_t vl = __riscv_vsetvl_e32m1(te - t);
+                                const vfloat32m1_t values = __riscv_vlse32_v_f32m1(
+                                    (const float *) (s1 + c * nb11 + t * nb10), nb10, vl);
+                                __riscv_vse32_v_f32m1(
+                                    (float *) (d + c * nb1 + (ne00 + t) * sizeof(float)), values, vl);
+                                t += vl;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
     for (int64_t i3 = 0; i3 < ne3; i3++) {
         for (int64_t i2 = 0; i2 < ne2; i2++) {
             const char * s0 = (const char *) src0->data + i2 * nb02 + i3 * nb03;
@@ -5382,6 +5645,30 @@ bool forward_ssm_conv_f32(ggml::spacemit::context & ctx, ggml_tensor * dst) {
     const int64_t dr  = (nr + (int64_t) ctx.nth - 1) / (int64_t) ctx.nth;
     const int64_t ir0 = dr * (int64_t) ctx.ith;
     const int64_t ir1 = std::min(ir0 + dr, nr);
+
+    if (n_t == 1 && xs == 4 * sizeof(float) && ws == 4 * sizeof(float)) {
+        for (int64_t i3 = 0; i3 < n_s; ++i3) {
+            for (int64_t c = ir0; c < ir1;) {
+                const size_t vl = __riscv_vsetvl_e32m2(ir1 - c);
+                const float * wp = (const float *) ((const char *) src1->data + c * ws);
+                const vfloat32m2x4_t w = __riscv_vlseg4e32_v_f32m2x4(wp, vl);
+                const float * xp = (const float *) ((const char *) src0->data + c * xs + i3 * src0->nb[2]);
+                const vfloat32m2x4_t sx = __riscv_vlseg4e32_v_f32m2x4(xp, vl);
+                const vfloat32m2_t x0 = __riscv_vget_v_f32m2x4_f32m2(sx, 0);
+                const vfloat32m2_t x1 = __riscv_vget_v_f32m2x4_f32m2(sx, 1);
+                const vfloat32m2_t x2 = __riscv_vget_v_f32m2x4_f32m2(sx, 2);
+                const vfloat32m2_t x3 = __riscv_vget_v_f32m2x4_f32m2(sx, 3);
+                vfloat32m2_t acc = __riscv_vfmul_vv_f32m2(x0, __riscv_vget_v_f32m2x4_f32m2(w, 0), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x1, __riscv_vget_v_f32m2x4_f32m2(w, 1), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x2, __riscv_vget_v_f32m2x4_f32m2(w, 2), vl);
+                acc = __riscv_vfmacc_vv_f32m2(acc, x3, __riscv_vget_v_f32m2x4_f32m2(w, 3), vl);
+                float * yp = (float *) ((char *) dst->data + c * sizeof(float) + i3 * dst->nb[2]);
+                __riscv_vse32_v_f32m2(yp, acc, vl);
+                c += vl;
+            }
+        }
+        return true;
+    }
 
     for (int64_t i3 = 0; i3 < n_s; ++i3) {
         for (int64_t c = ir0; c < ir1;) {
