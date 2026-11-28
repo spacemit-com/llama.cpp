@@ -1860,10 +1860,6 @@ private:
         const int ith = ctx.ith;
         const int nth = ctx.nth;
 
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
-
         const size_t out_row_stride = dst->nb[1];  // bytes
 
         constexpr size_t m_tile = F16_M_TILE;
