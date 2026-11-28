@@ -72,6 +72,10 @@ target_compile_features   (llama PRIVATE cxx_std_17) # don't bump
 find_package(Threads REQUIRED)
 target_link_libraries(llama PUBLIC ggml PRIVATE Threads::Threads)
 
+if (GGML_BACKEND_DL AND TARGET ggml-spacemit)
+    target_compile_definitions(llama PRIVATE GGML_USE_SPACEMIT)
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(llama PROPERTIES POSITION_INDEPENDENT_CODE ON)
     target_compile_definitions(llama PRIVATE LLAMA_BUILD)
