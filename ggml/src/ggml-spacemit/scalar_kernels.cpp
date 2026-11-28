@@ -9,8 +9,13 @@
 #include "vec.h"
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <algorithm>
+
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+#    include <riscv_vector.h>
+#endif
 
 namespace spacemit_kernels::scalar {
 
@@ -327,6 +332,158 @@ void forward_set_f32(ggml::spacemit::context & ctx, ggml_tensor * op) {
     }
 }
 
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+// Expand BF16 bits without native BF16 instructions; keep the CPU reference unchanged.
+// Ordered F64 reduction of F32 products preserves the scalar dot's element order.
+static void vec_dot_bf16_rvv_ordered(int n, float * GGML_RESTRICT s, size_t bs,
+                                   const void * GGML_RESTRICT vx, size_t bx,
+                                   const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    GGML_ASSERT(nrc == 1);
+    GGML_UNUSED(bs);
+    GGML_UNUSED(bx);
+    GGML_UNUSED(by);
+    const uint16_t * x = static_cast<const uint16_t *>(vx);
+    const uint16_t * y = static_cast<const uint16_t *>(vy);
+    vfloat64m1_t sum = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    for (int i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m4(n - i);
+        const vuint32m4_t xb = __riscv_vsll_vx_u32m4(
+            __riscv_vzext_vf2_u32m4(__riscv_vle16_v_u16m2(x + i, vl), vl), 16, vl);
+        const vuint32m4_t yb = __riscv_vsll_vx_u32m4(
+            __riscv_vzext_vf2_u32m4(__riscv_vle16_v_u16m2(y + i, vl), vl), 16, vl);
+        const vfloat32m4_t product = __riscv_vfmul_vv_f32m4(
+            __riscv_vreinterpret_v_u32m4_f32m4(xb), __riscv_vreinterpret_v_u32m4_f32m4(yb), vl);
+        sum = __riscv_vfwredosum_vs_f32m4_f64m1(product, sum, vl);
+        i += vl;
+    }
+    *s = (float) __riscv_vfmv_f_s_f64m1_f64(sum);
+}
+
+// Two output columns for one RHS column. This private helper deliberately does
+// not use the CPU vec_dot nrc/2x2 ABI: s[0] and s[1] are adjacent output columns.
+// Each dot keeps the same F32 products, ordered F64 seed, K chunks and final
+// F32 conversion as vec_dot_bf16_rvv_ordered; only the read-only RHS is shared.
+static void vec_dot_bf16_rvv_ordered_x2(int n, float * GGML_RESTRICT s,
+                                      const void * GGML_RESTRICT vx0,
+                                      const void * GGML_RESTRICT vx1,
+                                      const void * GGML_RESTRICT vy) {
+    const uint16_t * x0 = static_cast<const uint16_t *>(vx0);
+    const uint16_t * x1 = static_cast<const uint16_t *>(vx1);
+    const uint16_t * y  = static_cast<const uint16_t *>(vy);
+    vfloat64m1_t sum0 = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    vfloat64m1_t sum1 = __riscv_vfmv_v_f_f64m1(0.0, 1);
+    for (int i = 0; i < n;) {
+        const size_t vl = __riscv_vsetvl_e32m4(n - i);
+        const vuint32m4_t yb = __riscv_vsll_vx_u32m4(
+            __riscv_vzext_vf2_u32m4(__riscv_vle16_v_u16m2(y + i, vl), vl), 16, vl);
+        const vfloat32m4_t yf = __riscv_vreinterpret_v_u32m4_f32m4(yb);
+        const vuint32m4_t xb0 = __riscv_vsll_vx_u32m4(
+            __riscv_vzext_vf2_u32m4(__riscv_vle16_v_u16m2(x0 + i, vl), vl), 16, vl);
+        const vfloat32m4_t product0 = __riscv_vfmul_vv_f32m4(
+            __riscv_vreinterpret_v_u32m4_f32m4(xb0), yf, vl);
+        sum0 = __riscv_vfwredosum_vs_f32m4_f64m1(product0, sum0, vl);
+        const vuint32m4_t xb1 = __riscv_vsll_vx_u32m4(
+            __riscv_vzext_vf2_u32m4(__riscv_vle16_v_u16m2(x1 + i, vl), vl), 16, vl);
+        const vfloat32m4_t product1 = __riscv_vfmul_vv_f32m4(
+            __riscv_vreinterpret_v_u32m4_f32m4(xb1), yf, vl);
+        sum1 = __riscv_vfwredosum_vs_f32m4_f64m1(product1, sum1, vl);
+        i += vl;
+    }
+    s[0] = (float) __riscv_vfmv_f_s_f64m1_f64(sum0);
+    s[1] = (float) __riscv_vfmv_f_s_f64m1_f64(sum1);
+}
+
+static inline float bf16_to_f32_exact(uint16_t value) {
+    const uint32_t bits = (uint32_t) value << 16;
+    float result;
+    memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+template <int NR>
+__attribute__((noinline)) static void mul_mat_bf16_blocked_dot(
+        int64_t k, size_t vl, const float * GGML_RESTRICT packed,
+        const uint16_t * const rhs[4], float * const out[4]) {
+    vfloat64m2_t sum0 = __riscv_vfmv_v_f_f64m2(0.0, vl);
+    vfloat64m2_t sum1 = sum0;
+    vfloat64m2_t sum2 = sum0;
+    vfloat64m2_t sum3 = sum0;
+    // Each lane is one output: round the product to F32 before the K-ordered F64 add.
+    for (int64_t i = 0; i < k; ++i) {
+        const vfloat32m1_t weight = __riscv_vle32_v_f32m1(packed + i * 32, vl);
+        sum0 = __riscv_vfwadd_wv_f64m2(sum0, __riscv_vfmul_vf_f32m1(weight, bf16_to_f32_exact(rhs[0][i]), vl), vl);
+        if constexpr (NR > 1) {
+            sum1 = __riscv_vfwadd_wv_f64m2(sum1, __riscv_vfmul_vf_f32m1(weight, bf16_to_f32_exact(rhs[1][i]), vl), vl);
+        }
+        if constexpr (NR > 2) {
+            sum2 = __riscv_vfwadd_wv_f64m2(sum2, __riscv_vfmul_vf_f32m1(weight, bf16_to_f32_exact(rhs[2][i]), vl), vl);
+        }
+        if constexpr (NR > 3) {
+            sum3 = __riscv_vfwadd_wv_f64m2(sum3, __riscv_vfmul_vf_f32m1(weight, bf16_to_f32_exact(rhs[3][i]), vl), vl);
+        }
+    }
+    __riscv_vse32_v_f32m1(out[0], __riscv_vfncvt_f_f_w_f32m1(sum0, vl), vl);
+    if constexpr (NR > 1) {
+        __riscv_vse32_v_f32m1(out[1], __riscv_vfncvt_f_f_w_f32m1(sum1, vl), vl);
+    }
+    if constexpr (NR > 2) {
+        __riscv_vse32_v_f32m1(out[2], __riscv_vfncvt_f_f_w_f32m1(sum2, vl), vl);
+    }
+    if constexpr (NR > 3) {
+        __riscv_vse32_v_f32m1(out[3], __riscv_vfncvt_f_f_w_f32m1(sum3, vl), vl);
+    }
+}
+
+static void forward_mul_mat_bf16_blocked(ggml::spacemit::context & ctx, ggml_tensor * dst,
+                                         const char * rhs, size_t rhs_row_size, size_t converted_bytes) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    constexpr int64_t channels = 32;
+    const int64_t k = src0->ne[0];
+    const int64_t n_blocks = (src0->ne[1] + channels - 1) / channels;
+    const int64_t r2 = src1->ne[2] / src0->ne[2];
+    const int64_t r3 = src1->ne[3] / src0->ne[3];
+    const size_t scratch_stride = GGML_PAD(k * channels * sizeof(float), 64);
+    const size_t scratch_offset = GGML_PAD(converted_bytes, 64);
+    GGML_ASSERT(ctx.workspace_size >= scratch_offset + 63 + ctx.nth * scratch_stride);
+    const uintptr_t scratch_base = GGML_PAD((uintptr_t) ctx.workspace + scratch_offset, 64);
+    float * packed = (float *) (scratch_base + ctx.ith * scratch_stride);
+
+    for (int64_t block = ctx.ith; block < n_blocks * src1->ne[2] * src1->ne[3]; block += ctx.nth) {
+        const int64_t batch = block / n_blocks;
+        const int64_t i12 = batch % src1->ne[2];
+        const int64_t i13 = batch / src1->ne[2];
+        const int64_t col = (block % n_blocks) * channels;
+        const size_t vl = __riscv_vsetvl_e32m1(std::min(channels, src0->ne[1] - col));
+        const char * weight = (const char *) src0->data + (i12 / r2) * src0->nb[2] +
+                              (i13 / r3) * src0->nb[3] + col * src0->nb[1];
+        // Private K-major panels include packing cost and preserve the original tensor storage.
+        for (int64_t i = 0; i < k; ++i) {
+            const vuint16mf2_t bf16 = __riscv_vlse16_v_u16mf2((const uint16_t *) (weight + i * src0->nb[0]), src0->nb[1], vl);
+            const vuint32m1_t bits = __riscv_vsll_vx_u32m1(__riscv_vzext_vf2_u32m1(bf16, vl), 16, vl);
+            __riscv_vse32_v_f32m1(packed + i * channels, __riscv_vreinterpret_v_u32m1_f32m1(bits), vl);
+        }
+        const char * rhs_batch = rhs + batch * src1->ne[1] * rhs_row_size;
+        char * out_batch = (char *) dst->data + i12 * dst->nb[2] + i13 * dst->nb[3] + col * dst->nb[0];
+        for (int64_t token = 0; token < src1->ne[1]; token += 4) {
+            const int nr = std::min<int64_t>(4, src1->ne[1] - token);
+            const uint16_t * rows[4] = {};
+            float * out[4] = {};
+            for (int i = 0; i < nr; ++i) {
+                rows[i] = (const uint16_t *) (rhs_batch + (token + i) * rhs_row_size);
+                out[i] = (float *) (out_batch + (token + i) * dst->nb[1]);
+            }
+            switch (nr) {
+                case 4: mul_mat_bf16_blocked_dot<4>(k, vl, packed, rows, out); break;
+                case 3: mul_mat_bf16_blocked_dot<3>(k, vl, packed, rows, out); break;
+                case 2: mul_mat_bf16_blocked_dot<2>(k, vl, packed, rows, out); break;
+                case 1: mul_mat_bf16_blocked_dot<1>(k, vl, packed, rows, out); break;
+            }
+        }
+    }
+}
+#endif
+
 // Generic CPU MUL_MAT fallback. This follows ggml_compute_forward_mul_mat:
 // source-1 is quantized to the source-0 dot type in the shared spert
 // workspace, then the CPU type-trait dot kernel computes tiled output chunks.
@@ -344,6 +501,13 @@ void forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dot_traits && dot_traits->from_float);
     const ggml_from_float_t from_float = dot_traits->from_float;
     const int64_t vec_dot_num_rows = traits->nrows;
+    ggml_vec_dot_t vec_dot = traits->vec_dot;
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+    if (__riscv_vlenb() == 128 && src0->type == GGML_TYPE_BF16 &&
+        vec_dot_type == GGML_TYPE_BF16 && vec_dot_num_rows == 1) {
+        vec_dot = vec_dot_bf16_rvv_ordered;
+    }
+#endif
 
     GGML_ASSERT(ne0 == ne01 && ne1 == ne11 && ne2 == ne12 && ne3 == ne13);
     GGML_ASSERT(nb00 == ggml_type_size(src0->type) && nb10 == ggml_type_size(src1->type));
@@ -378,6 +542,15 @@ void forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * dst) {
         }
     }
     ctx.sync();
+
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+    if (__riscv_vlenb() == 128 &&
+        src0->type == GGML_TYPE_BF16 && src1->type == GGML_TYPE_F32 &&
+        vec_dot_type == GGML_TYPE_BF16 && vec_dot_num_rows == 1 && ne11 >= 8) {
+        forward_mul_mat_bf16_blocked(ctx, dst, wdata, row_size, needed);
+        return;
+    }
+#endif
 
     const int64_t nr0 = ne0;
     const int64_t nr1 = ne1 * ne2 * ne3;
@@ -426,10 +599,20 @@ void forward_mul_mat(ggml::spacemit::context & ctx, ggml_tensor * dst) {
                              ? (i11 + i12 * ne11 + i13 * ne12 * ne11) * row_size
                              : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                     float * dst_col = (float *) ((char *) dst->data + i11 * nb1 + i12 * nb2 + i13 * nb3);
-                    for (int64_t col = iir0; col < iir0 + blck0 && col < ir0_end; col += rows_per_dot) {
-                        traits->vec_dot(ne00, &tmp[col - iir0], rows_per_dot > 1 ? 16 : 0,
+                    for (int64_t col = iir0; col < iir0 + blck0 && col < ir0_end; /* increment below */) {
+#if defined(__riscv_v) && defined(__riscv_v_intrinsic) && defined(__riscv_v_elen_fp) && __riscv_v_elen_fp >= 64
+                        if (vec_dot == vec_dot_bf16_rvv_ordered && rows_per_dot == 1 &&
+                            col + 1 < std::min(iir0 + blck0, ir0_end)) {
+                            vec_dot_bf16_rvv_ordered_x2(ne00, &tmp[col - iir0], src0_row + col * nb01,
+                                                       src0_row + (col + 1) * nb01, src1_col);
+                            col += 2;
+                            continue;
+                        }
+#endif
+                        vec_dot(ne00, &tmp[col - iir0], rows_per_dot > 1 ? 16 : 0,
                                        src0_row + col * nb01, rows_per_dot > 1 ? nb01 : 0,
                                        src1_col, rows_per_dot > 1 ? src1_col_stride : 0, (int) rows_per_dot);
+                        col += rows_per_dot;
                     }
                     for (int cn = 0; cn < rows_per_dot; ++cn) {
                         memcpy(&dst_col[iir0 + cn * nb1 / nb0], tmp + cn * 16,
