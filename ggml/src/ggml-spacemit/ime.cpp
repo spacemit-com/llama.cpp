@@ -829,7 +829,15 @@ private:
 
         bool pad8_all = false;
         if constexpr (std::is_same_v<BLOC_TYPE, block_q4_0> && INTER_SIZE == 256) {
-            pad8_all = ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr && ne01 % 32 == 0 && hp_aligned();
+            // At T2-4, top-k routing commonly gives each expert only 1-4 real
+            // rows. Select the validated narrow expert projection shape:
+            // broadcast activations, K2048/N512. Wider projections retain m8
+            // padding because no-pad regressed for some routing.
+            const bool tiny_batch = ids->ne[1] >= 2 && ids->ne[1] <= 4;
+            const bool gate_up_shape = ne00 == 2048 && ne01 == 512 && ne11 == 1;
+            const bool small_t_nopad = tiny_batch && gate_up_shape;
+            pad8_all = ids->ne[1] > 1 && quantize_a_i8_r4 != nullptr && ne01 % 32 == 0 && hp_aligned() &&
+                       !small_t_nopad;
         }
 
         if (!pad8_all && ne11 == 1) {
@@ -1859,10 +1867,6 @@ private:
 
         const int ith = ctx.ith;
         const int nth = ctx.nth;
-
-        if (ith == 0 && getenv("GGML_SPACEMIT_Q41_TRACE") != nullptr) {
-            fprintf(stderr, "q41_mul_mat: N=%zu M=%zu K=%zu (%s)\n", N, M, K, M == 1 ? "decode" : "prefill");
-        }
 
         const size_t out_row_stride = dst->nb[1];  // bytes
 
