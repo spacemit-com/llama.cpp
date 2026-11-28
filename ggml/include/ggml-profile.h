@@ -18,7 +18,7 @@ GGML_API void ggml_profile_log_op_begin(struct ggml_tensor * tensor, int ith, in
 GGML_API void ggml_profile_log_op_end(struct ggml_tensor * tensor, int ith, int nth);
 GGML_API void ggml_profile_log_spacemit_op_begin(struct ggml_tensor * tensor, int ith, int nth);
 GGML_API void ggml_profile_log_spacemit_op_end(struct ggml_tensor * tensor, int ith, int nth);
-void ggml_profile_flush_tls(void);
+GGML_API void ggml_profile_flush_tls(void);
 #else
 #define g_current_token_idx 0
 #define ggml_profile_init_trace_file() ((void) 0)
